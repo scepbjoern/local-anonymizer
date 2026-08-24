@@ -6,12 +6,25 @@ import pymupdf  # PyMuPDF
 import docx
 
 
+class UnsupportedFileFormatError(ValueError):
+    """Raised when an unsupported file format is provided to the extractor."""
+    pass
+
+
 def extract_text_from_txt(path: Path) -> str:
-    """Extract text from plain text or markdown files."""
-    try:
-        return path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return path.read_text(encoding="latin-1")
+    """
+    Extract text from plain text or markdown files with robust encoding detection.
+    Tries UTF-8 (with BOM), UTF-8, Windows CP1252, ISO-8859-15, and Latin-1 in order.
+    """
+    encodings = ["utf-8-sig", "utf-8", "cp1252", "iso-8859-15", "latin-1"]
+    raw_bytes = path.read_bytes()
+    for enc in encodings:
+        try:
+            return raw_bytes.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    # Ultimate fallback with character replacement
+    return raw_bytes.decode("utf-8", errors="replace")
 
 
 def extract_text_from_docx(path: Path) -> str:
@@ -21,31 +34,42 @@ def extract_text_from_docx(path: Path) -> str:
     for para in doc.paragraphs:
         if para.text:
             full_text.append(para.text)
-    
+
     # Also extract text from tables
     for table in doc.tables:
         for row in table.rows:
             row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
             if row_text:
                 full_text.append(" | ".join(row_text))
-                
+
     return "\n\n".join(full_text)
 
 
 def extract_text_from_pdf(path: Path) -> str:
-    """Extract text from PDF files using PyMuPDF."""
+    """
+    Extract text from PDF files using PyMuPDF.
+    Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
+    """
     doc = pymupdf.open(str(path))
     pages_text = []
     for page in doc:
         text = page.get_text()
         if text.strip():
             pages_text.append(text.strip())
+    doc_pages = doc.page_count
     doc.close()
+
+    if doc_pages > 0 and not pages_text:
+        raise ValueError(
+            f"No extractable text found in PDF '{path.name}' ({doc_pages} pages). "
+            f"The file appears to be a scanned/image-based PDF requiring OCR, or an empty document."
+        )
+
     return "\n\n--- Page Break ---\n\n".join(pages_text)
 
 
 def read_document(file_path: Union[str, Path]) -> str:
-    """Unified document reader supporting .txt, .md, .docx, and .pdf."""
+    """Unified document reader supporting .txt, .md, .json, .csv, .docx, and .pdf."""
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
@@ -58,4 +82,7 @@ def read_document(file_path: Union[str, Path]) -> str:
     elif ext == ".pdf":
         return extract_text_from_pdf(path)
     else:
-        raise ValueError(f"Unsupported file format: '{ext}'. Supported: .txt, .md, .docx, .pdf")
+        raise UnsupportedFileFormatError(
+            f"Unsupported file format: '{ext}'. Supported formats: .txt, .md, .json, .csv, .docx, .pdf"
+        )
+

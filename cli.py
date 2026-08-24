@@ -58,7 +58,7 @@ def handle_anonymize(args: argparse.Namespace) -> None:
     print(f"🌐 Language   : {language}")
     print(f"🤖 Model      : {model}")
     print(f"🎯 Threshold  : {threshold}")
-    print(f"🔄 Reversible : {'No (--no-mapping enabled)' if args.no_mapping else 'Yes (mapping table saved)'}")
+    print(f"🔄 Reversible : {'No (--no-mapping enabled: permanent redaction)' if args.no_mapping else 'Yes (mapping table saved)'}")
 
     if glossary:
         print(f"📚 Glossary   : {len(glossary)} custom terms loaded")
@@ -80,21 +80,25 @@ def handle_anonymize(args: argparse.Namespace) -> None:
     print("-" * 70)
 
     print("⏳ Processing document...")
-    pipeline = AnonymizationPipeline(
-        language=language,
-        glossary=glossary,
-        ignore_terms=ignore_terms,
-        enabled_entities=enabled_entities,
-        custom_labels=custom_labels,
-        gliner_threshold=threshold,
-        gliner_model=model,
-    )
+    try:
+        pipeline = AnonymizationPipeline(
+            language=language,
+            glossary=glossary,
+            ignore_terms=ignore_terms,
+            enabled_entities=enabled_entities,
+            custom_labels=custom_labels,
+            gliner_threshold=threshold,
+            gliner_model=model,
+        )
 
-    result = pipeline.process_file(
-        input_path=input_path,
-        output_dir=args.output_dir,
-        no_mapping=args.no_mapping,
-    )
+        result = pipeline.process_file(
+            input_path=input_path,
+            output_dir=args.output_dir,
+            no_mapping=args.no_mapping,
+        )
+    except Exception as e:
+        print(f"\n❌ Error processing file: {e}")
+        sys.exit(1)
 
     print("\n✅ DETECTED ENTITIES:")
     entities = result.anonymization_result.entities
@@ -103,8 +107,9 @@ def handle_anonymize(args: argparse.Namespace) -> None:
     else:
         for ent in entities:
             flag = " ⚠️ [NEEDS REVIEW]" if ent.needs_review else ""
+            display_val = "[REDACTED]" if args.no_mapping else f"'{ent.original_text}'"
             print(
-                f"   • {ent.placeholder:<18} | {ent.entity_type:<15} | Score: {ent.score:.2f} | '{ent.original_text}'{flag}"
+                f"   • {ent.placeholder:<18} | {ent.entity_type:<15} | Score: {ent.score:.2f} | {display_val}{flag}"
             )
 
     print("\n" + "=" * 70)
@@ -145,11 +150,15 @@ def handle_restore(args: argparse.Namespace) -> None:
     print(f"🗺️  Mapping File : {map_path}")
     print("-" * 70)
 
-    restored_file = AnonymizationPipeline.restore_file(
-        anonymized_path=anon_path,
-        mapping_path=map_path,
-        output_path=args.output_file,
-    )
+    try:
+        restored_file = AnonymizationPipeline.restore_file(
+            anonymized_path=anon_path,
+            mapping_path=map_path,
+            output_path=args.output_file,
+        )
+    except Exception as e:
+        print(f"\n❌ Error restoring file: {e}")
+        sys.exit(1)
 
     print("✅ Successfully restored original entities!")
     print(f"💾 Restored File : {restored_file}")

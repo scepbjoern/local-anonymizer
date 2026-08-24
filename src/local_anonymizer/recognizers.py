@@ -22,9 +22,78 @@ from gliner import GLiNER
 from rapidfuzz import fuzz
 
 
+# Common abbreviations in German and English texts that should not trigger sentence boundaries
+GERMAN_ABBREVIATIONS = {
+    "dr", "prof", "hr", "fr", "frau", "herr", "nr", "st", "bzw", "etc",
+    "z.b", "u.a", "d.h", "inkl", "ca", "vgl", "abs", "art", "jan", "feb", "mär",
+    "apr", "jun", "jul", "aug", "sep", "okt", "nov", "dez", "univ", "ass", "dipl",
+    "ing", "mag", "bsc", "msc", "phd", "co", "gmbh", "ag", "inc", "ltd"
+}
+
+GERMAN_MONTHS = {
+    "januar", "februar", "märz", "april", "mai", "juni", "juli", "august",
+    "september", "oktober", "november", "dezember", "jan", "feb", "mär", "apr",
+    "jun", "jul", "aug", "sep", "okt", "nov", "dez"
+}
+
+
+def is_sentence_boundary(text: str, match: re.Match) -> bool:
+    """Check if punctuation match represents a true sentence boundary."""
+    p_end = match.end()
+    p_start = match.start()
+
+    # Punctuation must be followed by whitespace, newline, or end of string
+    if p_end < len(text) and not text[p_end].isspace():
+        return False
+
+    preceding = text[:p_start].rstrip()
+    if not preceding:
+        return False
+    last_word = preceding.split()[-1].lower().rstrip(".!?")
+
+    # Abbreviations or street suffixes (e.g. "Dr.", "Bahnhofstr.", "Nr.")
+    if last_word in GERMAN_ABBREVIATIONS or last_word.endswith(("str", "str.")):
+        return False
+
+    # Ordinal numbers in dates (e.g. "14. Juli")
+    if last_word.isdigit():
+        after = text[p_end:].lstrip()
+        if after:
+            next_word = after.split()[0].lower().rstrip(",;.:")
+            if next_word in GERMAN_MONTHS:
+                return False
+
+    # Lowercase continuation is rarely a new sentence
+    after = text[p_end:].lstrip()
+    if after and after[0].islower():
+        return False
+
+    return True
+
+
+def split_paragraph_into_sentences(p_str: str) -> List[Tuple[int, int, str]]:
+    """Split a single paragraph into sentence spans (start_rel, end_rel, sentence_text)."""
+    boundaries: List[int] = []
+    for m in re.finditer(r"[.!?]+", p_str):
+        if is_sentence_boundary(p_str, m):
+            boundaries.append(m.end())
+
+    if not boundaries:
+        return [(0, len(p_str), p_str)]
+
+    sentences: List[Tuple[int, int, str]] = []
+    curr = 0
+    for b in boundaries:
+        sentences.append((curr, b, p_str[curr:b]))
+        curr = b
+    if curr < len(p_str):
+        sentences.append((curr, len(p_str), p_str[curr:]))
+    return sentences
+
+
 def chunk_text_with_offsets(text: str, max_chars: int = 800) -> List[Tuple[int, int, str]]:
     """
-    Split text into chunks of at most max_chars without breaking paragraphs or sentences.
+    Split text into chunks of at most max_chars without breaking paragraphs, sentences, or entity spans.
     Returns list of (start_char_idx, end_char_idx, chunk_text).
     """
     if not text:
@@ -33,35 +102,32 @@ def chunk_text_with_offsets(text: str, max_chars: int = 800) -> List[Tuple[int, 
         return [(0, len(text), text)]
 
     chunks: List[Tuple[int, int, str]] = []
-    # Split by paragraph / line boundaries
     paragraphs = list(re.finditer(r"[^\r\n]+(?:\r?\n)?|\r?\n", text))
 
-    current_chunk_start: Optional[int] = None
-    current_chunk_end: Optional[int] = None
-    current_chunk_pieces: List[str] = []
+    current_start: Optional[int] = None
+    current_end: Optional[int] = None
+    current_pieces: List[str] = []
 
     for p in paragraphs:
         p_start, p_end = p.start(), p.end()
         p_str = p.group()
 
-        # If a single paragraph is larger than max_chars, split it by sentence or words
         if len(p_str) > max_chars:
-            if current_chunk_pieces and current_chunk_start is not None and current_chunk_end is not None:
-                chunks.append((current_chunk_start, current_chunk_end, "".join(current_chunk_pieces)))
-                current_chunk_start = None
-                current_chunk_end = None
-                current_chunk_pieces = []
+            if current_pieces and current_start is not None and current_end is not None:
+                chunks.append((current_start, current_end, "".join(current_pieces)))
+                current_pieces = []
+                current_start = None
+                current_end = None
 
-            # Sub-split long paragraph by sentences / punctuation
-            sub_matches = list(re.finditer(r"[^.!?\r\n]+(?:[.!?]+|\r?\n)?", p_str))
+            # Sentence-aware chunking for long paragraphs
+            sentences = split_paragraph_into_sentences(p_str)
             sub_start: Optional[int] = None
             sub_end: Optional[int] = None
             sub_pieces: List[str] = []
 
-            for s in sub_matches:
-                s_start = p_start + s.start()
-                s_end = p_start + s.end()
-                s_str = s.group()
+            for s_start_rel, s_end_rel, s_str in sentences:
+                s_start = p_start + s_start_rel
+                s_end = p_start + s_end_rel
 
                 if sub_pieces and sub_start is not None and (s_end - sub_start) > max_chars:
                     chunks.append((sub_start, sub_end, "".join(sub_pieces)))  # type: ignore
@@ -77,19 +143,19 @@ def chunk_text_with_offsets(text: str, max_chars: int = 800) -> List[Tuple[int, 
             if sub_pieces and sub_start is not None and sub_end is not None:
                 chunks.append((sub_start, sub_end, "".join(sub_pieces)))
         else:
-            if current_chunk_pieces and current_chunk_start is not None and (p_end - current_chunk_start) > max_chars:
-                chunks.append((current_chunk_start, current_chunk_end, "".join(current_chunk_pieces)))  # type: ignore
-                current_chunk_start = p_start
-                current_chunk_end = p_end
-                current_chunk_pieces = [p_str]
+            if current_pieces and current_start is not None and (p_end - current_start) > max_chars:
+                chunks.append((current_start, current_end, "".join(current_pieces)))  # type: ignore
+                current_start = p_start
+                current_end = p_end
+                current_pieces = [p_str]
             else:
-                if current_chunk_start is None:
-                    current_chunk_start = p_start
-                current_chunk_end = p_end
-                current_chunk_pieces.append(p_str)
+                if current_start is None:
+                    current_start = p_start
+                current_end = p_end
+                current_pieces.append(p_str)
 
-    if current_chunk_pieces and current_chunk_start is not None and current_chunk_end is not None:
-        chunks.append((current_chunk_start, current_chunk_end, "".join(current_chunk_pieces)))
+    if current_pieces and current_start is not None and current_end is not None:
+        chunks.append((current_start, current_end, "".join(current_pieces)))
 
     return chunks
 

@@ -104,14 +104,16 @@ class LocalAnonymizer:
     ):
         self.language = language
         self.glossary = glossary or {}
-        
+        self.gliner_threshold = gliner_threshold
+
         # Combine user ignore terms with sensible default role/degree terms
         combined_ignore = set(DEFAULT_IGNORE_TERMS)
         if ignore_terms:
             combined_ignore.update(ignore_terms)
         self.ignore_terms = list(combined_ignore)
 
-        self.enabled_entities = list(enabled_entities) if enabled_entities else None
+        # Explicitly preserve empty list [] vs None (None = all entities, [] = no entities)
+        self.enabled_entities = list(enabled_entities) if enabled_entities is not None else None
 
         # Setup Presidio AnalyzerEngine with lightweight blank NLP engine
         nlp_engine = BlankSpacyNlpEngine(languages=["de", "en"])
@@ -137,6 +139,20 @@ class LocalAnonymizer:
         self.analyzer.registry.add_recognizer(self.gliner_recognizer)
         self.analyzer.registry.add_recognizer(self.fuzzy_recognizer)
 
+        # Validate enabled_entities against supported recognizer entities
+        if self.enabled_entities is not None and len(self.enabled_entities) > 0:
+            supported = set(self.analyzer.get_supported_entities(language=self.language))
+            supported.update(self.gliner_recognizer.supported_entities)
+            supported.update(self.fuzzy_recognizer.supported_entities)
+            unknown = [e for e in self.enabled_entities if e not in supported]
+            if unknown:
+                warnings.warn(
+                    f"Unknown entity type(s) configured in enabled_entities: {unknown}. "
+                    f"Supported entities are: {sorted(supported)}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
     def add_glossary_term(self, term: str, entity_type: str = "PERSON") -> None:
         """Add a term to the fuzzy glossary dynamically."""
         self.fuzzy_recognizer.add_term(term, entity_type)
@@ -151,6 +167,10 @@ class LocalAnonymizer:
         if not text:
             return []
 
+        # If enabled_entities is explicitly empty [], return no entities
+        if self.enabled_entities is not None and len(self.enabled_entities) == 0:
+            return []
+
         # Find spans of ignore terms to exclude false positives (e.g. "CAS", "Studierende", "Unternehmen")
         ignored_spans: List[Tuple[int, int]] = []
         for term in self.ignore_terms:
@@ -160,11 +180,12 @@ class LocalAnonymizer:
             for match in pattern.finditer(text):
                 ignored_spans.append((match.start(), match.end()))
 
+        # Run Presidio analysis without hardcoded score_threshold overriding recognizer thresholds
         results = self.analyzer.analyze(
             text=text,
             language=self.language,
             entities=self.enabled_entities,
-            score_threshold=0.50,
+            score_threshold=None,
         )
 
         # 1. Filter out ignored spans
@@ -245,7 +266,7 @@ class LocalAnonymizer:
             if needs_review:
                 review_needed.append(entity)
 
-        # Replace spans in reverse order (from end of text to start) to maintain indices
+        # Replace spans in reverse order (from end of text to start) to maintain character indices
         anonymized_chars = list(text)
         for entity in reversed(detected_entities):
             anonymized_chars[entity.start:entity.end] = list(entity.placeholder)
@@ -263,20 +284,16 @@ class LocalAnonymizer:
     def de_anonymize(anonymized_text: str, mapping: Dict[str, str]) -> str:
         """
         Restore original values in anonymized text using the mapping table.
-        Sorts placeholders by length descending to prevent partial prefix collisions.
+        Uses a single-pass regex replacement to eliminate cascading substitutions.
         """
         if not anonymized_text or not mapping:
             return anonymized_text
 
-        result_text = anonymized_text
-        # Sort placeholders by length descending
+        # Sort placeholder keys by length descending to match longest first
         sorted_placeholders = sorted(mapping.keys(), key=len, reverse=True)
+        pattern = re.compile("|".join(re.escape(k) for k in sorted_placeholders))
 
-        for placeholder in sorted_placeholders:
-            original_value = mapping[placeholder]
-            result_text = result_text.replace(placeholder, original_value)
-
-        return result_text
+        return pattern.sub(lambda m: mapping.get(m.group(0), m.group(0)), anonymized_text)
 
     @staticmethod
     def save_mapping(mapping: Dict[str, str], file_path: Union[str, Path]) -> None:
