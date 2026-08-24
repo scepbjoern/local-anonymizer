@@ -1,0 +1,52 @@
+{
+  "language": "de",
+  "threshold": 0.55,
+  "enabled_entities": [
+    "PERSON",
+    "ORGANIZATION",
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "IBAN_CODE",
+    "LOCATION",
+    "ID_NUMBER",
+    "CREDIT_CARD",
+    "BANK_ACCOUNT",
+    "IP_ADDRESS",
+    "USERNAME",
+    "URL",
+    "HEALTH_DATA",
+    "FINANCIAL_DATA"
+  ],
+  "glossary": {
+    "abcd": "PERSON",
+    "efgh": "PERSON",
+    "ijkl": "PERSON",
+    "ZHAW": "ORGANIZATION",
+    "Zürcher Hochschule für Angewandte Wissenschaften": "ORGANIZATION"
+  },
+  "ignore_terms": [
+    "CAS",
+    "DAS",
+    "MAS",
+    "BSc",
+    "MSc",
+    "Studierende",
+    "Studierenden",
+    "Lehrpersonen",
+    "Dozierende",
+    "Mitarbeitende",
+    "Unternehmen",
+    "Unternehmens",
+    "Aufgabensteller",
+    "Aufgabenstellerin",
+    "Telefon",
+    "Email",
+    "Adresse"
+  ],
+  "custom_labels": {
+    "ahv nummer": "ID_NUMBER",
+    "matrikelnummer": "ID_NUMBER",
+    "geburtsdatum": "DATE_TIME",
+    "noten": "SENSITIVE_ACADEMIC_DATA"
+  }
+}
