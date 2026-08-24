@@ -1,5 +1,6 @@
 """Document extraction utilities for various file formats."""
 
+import io
 from pathlib import Path
 from typing import Union
 import pymupdf  # PyMuPDF
@@ -11,13 +12,12 @@ class UnsupportedFileFormatError(ValueError):
     pass
 
 
-def extract_text_from_txt(path: Path) -> str:
+def extract_text_from_txt_bytes(raw_bytes: bytes) -> str:
     """
-    Extract text from plain text or markdown files with robust encoding detection.
+    Extract text from plain text or markdown bytes with robust encoding detection.
     Tries UTF-8 (with BOM), UTF-8, Windows CP1252, ISO-8859-15, and Latin-1 in order.
     """
     encodings = ["utf-8-sig", "utf-8", "cp1252", "iso-8859-15", "latin-1"]
-    raw_bytes = path.read_bytes()
     for enc in encodings:
         try:
             return raw_bytes.decode(enc)
@@ -27,9 +27,14 @@ def extract_text_from_txt(path: Path) -> str:
     return raw_bytes.decode("utf-8", errors="replace")
 
 
-def extract_text_from_docx(path: Path) -> str:
-    """Extract text from Microsoft Word .docx files."""
-    doc = docx.Document(path)
+def extract_text_from_txt(path: Path) -> str:
+    """Extract text from plain text or markdown files."""
+    return extract_text_from_txt_bytes(path.read_bytes())
+
+
+def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
+    """Extract text from Microsoft Word .docx bytes."""
+    doc = docx.Document(io.BytesIO(raw_bytes))
     full_text = []
     for para in doc.paragraphs:
         if para.text:
@@ -43,6 +48,34 @@ def extract_text_from_docx(path: Path) -> str:
                 full_text.append(" | ".join(row_text))
 
     return "\n\n".join(full_text)
+
+
+def extract_text_from_docx(path: Path) -> str:
+    """Extract text from Microsoft Word .docx files."""
+    return extract_text_from_docx_bytes(path.read_bytes())
+
+
+def extract_text_from_pdf_bytes(raw_bytes: bytes, filename: str = "document.pdf") -> str:
+    """
+    Extract text from PDF bytes using PyMuPDF.
+    Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
+    """
+    doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
+    pages_text = []
+    for page in doc:
+        text = page.get_text()
+        if text.strip():
+            pages_text.append(text.strip())
+    doc_pages = doc.page_count
+    doc.close()
+
+    if doc_pages > 0 and not pages_text:
+        raise ValueError(
+            f"No extractable text found in PDF '{filename}' ({doc_pages} pages). "
+            f"The file appears to be a scanned/image-based PDF requiring OCR, or an empty document."
+        )
+
+    return "\n\n--- Page Break ---\n\n".join(pages_text)
 
 
 def extract_text_from_pdf(path: Path) -> str:
@@ -66,6 +99,21 @@ def extract_text_from_pdf(path: Path) -> str:
         )
 
     return "\n\n--- Page Break ---\n\n".join(pages_text)
+
+
+def read_document_from_bytes(data: bytes, filename: str) -> str:
+    """Unified document reader from in-memory bytes."""
+    ext = Path(filename).suffix.lower()
+    if ext in [".txt", ".md", ".json", ".csv"]:
+        return extract_text_from_txt_bytes(data)
+    elif ext == ".docx":
+        return extract_text_from_docx_bytes(data)
+    elif ext == ".pdf":
+        return extract_text_from_pdf_bytes(data, filename=filename)
+    else:
+        raise UnsupportedFileFormatError(
+            f"Unsupported file format: '{ext}'. Supported formats: .txt, .md, .json, .csv, .docx, .pdf"
+        )
 
 
 def read_document(file_path: Union[str, Path]) -> str:

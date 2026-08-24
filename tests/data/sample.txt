@@ -1,0 +1,4 @@
+Prof. Dr. Max Mustermann wohnt in der Bahnhofstr. 12, 8000 Zürich.
+Er ist am 14. Juli 1980 geboren und arbeitet für die ZHAW (Zürcher Hochschule für Angewandte Wissenschaften).
+E-Mail: max.mustermann@zhaw.ch, Telefon: +41 79 123 45 67.
+Bitte wenden Sie sich an die Studierenden der ZHW für weitere Infos.

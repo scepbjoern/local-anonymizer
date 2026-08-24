@@ -12,3 +12,13 @@ dependencies = [
     "python-docx>=1.2.0",
     "rapidfuzz>=3.14.5",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.10.0",
+]
+gui = [
+    "nicegui>=1.4.0",
+    "pywebview>=4.4.0",
+]

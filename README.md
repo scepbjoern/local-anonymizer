@@ -82,6 +82,36 @@ uv run cli.py restore path/to/llm_response.txt path/to/original_mapping.json
 
 ---
 
+### 3. Interactive Review-GUI (NiceGUI)
+
+For visual inspection, interactive entity review, and single-click corrections, launch the local GUI:
+
+```bash
+# Start as native desktop application
+uv run --extra gui python app.py
+
+# Or launch directly in your default web browser
+uv run --extra gui python app.py --browser
+```
+
+**Features of the GUI:**
+- 🖼️ **3-Step Review Workflow:** Upload → Inspect & Correct Highlights/Entities → Download Outputs.
+- ⚡ **100% In-Memory:** Uploaded documents, PII, and mappings are held in memory only and never written to temporary disk storage.
+- 🎛️ **Live Diff & Reactive Preview:** Adjust checkboxes or entity categories and see the anonymized document update in real time.
+- 🔄 **De-Anonymize Tab:** Direct recovery of LLM responses using your local `*_mapping.json` file.
+
+---
+
+### 4. Automated Testing (pytest)
+
+Run the full regression test suite (covers all recognizers, extractors, encoding fallbacks, and de-anonymization):
+
+```bash
+uv run pytest
+```
+
+---
+
 ## ⚙️ Configuration (`config.json`)
 
 You can customize detection behavior using a simple JSON file:
