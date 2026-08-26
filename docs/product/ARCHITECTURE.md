@@ -88,11 +88,11 @@
   - Nutzt `rapidfuzz.fuzz.ratio` mit Schwellenwerten (High Confidence $\ge 90\%$, Review-Bedarf $\ge 75\%$).
   - Bevorzugt exakte Treffer (Score 1.0) vor Fuzzy-Treffern.
 
-### 2.3 Platzhalter-Engine & Entity-Linking (`anonymizer.py`)
+### 2.3 Platzhalter-Engine & Entity-Linking (`anonymizer.py`) *(Geplant für Phase 3 / In Prüfung)*
 - **Format-Modi:**
   - **Modus 1:** `[<TYPE>_<N>]`
   - **Modus 2:** `[<TYPE>_<N>_<ROLE>]`
-  - **Modus 3:** `[<TYPE>_<ROLE>]`
+  - **Modus 3:** `[<TYPE>_<ROLE>]` *(mit automatischer Kollisions-Prüfung und Fallback auf Modus 2)*
 - **Co-Referenz-Tags:**
   - Verknüpfte Entitäten erhalten ein gemeinsames Präfix `[<TYPE>_<N>_...]` und ein Oberflächen-Tag (`_VOLLNAME`, `_VORNAME`, `_NACHNAME`, `_KURZFORM`).
 - **De-Anonymisierung:**
@@ -118,3 +118,13 @@
 | **Persistenz** | Keine PII auf temporären Datenträgern | Reine RAM-Objekte (`io.BytesIO`, Python-State), Speicherbereinigung nach Session-Ende |
 | **Reversibilität** | 100% mathematische Wiederherstellbarkeit | Deterministische JSON-Mappingtabelle, Single-Pass-Regex |
 | **Admin-Rechte** | 0% Admin-Rechte erforderlich | Reine User-Space-Dependencies (`uv pip install`) |
+
+---
+
+## 4. Abgrenzung: Warum keine echte PDF-Content-Stream-Redaktion?
+
+> [!NOTE]
+> **Bewusste Scope-Entscheidung:**
+> `local-anonymizer` führt **keine** native PDF-Content-Stream-Redaktion durch (d. h. keine direkte Entfernung von Vektorglyphen oder Pixel-Übermalung in binären PDF-Dateien). 
+> 
+> **Begründung:** Der Einsatzzweck des Tools ist ein reiner **Prompt-Privacy-Layer für KI-Workflows**: Textinhalte werden aus Dokumenten extrahiert, lokal bereinigt, an ein LLM übergeben und die LLM-Antwort anschliessend de-anonymisiert. Das Veröffentlichen optisch geschwärzter Original-PDFs ist nicht Gegenstand dieses Tools. Das text- und markdown-basierte Vorgehen stellt sicher, dass keinerlei unsichtbare PDF-Metadaten oder versteckte Textlayer unbemerkt an das LLM übermittelt werden können.

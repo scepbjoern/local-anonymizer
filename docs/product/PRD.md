@@ -28,7 +28,7 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 
 ## 4. Detaillierte Feature-Spezifikationen
 
-### 4.1 Feature 1: Strukturierte Dokumenten- & Markdown-Extraktion
+### 4.1 Feature 1: Strukturierte Dokumenten- & Markdown-Extraktion *(Geplant für Phase 3 / In Prüfung)*
 
 * **Unterstützte Formate:** `.txt`, `.md`, `.docx`, `.pdf`, `.json`, `.csv`.
 * **PDF-zu-Markdown (`pymupdf4llm`):**
@@ -43,7 +43,7 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 
 ---
 
-### 4.2 Feature 2: Hybride Entitätserkennung (Zero-Shot NER & Glossar)
+### 4.2 Feature 2: Hybride Entitätserkennung (Zero-Shot NER & Glossar) *(Umgesetzt in Phase 1 & 2)*
 
 * **Multilinguales Zero-Shot NER:** Basiert auf [GLiNER](https://github.com/urchade/GLiNER) (`urchade/gliner_multi_pii-v1`) zur Erkennung von:
   * `PERSON`, `ORGANIZATION`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `LOCATION`, `DATE_TIME`, `IBAN_CODE`, `CREDIT_CARD`, `ID_NUMBER`, `FINANCIAL_DATA`, `HEALTH_DATA`, `IP_ADDRESS`.
@@ -55,7 +55,7 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 
 ---
 
-### 4.3 Feature 3: Semantische Rollen-Labels & Format-Modi
+### 4.3 Feature 3: Semantische Rollen-Labels & Format-Modi *(Geplant für Phase 3 / In Prüfung)*
 
 Um dem nachgelagerten Cloud-LLM optimalen semantischen Kontext zu vermitteln, ohne Klarnamen preiszugeben, unterstützt die Pipeline flexible Platzhalterformate:
 
@@ -67,10 +67,14 @@ Um dem nachgelagerten Cloud-LLM optimalen semantischen Kontext zu vermitteln, oh
 
 * **Granulare Steuerung:** Jede erkannte Entität kann in der Review-Tabelle mit einer individuellen Rollenbezeichnung versehen werden (z. B. `Student`, `Dozent`, `Eigentümer`, `Kunde`).
 * **Fallback:** Bleibt das Rollenfeld leer, greift automatisch Modus 1 mit fortlaufender Nummerierung.
+* **Kollisions-Schutz (Modus 3):**
+  > [!IMPORTANT]
+  > Modus 3 lässt bewusst die Nummer weg. Tragen jedoch **mehrere unterschiedliche Entitäten dieselbe Rolle** (z. B. zwei verschiedene Studierende, beide mit Rolle `STUDENT`), entsteht ein Informationsverlust und ein Widerspruch in der Mapping-Tabelle. 
+  > **Schutzmechanismus:** Das System führt bei Modus 3 eine automatische Eindeutigkeits-Prüfung durch. Bei Rollen-Mehrfachvergabe wird eine Warnung ausgegeben und für die betroffenen Entitäten automatisch auf Modus 2 (`[PERSON_1_STUDENT]`, `[PERSON_2_STUDENT]`) zurückgefallen, um die 100%ige Reversibilität und LLM-Differenzierung sicherzustellen.
 
 ---
 
-### 4.4 Feature 4: Co-Referenz & Entity-Linking (Schreibweisen-Verknüpfung)
+### 4.4 Feature 4: Co-Referenz & Entity-Linking (Schreibweisen-Verknüpfung) *(Geplant für Phase 3 / In Prüfung)*
 
 Personen und Organisationen treten in realen Texten oft in unterschiedlichen Schreibweisen auf (z. B. *„Julia Meier“*, *„Julia“*, *„Frau Meier“*).
 
@@ -82,7 +86,9 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
     * *„Julia“* $\rightarrow$ `[PERSON_1_STUDENT_VORNAME]`
     * *„Frau Meier“* $\rightarrow$ `[PERSON_1_STUDENT_ANREDE]`
   * **Nutzen:** Das LLM versteht, dass es sich um dieselbe Identität handelt, behält aber die grammatikalische Satzstruktur bei. Beim De-Anonymisieren wird jede Stelle mit 100%iger Exaktheit in ihrer ursprünglichen Schreibweise wiederhergestellt.
-* **Smart Linking (Auto-Vorschlag):** Automatische Erkennung von Teilstrings im Review-GUI mit 1-Klick-Bestätigung.
+* **Smart Linking & Undo/Trennen-Funktion:**
+  * **Automatischer Vorschlag:** Kürzere Begriffe (z. B. „Julia“) schlagen bei Namensübereinstimmung eine Verknüpfung mit der Langform vor.
+  * **Explizite „Trennen“-Funktion:** Fälschlich vorgeschlagene Verknüpfungen (z. B. zwei verschiedene Personen namens „Julia Meier“ und „Julia Suter“) können per Klick auf **„Trennen / Als eigenständige Person behandeln“** sofort gelöst werden. Dadurch erhalten beide Personen eigenständige IDs (`PERSON_1` und `PERSON_2`).
 
 ---
 
