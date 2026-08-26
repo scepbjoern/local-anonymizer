@@ -20,15 +20,50 @@ from local_anonymizer.anonymizer import AnonymizationResult, DetectedEntity, Loc
 from local_anonymizer.extractors import UnsupportedFileFormatError, read_document_from_bytes
 
 
+# --- Data Models for Grouped Review ---
+@dataclass
+class EntityOccurrence:
+    start: int
+    end: int
+    score: float
+    context_html: str
+    needs_review: bool
+
+
+class EntityGroup:
+    def __init__(self, original_text: str, entity_type: str):
+        self.original_text: str = original_text
+        self.entity_type: str = entity_type
+        self.enabled: bool = True
+        self.occurrences: List[EntityOccurrence] = []
+
+    @property
+    def count(self) -> int:
+        return len(self.occurrences)
+
+    @property
+    def max_score(self) -> float:
+        return max((occ.score for occ in self.occurrences), default=0.0)
+
+    @property
+    def needs_review(self) -> bool:
+        return any(occ.needs_review for occ in self.occurrences)
+
+    @property
+    def first_start(self) -> int:
+        return self.occurrences[0].start if self.occurrences else 0
+
+
 # --- App State ---
 class AppState:
     def __init__(self):
         self.filename: str = ""
         self.raw_text: str = ""
         self.anonymizer: Optional[LocalAnonymizer] = None
-        self.detected_items: List[Dict] = []  # List of mutable dicts representing detected entities
+        self.entity_groups: List[EntityGroup] = []
         self.active_entities: List[str] = ["PERSON", "ORGANIZATION", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION"]
         self.gliner_threshold: float = 0.55
+        self.sort_by: str = "Erstes Auftreten im Text"
         self.ignore_terms_text: str = "CAS, DAS, MAS, BSc, MSc, PhD, MBA, Studierende, Studierenden, Dozent, Dozenten, Lehrperson, Berater, Aufgabensteller"
         self.glossary_text: str = "ZHAW: ORGANIZATION\nHWZ: ORGANIZATION\nUZH: ORGANIZATION\nETH: ORGANIZATION"
         
@@ -36,6 +71,7 @@ class AppState:
         self.restore_anon_text: str = ""
         self.restore_mapping: Dict[str, str] = {}
         self.restored_text: str = ""
+
 
 state = AppState()
 
@@ -54,6 +90,21 @@ AVAILABLE_ENTITIES = [
     "HEALTH_DATA",
     "IP_ADDRESS",
 ]
+
+
+def extract_context_snippet(raw_text: str, start: int, end: int, window: int = 40) -> str:
+    """Extract contextual snippet around entity with highlighted keyword."""
+    ctx_start = max(0, start - window)
+    ctx_end = min(len(raw_text), end + window)
+    
+    before = raw_text[ctx_start:start].replace("\r", " ").replace("\n", " ")
+    match = raw_text[start:end].replace("\r", " ").replace("\n", " ")
+    after = raw_text[end:ctx_end].replace("\r", " ").replace("\n", " ")
+    
+    prefix = "…" if ctx_start > 0 else ""
+    suffix = "…" if ctx_end < len(raw_text) else ""
+    
+    return f"{prefix}{html.escape(before)}<b class='text-blue-700 bg-blue-100 px-1 rounded'>{html.escape(match)}</b>{html.escape(after)}{suffix}"
 
 
 def parse_glossary(text: str) -> Dict[str, str]:
@@ -110,18 +161,27 @@ def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
     if not state.raw_text:
         return "", {}, {}
 
-    # Filter accepted entities based on user checkbox
-    accepted_entities = [
-        item for item in state.detected_items if item.get("enabled", True)
-    ]
+    # Flatten active occurrences from enabled entity groups
+    active_occurrences = []
+    for group in state.entity_groups:
+        if group.enabled:
+            for occ in group.occurrences:
+                active_occurrences.append({
+                    "original": group.original_text,
+                    "type": group.entity_type,
+                    "start": occ.start,
+                    "end": occ.end,
+                    "score": occ.score,
+                    "needs_review": occ.needs_review,
+                })
 
-    # Re-generate clean placeholders per category
+    # Category counters and placeholder generation
     category_counters: Dict[str, int] = {}
     value_to_placeholder: Dict[Tuple[str, str], str] = {}
     mapping: Dict[str, str] = {}
     final_entities_report = []
 
-    for item in accepted_entities:
+    for item in active_occurrences:
         orig = item["original"]
         etype = item["type"]
         norm_key = (orig.strip().lower(), etype)
@@ -141,12 +201,11 @@ def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
             "original": orig,
             "placeholder": placeholder,
             "score": round(item["score"], 3),
-            "needs_review": item.get("needs_review", False),
+            "needs_review": item["needs_review"],
         })
 
-    # Sort spans in reverse order to substitute
-    # Sort accepted items by start descending
-    sorted_for_sub = sorted(accepted_entities, key=lambda x: x["start"], reverse=True)
+    # Sort accepted items by start descending to replace in reverse character order
+    sorted_for_sub = sorted(active_occurrences, key=lambda x: x["start"], reverse=True)
     chars = list(state.raw_text)
     for item in sorted_for_sub:
         start, end = item["start"], item["end"]
@@ -157,11 +216,56 @@ def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
     audit_report = {
         "source_file": state.filename,
         "entity_count": len(final_entities_report),
+        "unique_entities_count": len(mapping),
         "mapping": mapping,
         "entities": final_entities_report,
     }
 
     return anonymized_text, mapping, audit_report
+
+
+def native_save_file(default_filename: str, content: str, title: str = "Datei speichern") -> Optional[str]:
+    """Open native OS save dialog on Windows/Desktop to save a file."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        filepath = filedialog.asksaveasfilename(
+            title=title,
+            initialfile=default_filename,
+            defaultextension=Path(default_filename).suffix,
+            filetypes=[("Dateien", f"*{Path(default_filename).suffix}"), ("Alle Dateien", "*.*")],
+        )
+        root.destroy()
+        if filepath:
+            Path(filepath).write_text(content, encoding="utf-8")
+            return filepath
+    except Exception as e:
+        print(f"Native save dialog error: {e}")
+    return None
+
+
+def native_export_folder(stem: str, anon_text: str, mapping: dict, report: dict) -> Optional[str]:
+    """Export all three files into a folder chosen by the user."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        folder = filedialog.askdirectory(title="Zielordner für Export auswählen")
+        root.destroy()
+        if folder:
+            out_dir = Path(folder)
+            (out_dir / f"{stem}_anonymized.txt").write_text(anon_text, encoding="utf-8")
+            (out_dir / f"{stem}_mapping.json").write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+            (out_dir / f"{stem}_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            return str(out_dir)
+    except Exception as e:
+        print(f"Native folder export error: {e}")
+    return None
 
 
 # --- UI Building ---
@@ -186,6 +290,8 @@ def create_ui():
         if not preview_holder or not export_holder:
             return
         anon_text, mapping, audit_report = compute_reactive_preview()
+        stem = Path(state.filename).stem or "dokument"
+
         preview_holder.clear()
         with preview_holder:
             ui.label("Anonymisierte Vorschau:").classes("font-semibold text-slate-700 mb-1")
@@ -193,36 +299,85 @@ def create_ui():
 
         export_holder.clear()
         with export_holder:
-            with ui.row().classes("gap-4 mt-2"):
-                ui.button(
-                    "📥 Anonymisierter Text (.txt)",
-                    icon="download",
-                    color="primary",
-                    on_click=lambda: ui.download(
-                        anon_text.encode("utf-8"),
-                        filename=f"{Path(state.filename).stem or 'dokument'}_anonymized.txt",
-                    ),
-                ).props("unelevated")
+            with ui.row().classes("gap-3 mt-2 flex-wrap items-center"):
+                # 1. Copy to clipboard
+                async def copy_clipboard():
+                    await ui.run_javascript(f'navigator.clipboard.writeText({json.dumps(anon_text)});')
+                    ui.notify("Anonymisierter Text in Zwischenablage kopiert!", type="positive", icon="content_copy")
 
                 ui.button(
-                    "📥 Mapping-Tabelle (.json)",
-                    icon="key",
+                    "📋 In Zwischenablage kopieren",
+                    icon="content_copy",
                     color="secondary",
-                    on_click=lambda: ui.download(
-                        json.dumps(mapping, indent=2, ensure_ascii=False).encode("utf-8"),
-                        filename=f"{Path(state.filename).stem or 'dokument'}_mapping.json",
-                    ),
+                    on_click=copy_clipboard,
                 ).props("unelevated")
 
+                # 2. Save Anonymized Text
+                def save_anon():
+                    path = native_save_file(f"{stem}_anonymized.txt", anon_text, "Anonymisierten Text speichern")
+                    if path:
+                        ui.notify(f"Gespeichert: {Path(path).name}", type="positive", icon="check")
+                    else:
+                        ui.download(anon_text.encode("utf-8"), filename=f"{stem}_anonymized.txt")
+
                 ui.button(
-                    "📥 Audit-Bericht (.json)",
+                    "💾 Text speichern (.txt)",
+                    icon="save",
+                    color="primary",
+                    on_click=save_anon,
+                ).props("unelevated")
+
+                # 3. Save Mapping
+                def save_map():
+                    map_str = json.dumps(mapping, indent=2, ensure_ascii=False)
+                    path = native_save_file(f"{stem}_mapping.json", map_str, "Mapping-Tabelle speichern")
+                    if path:
+                        ui.notify(f"Gespeichert: {Path(path).name}", type="positive", icon="check")
+                    else:
+                        ui.download(map_str.encode("utf-8"), filename=f"{stem}_mapping.json")
+
+                ui.button(
+                    "💾 Mapping speichern (.json)",
+                    icon="key",
+                    color="primary",
+                    on_click=save_map,
+                ).props("unelevated")
+
+                # 4. Save Report
+                def save_rep():
+                    rep_str = json.dumps(audit_report, indent=2, ensure_ascii=False)
+                    path = native_save_file(f"{stem}_report.json", rep_str, "Audit-Bericht speichern")
+                    if path:
+                        ui.notify(f"Gespeichert: {Path(path).name}", type="positive", icon="check")
+                    else:
+                        ui.download(rep_str.encode("utf-8"), filename=f"{stem}_report.json")
+
+                ui.button(
+                    "💾 Bericht speichern (.json)",
                     icon="assessment",
                     color="slate",
-                    on_click=lambda: ui.download(
-                        json.dumps(audit_report, indent=2, ensure_ascii=False).encode("utf-8"),
-                        filename=f"{Path(state.filename).stem or 'dokument'}_report.json",
-                    ),
+                    on_click=save_rep,
                 ).props("outline")
+
+                # 5. Export all to folder
+                def export_all():
+                    out_path = native_export_folder(stem, anon_text, mapping, audit_report)
+                    if out_path:
+                        with ui.dialog() as dlg, ui.card().classes("p-4"):
+                            ui.label("✅ Export erfolgreich!").classes("text-lg font-bold text-slate-800")
+                            ui.label(f"3 Dateien wurden exportiert nach:\n{out_path}").classes("text-sm text-slate-600 font-mono my-2")
+                            with ui.row().classes("gap-2 justify-end w-full mt-2"):
+                                if hasattr(os, "startfile"):
+                                    ui.button("Ordner im Explorer öffnen", icon="folder_open", on_click=lambda: os.startfile(out_path), color="primary").props("unelevated")
+                                ui.button("Schliessen", on_click=dlg.close).props("flat")
+                        dlg.open()
+
+                ui.button(
+                    "📁 Alle 3 Dateien in Ordner exportieren",
+                    icon="folder_zip",
+                    color="teal",
+                    on_click=export_all,
+                ).props("unelevated")
 
     async def run_analysis():
         if not state.raw_text:
@@ -238,25 +393,33 @@ def create_ui():
 
         try:
             anonymizer = build_anonymizer()
-            # Run CPU-intensive NER in a background worker thread to keep the GUI fluid
+            # Run CPU-intensive NER in a background worker thread
             results = await asyncio.to_thread(anonymizer.analyze, state.raw_text)
 
-            state.detected_items = []
+            # Group detected entities by canonical term
+            groups_dict: Dict[str, EntityGroup] = {}
             for res in results:
-                orig_val = state.raw_text[res.start:res.end]
-                needs_review = 0.70 <= res.score < 0.85
-                state.detected_items.append({
-                    "enabled": True,
-                    "original": orig_val,
-                    "type": res.entity_type,
-                    "score": res.score,
-                    "start": res.start,
-                    "end": res.end,
-                    "needs_review": needs_review,
-                    "placeholder": f"[{res.entity_type}]",
-                })
+                orig = state.raw_text[res.start:res.end]
+                norm = orig.strip()
+                key = norm.lower()
+                needs_rev = 0.70 <= res.score < 0.85
+                ctx_html = extract_context_snippet(state.raw_text, res.start, res.end)
+                
+                occ = EntityOccurrence(
+                    start=res.start,
+                    end=res.end,
+                    score=res.score,
+                    context_html=ctx_html,
+                    needs_review=needs_rev,
+                )
+                if key not in groups_dict:
+                    groups_dict[key] = EntityGroup(original_text=norm, entity_type=res.entity_type)
+                groups_dict[key].occurrences.append(occ)
 
-            ui.notify(f"Analyse abgeschlossen: {len(state.detected_items)} Entitäten gefunden.", type="positive")
+            state.entity_groups = list(groups_dict.values())
+
+            total_occurrences = sum(g.count for g in state.entity_groups)
+            ui.notify(f"Analyse abgeschlossen: {len(state.entity_groups)} einzigartige Begriffe ({total_occurrences} Fundstellen).", type="positive")
             build_review_table()
             refresh_preview_and_exports()
 
@@ -271,10 +434,10 @@ def create_ui():
 
     async def handle_upload(e):
         try:
-            if hasattr(e, 'file'):
+            if hasattr(e, "file"):
                 data = await e.file.read()
                 filename = e.file.name
-            elif hasattr(e, 'content'):
+            elif hasattr(e, "content"):
                 data = e.content.read()
                 filename = e.name
             else:
@@ -293,84 +456,143 @@ def create_ui():
         except Exception as ex:
             ui.notify(f"Fehler beim Upload: {str(ex)}", type="negative")
 
+    def get_sorted_groups() -> List[EntityGroup]:
+        """Return entity groups sorted according to user selection."""
+        if state.sort_by == "Häufigkeit (meiste Treffer zuerst)":
+            return sorted(state.entity_groups, key=lambda g: (-g.count, g.first_start))
+        elif state.sort_by == "Entitätstyp (PERSON, ORG, ...)":
+            return sorted(state.entity_groups, key=lambda g: (g.entity_type, g.original_text.lower()))
+        elif state.sort_by == "Alphabetisch (A–Z)":
+            return sorted(state.entity_groups, key=lambda g: g.original_text.lower())
+        elif state.sort_by == "⚠️ Review-Bedarf zuerst":
+            return sorted(state.entity_groups, key=lambda g: (not g.needs_review, -g.count, g.first_start))
+        else:
+            # Default: Erstes Auftreten im Text
+            return sorted(state.entity_groups, key=lambda g: g.first_start)
+
     def build_review_table():
         if not table_holder:
             return
         table_holder.clear()
         with table_holder:
-            if not state.detected_items:
+            if not state.entity_groups:
                 ui.label("Keine zu anonymisierenden Entitäten im Text erkannt.").classes("text-slate-500 italic p-4")
                 return
 
-            ui.label(f"Erkannte Entitäten ({len(state.detected_items)} Treffer)").classes("text-lg font-bold text-slate-800 mb-2")
-            ui.label("Prüfen Sie gefundene Begriffe, passen Sie ggf. den Entitätstyp an oder wählen Sie Fehlalarme ab:").classes("text-sm text-slate-600 mb-4")
+            total_hits = sum(g.count for g in state.entity_groups)
+            unique_count = len(state.entity_groups)
 
-            # Table Header
-            with ui.row().classes("w-full bg-slate-200 p-2 font-semibold text-xs text-slate-700 rounded items-center"):
-                ui.label("Aktiv").classes("w-12 text-center")
-                ui.label("Originaltext").classes("w-48 font-mono")
-                ui.label("Entitätstyp").classes("w-44")
-                ui.label("Score").classes("w-20 text-center")
-                ui.label("Status").classes("w-32")
-                ui.label("Aktionen").classes("flex-1")
+            ui.label(f"Erkannte Entitäten ({unique_count} Begriffe, {total_hits} Fundstellen gesamt)").classes("text-lg font-bold text-slate-800 mb-1")
+            ui.label("Prüfen Sie gefundene Begriffe gebündelt. Ein Klick auf die Zeile klappt alle Fundstellen im Kontext auf:").classes("text-sm text-slate-600 mb-3")
 
-            # Table Rows
-            for idx, item in enumerate(state.detected_items):
-                row_bg = "bg-amber-50" if item.get("needs_review") else ("bg-white" if idx % 2 == 0 else "bg-slate-50")
-                with ui.row().classes(f"w-full p-2 border-b items-center gap-2 {row_bg}"):
-                    # Checkbox
-                    def make_check_handler(it):
-                        def on_change(e):
-                            it["enabled"] = e.value
-                            refresh_preview_and_exports()
-                        return on_change
+            # Toolbar: Sorting & Bulk actions
+            with ui.row().classes("w-full items-center justify-between bg-slate-100 p-2.5 rounded-lg border mb-3 flex-wrap gap-2"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("sort", size="sm").classes("text-slate-600")
+                    ui.label("Sortierung:").classes("text-xs font-semibold text-slate-700")
 
-                    ui.checkbox(value=item["enabled"], on_change=make_check_handler(item)).classes("w-12 justify-center")
-
-                    # Original Text
-                    ui.label(item["original"]).classes("w-48 font-mono text-sm font-semibold truncate")
-
-                    # Type Dropdown
-                    def make_select_handler(it):
-                        def on_change(e):
-                            it["type"] = e.value
-                            refresh_preview_and_exports()
-                        return on_change
+                    def on_sort_change(e):
+                        state.sort_by = e.value
+                        build_review_table()
 
                     ui.select(
-                        options=AVAILABLE_ENTITIES,
-                        value=item["type"],
-                        on_change=make_select_handler(item),
-                    ).props("dense outlined").classes("w-44 text-xs")
+                        options=[
+                            "Erstes Auftreten im Text",
+                            "Häufigkeit (meiste Treffer zuerst)",
+                            "Entitätstyp (PERSON, ORG, ...)",
+                            "Alphabetisch (A–Z)",
+                            "⚠️ Review-Bedarf zuerst",
+                        ],
+                        value=state.sort_by,
+                        on_change=on_sort_change,
+                    ).props("dense outlined bg-white").classes("w-64 text-xs")
 
-                    # Score
-                    ui.label(f"{item['score']:.2f}").classes("w-20 text-center text-xs font-mono")
+                with ui.row().classes("items-center gap-2"):
+                    def select_all():
+                        for g in state.entity_groups:
+                            g.enabled = True
+                        refresh_preview_and_exports()
+                        build_review_table()
 
-                    # Warning / Status
-                    with ui.row().classes("w-32 items-center"):
-                        if item.get("needs_review"):
-                            ui.badge("⚠️ Review", color="warning").props("dense")
-                        else:
-                            ui.badge("✓ Sicher", color="positive").props("dense outline")
+                    def deselect_all():
+                        for g in state.entity_groups:
+                            g.enabled = False
+                        refresh_preview_and_exports()
+                        build_review_table()
 
-                    # Action: Add to Ignore
-                    def make_ignore_handler(term, it):
-                        def on_click():
-                            current_ignores = parse_ignore_terms(state.ignore_terms_text)
-                            if term not in current_ignores:
-                                state.ignore_terms_text += f", {term}"
-                                ignore_input.value = state.ignore_terms_text
-                            it["enabled"] = False
-                            ui.notify(f"'{term}' zur Ignore-Liste hinzugefügt.", type="info")
-                            refresh_preview_and_exports()
-                            build_review_table()
-                        return on_click
+                    ui.button("Alle aktivieren", icon="select_all", on_click=select_all, color="slate").props("outline dense size=sm")
+                    ui.button("Alle abwählen", icon="deselect", on_click=deselect_all, color="slate").props("outline dense size=sm")
 
-                    ui.button(
-                        "Ignorieren",
-                        icon="block",
-                        on_click=make_ignore_handler(item["original"], item),
-                    ).props("flat dense size=sm color=grey-8")
+            sorted_groups = get_sorted_groups()
+
+            # Grouped Entity Rows (Accordion for Context Snippets)
+            for idx, group in enumerate(sorted_groups):
+                row_bg = "bg-amber-50" if group.needs_review else ("bg-white" if idx % 2 == 0 else "bg-slate-50")
+                
+                with ui.expansion().classes(f"w-full border rounded mb-1 {row_bg}") as exp:
+                    with exp.add_slot("header"):
+                        with ui.row().classes("w-full items-center justify-between gap-3 pr-2"):
+                            # Left part: Checkbox + Name + Count Badge
+                            with ui.row().classes("items-center gap-2 flex-1 min-w-[200px]"):
+                                def make_group_check(grp):
+                                    def on_change(e):
+                                        grp.enabled = e.value
+                                        refresh_preview_and_exports()
+                                    return on_change
+
+                                ui.checkbox(value=group.enabled, on_change=make_group_check(group)).props("dense")
+                                ui.label(group.original_text).classes("font-mono text-sm font-bold text-slate-800")
+                                ui.badge(f"{group.count}x", color="primary" if group.count > 1 else "grey-6").props("dense")
+
+                            # Middle: Type Selector
+                            with ui.row().classes("items-center gap-2"):
+                                def make_group_select(grp):
+                                    def on_change(e):
+                                        grp.entity_type = e.value
+                                        refresh_preview_and_exports()
+                                    return on_change
+
+                                ui.select(
+                                    options=AVAILABLE_ENTITIES,
+                                    value=group.entity_type,
+                                    on_change=make_group_select(group),
+                                ).props("dense outlined bg-white").classes("w-44 text-xs")
+
+                            # Right part: Score & Review Badge
+                            with ui.row().classes("items-center gap-3"):
+                                ui.label(f"Score: {group.max_score:.2f}").classes("text-xs font-mono text-slate-600")
+                                if group.needs_review:
+                                    ui.badge("⚠️ Review", color="warning").props("dense")
+                                else:
+                                    ui.badge("✓ Sicher", color="positive").props("dense outline")
+
+                                # Action: Ignore Term
+                                def make_group_ignore(term, grp):
+                                    def on_click():
+                                        current_ignores = parse_ignore_terms(state.ignore_terms_text)
+                                        if term not in current_ignores:
+                                            state.ignore_terms_text += f", {term}"
+                                            ignore_input.value = state.ignore_terms_text
+                                        grp.enabled = False
+                                        ui.notify(f"'{term}' zur Ignore-Liste hinzugefügt.", type="info")
+                                        refresh_preview_and_exports()
+                                        build_review_table()
+                                    return on_click
+
+                                ui.button(
+                                    "Ignorieren",
+                                    icon="block",
+                                    on_click=make_group_ignore(group.original_text, group),
+                                ).props("flat dense size=sm color=grey-8")
+
+                    # Expanded slot: Occurrences in context
+                    with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
+                        ui.label(f"Fundstellen im Text ({group.count} Vorkommen):").classes("text-xs font-bold text-slate-700")
+                        for occ_idx, occ in enumerate(group.occurrences, start=1):
+                            with ui.row().classes("items-center gap-2 p-1.5 bg-slate-50 rounded border text-xs w-full"):
+                                ui.label(f"#{occ_idx}").classes("font-bold text-slate-500 w-6")
+                                ui.html(occ.context_html).classes("flex-1 text-slate-800")
+                                ui.label(f"Score: {occ.score:.2f}").classes("text-slate-400 font-mono text-[10px]")
 
     # --- Layout ---
     with ui.row().classes("w-full no-wrap p-4 gap-6"):
@@ -411,7 +633,7 @@ def create_ui():
             def on_thresh_change(e):
                 state.gliner_threshold = e.value
             thresh_slider = ui.slider(min=0.20, max=0.95, step=0.05, value=state.gliner_threshold, on_change=on_thresh_change)
-            ui.label().bind_text_from(thresh_slider, 'value', lambda v: f"Schwellenwert: {v:.2f}").classes("text-xs text-slate-500 mb-2")
+            ui.label().bind_text_from(thresh_slider, "value", lambda v: f"Schwellenwert: {v:.2f}").classes("text-xs text-slate-500 mb-2")
 
             ui.separator().classes("my-2")
 
@@ -483,9 +705,9 @@ def create_ui():
                             ui.label("2. Mapping-Tabelle (.json):").classes("font-semibold text-xs text-slate-700")
                             async def on_map_upload(e):
                                 try:
-                                    if hasattr(e, 'file'):
+                                    if hasattr(e, "file"):
                                         data = await e.file.read()
-                                    elif hasattr(e, 'content'):
+                                    elif hasattr(e, "content"):
                                         data = e.content.read()
                                     else:
                                         raise ValueError("Unbekanntes Upload-Format")
@@ -529,12 +751,31 @@ def create_ui():
                     ui.label("Wiederhergestelltes Originaldokument:").classes("font-semibold text-slate-700 mb-1")
                     restored_preview = ui.textarea().props("readonly rows=10").classes("w-full font-mono text-sm bg-slate-50 border rounded p-2")
 
-                    ui.button(
-                        "📥 Wiederhergestellten Text herunterladen",
-                        icon="download",
-                        color="secondary",
-                        on_click=lambda: ui.download(state.restored_text.encode("utf-8"), filename="restored_document.txt"),
-                    ).props("unelevated mt-2")
+                    with ui.row().classes("gap-3 mt-2"):
+                        async def copy_restored_clipboard():
+                            await ui.run_javascript(f'navigator.clipboard.writeText({json.dumps(state.restored_text)});')
+                            ui.notify("Wiederhergestellter Text in Zwischenablage kopiert!", type="positive", icon="content_copy")
+
+                        ui.button(
+                            "📋 In Zwischenablage kopieren",
+                            icon="content_copy",
+                            color="secondary",
+                            on_click=copy_restored_clipboard,
+                        ).props("unelevated")
+
+                        def save_restored():
+                            path = native_save_file("restored_document.txt", state.restored_text, "Wiederhergestellten Text speichern")
+                            if path:
+                                ui.notify(f"Gespeichert: {Path(path).name}", type="positive", icon="check")
+                            else:
+                                ui.download(state.restored_text.encode("utf-8"), filename="restored_document.txt")
+
+                        ui.button(
+                            "💾 Wiederhergestellten Text speichern",
+                            icon="download",
+                            color="primary",
+                            on_click=save_restored,
+                        ).props("unelevated")
 
 
 def main():
