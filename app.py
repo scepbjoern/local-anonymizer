@@ -4,6 +4,7 @@ Runs completely locally with in-memory processing.
 """
 
 import argparse
+import asyncio
 import html
 import io
 import json
@@ -235,10 +236,10 @@ def create_ui():
                     ui.spinner(size="md", color="primary")
                     ui.label("Dokument wird lokal analysiert (NER & Entitätserkennung)...").classes("text-slate-700 text-sm font-medium")
 
-        n = ui.notify("Analysiere Dokument lokal...", type="info", timeout=0, spinner=True)
         try:
             anonymizer = build_anonymizer()
-            results = anonymizer.analyze(state.raw_text)
+            # Run CPU-intensive NER in a background worker thread to keep the GUI fluid
+            results = await asyncio.to_thread(anonymizer.analyze, state.raw_text)
 
             state.detected_items = []
             for res in results:
@@ -255,16 +256,17 @@ def create_ui():
                     "placeholder": f"[{res.entity_type}]",
                 })
 
-            n.dismiss()
             ui.notify(f"Analyse abgeschlossen: {len(state.detected_items)} Entitäten gefunden.", type="positive")
             build_review_table()
             refresh_preview_and_exports()
 
         except ValueError as ve:
-            n.dismiss()
+            if table_holder:
+                table_holder.clear()
             ui.notify(f"Verarbeitungsfehler: {str(ve)}", type="negative", close_button=True, timeout=10000)
         except Exception as e:
-            n.dismiss()
+            if table_holder:
+                table_holder.clear()
             ui.notify(f"Unerwarteter Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
 
     async def handle_upload(e):

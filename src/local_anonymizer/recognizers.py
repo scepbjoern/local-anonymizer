@@ -10,6 +10,7 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*resume_download.*")
 
 try:
     import transformers
@@ -240,9 +241,15 @@ class GLiNERRecognizer(EntityRecognizer):
             name=name,
         )
 
+    _MODEL_CACHE: Dict[str, GLiNER] = {}
+
     def load(self) -> None:
         """Load GLiNER model silently (locally if cached, otherwise download without noise)."""
         if self.model is None:
+            if self.model_name in self._MODEL_CACHE:
+                self.model = self._MODEL_CACHE[self.model_name]
+                return
+
             os.environ["HF_HUB_OFFLINE"] = "1"
             try:
                 self.model = GLiNER.from_pretrained(self.model_name, local_files_only=True)
@@ -250,6 +257,8 @@ class GLiNERRecognizer(EntityRecognizer):
                 os.environ.pop("HF_HUB_OFFLINE", None)
                 self.model = GLiNER.from_pretrained(self.model_name)
                 os.environ["HF_HUB_OFFLINE"] = "1"
+
+            self._MODEL_CACHE[self.model_name] = self.model
 
     def analyze(
         self,
