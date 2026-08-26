@@ -28,7 +28,7 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 
 ## 4. Detaillierte Feature-Spezifikationen
 
-### 4.1 Feature 1: Strukturierte Dokumenten- & Markdown-Extraktion *(Geplant für Phase 3 / In Prüfung)*
+### 4.1 Feature 1: Strukturierte Dokumenten- & Markdown-Extraktion *(Umgesetzt)*
 
 * **Unterstützte Formate:** `.txt`, `.md`, `.docx`, `.pdf`, `.json`, `.csv`.
 * **PDF-zu-Markdown (`pymupdf4llm`):**
@@ -43,7 +43,7 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 
 ---
 
-### 4.2 Feature 2: Hybride Entitätserkennung (Zero-Shot NER & Glossar) *(Umgesetzt in Phase 1 & 2)*
+### 4.2 Feature 2: Hybride Entitätserkennung (Zero-Shot NER & Glossar) *(Umgesetzt)*
 
 * **Multilinguales Zero-Shot NER:** Basiert auf [GLiNER](https://github.com/urchade/GLiNER) (`urchade/gliner_multi_pii-v1`) zur Erkennung von:
   * `PERSON`, `ORGANIZATION`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `LOCATION`, `DATE_TIME`, `IBAN_CODE`, `CREDIT_CARD`, `ID_NUMBER`, `FINANCIAL_DATA`, `HEALTH_DATA`, `IP_ADDRESS`.
@@ -55,7 +55,7 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 
 ---
 
-### 4.3 Feature 3: Semantische Rollen-Labels & Format-Modi *(Geplant für Phase 3 / In Prüfung)*
+### 4.3 Feature 3: Semantische Rollen-Labels & Format-Modi *(Umgesetzt)*
 
 Um dem nachgelagerten Cloud-LLM optimalen semantischen Kontext zu vermitteln, ohne Klarnamen preiszugeben, unterstützt die Pipeline flexible Platzhalterformate:
 
@@ -70,11 +70,11 @@ Um dem nachgelagerten Cloud-LLM optimalen semantischen Kontext zu vermitteln, oh
 * **Kollisions-Schutz (Modus 3):**
   > [!IMPORTANT]
   > Modus 3 lässt bewusst die Nummer weg. Tragen jedoch **mehrere unterschiedliche Entitäten dieselbe Rolle** (z. B. zwei verschiedene Studierende, beide mit Rolle `STUDENT`), entsteht ein Informationsverlust und ein Widerspruch in der Mapping-Tabelle. 
-  > **Schutzmechanismus:** Das System führt bei Modus 3 eine automatische Eindeutigkeits-Prüfung durch. Bei Rollen-Mehrfachvergabe wird eine Warnung ausgegeben und für die betroffenen Entitäten automatisch auf Modus 2 (`[PERSON_1_STUDENT]`, `[PERSON_2_STUDENT]`) zurückgefallen, um die 100%ige Reversibilität und LLM-Differenzierung sicherzustellen.
+  > **Schutzmechanismus:** Das System führt bei Modus 3 eine automatische `(Typ, Rolle)`-Eindeutigkeits-Prüfung durch. Bei Rollen-Mehrfachvergabe wird eine Warnung ausgegeben und für die betroffenen Entitäten automatisch auf Modus 2 (`[PERSON_1_STUDENT]`, `[PERSON_2_STUDENT]`) zurückgefallen, um die 100%ige Reversibilität und LLM-Differenzierung sicherzustellen.
 
 ---
 
-### 4.4 Feature 4: Co-Referenz & Entity-Linking (Schreibweisen-Verknüpfung) *(Geplant für Phase 3 / In Prüfung)*
+### 4.4 Feature 4: Co-Referenz & Entity-Linking (Schreibweisen-Verknüpfung) *(Umgesetzt)*
 
 Personen und Organisationen treten in realen Texten oft in unterschiedlichen Schreibweisen auf (z. B. *„Julia Meier“*, *„Julia“*, *„Frau Meier“*).
 
@@ -88,11 +88,11 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
   * **Nutzen:** Das LLM versteht, dass es sich um dieselbe Identität handelt, behält aber die grammatikalische Satzstruktur bei. Beim De-Anonymisieren wird jede Stelle mit 100%iger Exaktheit in ihrer ursprünglichen Schreibweise wiederhergestellt.
 * **Smart Linking & Undo/Trennen-Funktion:**
   * **Automatischer Vorschlag:** Kürzere Begriffe (z. B. „Julia“) schlagen bei Namensübereinstimmung eine Verknüpfung mit der Langform vor.
-  * **Explizite „Trennen“-Funktion:** Fälschlich vorgeschlagene Verknüpfungen (z. B. zwei verschiedene Personen namens „Julia Meier“ und „Julia Suter“) können per Klick auf **„Trennen / Als eigenständige Person behandeln“** sofort gelöst werden. Dadurch erhalten beide Personen eigenständige IDs (`PERSON_1` und `PERSON_2`).
+  * **Explizite „Trennen“-Funktion:** Fälschlich vorgeschlagene Verknüpfungen (z. B. zwei verschiedene Personen namens „Julia Meier“ und „Julia Suter“) können per Klick auf **„✕ Trennen“** sofort gelöst werden. Dadurch erhalten beide Personen eigenständige IDs (`PERSON_1` und `PERSON_2`).
 
 ---
 
-### 4.5 Feature 5: Interaktives Review-GUI (NiceGUI)
+### 4.5 Feature 5: Interaktives Review-GUI (NiceGUI) *(Umgesetzt)*
 
 * **Single-Page Application (`app.py`):**
   * Start als eigenständiges natives Desktop-Fenster (`native=True` via pywebview/WebView2) oder im Webbrowser (`--browser`).
@@ -108,7 +108,7 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 
 ---
 
-### 4.6 Feature 6: Deterministische 2-Wege De-Anonymisierung
+### 4.6 Feature 6: Deterministische 2-Wege De-Anonymisierung *(Umgesetzt)*
 
 * **Single-Pass Regex-Substitution:** Platzhalter werden nach Längen absteigend sortiert und in einem einzigen Regex-Durchlauf ersetzt, um Kaskadierungsfehler (Überschreiben von Platzhaltern innerhalb ersetzter Klartexte) mathematisch auszuschliessen.
 * **Audit-Report:** JSON-Bericht mit Dokument-Metadaten, Entitätszählern, Konfidenzen und Review-Status.
@@ -123,10 +123,11 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 ### ✅ Phase 2: Testsuite & NiceGUI Review-GUI (Abgeschlossen)
 * 15/15 Pytest Regressionstests, NiceGUI Desktop-Anwendung, In-Memory File Handling, Entitäten-Bündelung, Kontext-Akkordeons, Sortier-Toolbar, nativer Datei-Export.
 
-### ⏳ Phase 3: Semantische Rollen, Entity-Linking & Markdown-Extraktion (Aktuell)
+### ✅ Phase 3: Semantische Rollen, Entity-Linking & Markdown-Extraktion (Abgeschlossen)
+* 21/21 Pytest Regressionstests bestanden (100%).
 * Einbindung von `pymupdf4llm` für formatierte Markdown-Extraktion aus PDFs.
-* Umsetzung der 3 Platzhalter-Format-Modi (`[TYP_NUMMER]`, `[TYP_NUMMER_ROLLE]`, `[TYP_ROLLE]`).
-* Implementierung des Entity-Linkings für Schreibweisen (`VOLLNAME`, `VORNAME`, `ANREDE`, `KURZFORM`) im Core und im GUI.
+* Umsetzung der 3 Platzhalter-Format-Modi (`[TYP_NUMMER]`, `[TYP_NUMMER_ROLLE]`, `[TYP_ROLLE]` mit Kollisionsschutz).
+* Implementierung des Entity-Linkings für Schreibweisen (`VOLLNAME`, `VORNAME`, `NACHNAME`, `KURZFORM`, `ANREDE`) im Core und im GUI inklusive `✕ Trennen`-Aktion.
 
 ### 🔮 Phase 4: Lokaler SLM-Triage-Layer (Geplant / Ausblick)
 * Optionaler Triage-Filter mit lokalem SLM (z. B. via Ollama / LM Studio) zur automatischen Vorfilterung von Grenzfall-Entitäten.

@@ -4,6 +4,7 @@ import io
 from pathlib import Path
 from typing import Union
 import pymupdf  # PyMuPDF
+import pymupdf4llm
 import docx
 
 
@@ -57,48 +58,61 @@ def extract_text_from_docx(path: Path) -> str:
 
 def extract_text_from_pdf_bytes(raw_bytes: bytes, filename: str = "document.pdf") -> str:
     """
-    Extract text from PDF bytes using PyMuPDF.
+    Extract structured Markdown text from PDF bytes using pymupdf4llm.
+    Preserves headings, lists, tables, and bold/italic styles.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
     doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
-    pages_text = []
-    for page in doc:
-        text = page.get_text()
-        if text.strip():
-            pages_text.append(text.strip())
     doc_pages = doc.page_count
-    doc.close()
 
-    if doc_pages > 0 and not pages_text:
+    # Check if there is any extractable text across pages
+    has_text = any(page.get_text().strip() for page in doc)
+    if doc_pages > 0 and not has_text:
+        doc.close()
         raise ValueError(
             f"No extractable text found in PDF '{filename}' ({doc_pages} pages). "
             f"The file appears to be a scanned/image-based PDF requiring OCR, or an empty document."
         )
 
-    return "\n\n--- Page Break ---\n\n".join(pages_text)
+    try:
+        md_text = pymupdf4llm.to_markdown(doc)
+    except Exception:
+        # Fallback to plain get_text if markdown conversion fails
+        pages_text = [page.get_text().strip() for page in doc if page.get_text().strip()]
+        md_text = "\n\n--- Page Break ---\n\n".join(pages_text)
+    finally:
+        doc.close()
+
+    return md_text.strip()
 
 
 def extract_text_from_pdf(path: Path) -> str:
     """
-    Extract text from PDF files using PyMuPDF.
+    Extract structured Markdown text from PDF files using pymupdf4llm.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
     doc = pymupdf.open(str(path))
-    pages_text = []
-    for page in doc:
-        text = page.get_text()
-        if text.strip():
-            pages_text.append(text.strip())
     doc_pages = doc.page_count
-    doc.close()
 
-    if doc_pages > 0 and not pages_text:
+    # Check if there is any extractable text across pages
+    has_text = any(page.get_text().strip() for page in doc)
+    if doc_pages > 0 and not has_text:
+        doc.close()
         raise ValueError(
             f"No extractable text found in PDF '{path.name}' ({doc_pages} pages). "
             f"The file appears to be a scanned/image-based PDF requiring OCR, or an empty document."
         )
 
-    return "\n\n--- Page Break ---\n\n".join(pages_text)
+    try:
+        md_text = pymupdf4llm.to_markdown(doc)
+    except Exception:
+        # Fallback to plain get_text if markdown conversion fails
+        pages_text = [page.get_text().strip() for page in doc if page.get_text().strip()]
+        md_text = "\n\n--- Page Break ---\n\n".join(pages_text)
+    finally:
+        doc.close()
+
+    return md_text.strip()
 
 
 def read_document_from_bytes(data: bytes, filename: str) -> str:

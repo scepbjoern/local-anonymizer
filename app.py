@@ -9,14 +9,16 @@ import html
 import io
 import json
 import os
+import re
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from nicegui import app, ui
 
-from local_anonymizer.anonymizer import AnonymizationResult, DetectedEntity, LocalAnonymizer
+from local_anonymizer.anonymizer import AnonymizationResult, DetectedEntity, LocalAnonymizer, clean_tag
 from local_anonymizer.extractors import UnsupportedFileFormatError, read_document_from_bytes
 
 
@@ -35,7 +37,14 @@ class EntityGroup:
         self.original_text: str = original_text
         self.entity_type: str = entity_type
         self.enabled: bool = True
+        self.role: str = ""
+        self.parent_group_text: Optional[str] = None
+        self.surface_tag: str = ""
         self.occurrences: List[EntityOccurrence] = []
+
+    @property
+    def key(self) -> str:
+        return self.original_text.strip().lower()
 
     @property
     def count(self) -> int:
@@ -62,11 +71,13 @@ class AppState:
         self.anonymizer: Optional[LocalAnonymizer] = None
         self.entity_groups: List[EntityGroup] = []
         self.active_entities: List[str] = ["PERSON", "ORGANIZATION", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION"]
+        self.format_mode: str = "numbered"  # "numbered", "numbered_role", "role_only"
         self.gliner_threshold: float = 0.55
         self.sort_by: str = "Erstes Auftreten im Text"
         self.ignore_terms_text: str = "CAS, DAS, MAS, BSc, MSc, PhD, MBA, Studierende, Studierenden, Dozent, Dozenten, Lehrperson, Berater, Aufgabensteller"
         self.glossary_text: str = "ZHAW: ORGANIZATION\nHWZ: ORGANIZATION\nUZH: ORGANIZATION\nETH: ORGANIZATION"
-        
+        self.colliding_roles: Set[Tuple[str, str]] = set()
+
         # Tab 2 state
         self.restore_anon_text: str = ""
         self.restore_mapping: Dict[str, str] = {}
@@ -91,19 +102,28 @@ AVAILABLE_ENTITIES = [
     "IP_ADDRESS",
 ]
 
+SURFACE_TAG_OPTIONS = [
+    ("VOLLNAME", "Vollname"),
+    ("VORNAME", "Vorname"),
+    ("NACHNAME", "Nachname"),
+    ("ANREDE", "Anrede / Titel"),
+    ("KURZFORM", "Kurzform / Kürzel"),
+    ("STANDALONE", "Eigenständig"),
+]
+
 
 def extract_context_snippet(raw_text: str, start: int, end: int, window: int = 40) -> str:
     """Extract contextual snippet around entity with highlighted keyword."""
     ctx_start = max(0, start - window)
     ctx_end = min(len(raw_text), end + window)
-    
+
     before = raw_text[ctx_start:start].replace("\r", " ").replace("\n", " ")
     match = raw_text[start:end].replace("\r", " ").replace("\n", " ")
     after = raw_text[end:ctx_end].replace("\r", " ").replace("\n", " ")
-    
+
     prefix = "…" if ctx_start > 0 else ""
     suffix = "…" if ctx_end < len(raw_text) else ""
-    
+
     return f"{prefix}{html.escape(before)}<b class='text-blue-700 bg-blue-100 px-1 rounded'>{html.escape(match)}</b>{html.escape(after)}{suffix}"
 
 
@@ -156,56 +176,122 @@ def build_anonymizer() -> LocalAnonymizer:
 
 def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
     """
-    Recalculate placeholder substitution based on current active checkbox and type selections.
+    Recalculate placeholder substitution based on current active groups, roles, format mode, and entity links.
     """
     if not state.raw_text:
         return "", {}, {}
 
-    # Flatten active occurrences from enabled entity groups
-    active_occurrences = []
-    for group in state.entity_groups:
-        if group.enabled:
-            for occ in group.occurrences:
-                active_occurrences.append({
-                    "original": group.original_text,
-                    "type": group.entity_type,
-                    "start": occ.start,
-                    "end": occ.end,
-                    "score": occ.score,
-                    "needs_review": occ.needs_review,
-                })
+    active_groups = [g for g in state.entity_groups if g.enabled]
+    if not active_groups:
+        return state.raw_text, {}, {"source_file": state.filename, "entity_count": 0, "mapping": {}, "entities": []}
 
-    # Category counters and placeholder generation
+    # Prepare roles and links
+    roles_map: Dict[str, str] = {}
+    entity_links: Dict[str, Tuple[str, str]] = {}
+
+    for g in active_groups:
+        if g.role:
+            roles_map[g.key] = g.role
+        if g.parent_group_text and g.parent_group_text.strip().lower() != g.key:
+            entity_links[g.key] = (g.parent_group_text.strip(), g.surface_tag or "VORNAME")
+        elif g.surface_tag:
+            entity_links[g.key] = ("", g.surface_tag)
+
+    # 1. Assign entity numbering to master groups
     category_counters: Dict[str, int] = {}
-    value_to_placeholder: Dict[Tuple[str, str], str] = {}
+    group_info: Dict[str, Dict[str, Any]] = {}
+
+    # Pass 1: Masters
+    for g in active_groups:
+        is_child = g.parent_group_text and g.parent_group_text.strip().lower() != g.key
+        if not is_child:
+            count = category_counters.get(g.entity_type, 0) + 1
+            category_counters[g.entity_type] = count
+            group_info[g.key] = {
+                "id": count,
+                "role": g.role,
+                "surface_tag": g.surface_tag,
+            }
+
+    # Pass 2: Linked children
+    for g in active_groups:
+        is_child = g.parent_group_text and g.parent_group_text.strip().lower() != g.key
+        if is_child:
+            parent_key = g.parent_group_text.strip().lower()
+            if parent_key in group_info:
+                p_id = group_info[parent_key]["id"]
+                p_role = group_info[parent_key]["role"] or g.role
+            else:
+                count = category_counters.get(g.entity_type, 0) + 1
+                category_counters[g.entity_type] = count
+                p_id = count
+                p_role = g.role
+
+            group_info[g.key] = {
+                "id": p_id,
+                "role": p_role,
+                "surface_tag": g.surface_tag or "VORNAME",
+            }
+
+    # 2. Check collisions for Mode 3 (role_only)
+    role_type_groups: Dict[Tuple[str, str], Set[int]] = {}
+    for g in active_groups:
+        info = group_info.get(g.key, {})
+        role_str = clean_tag(info.get("role", ""))
+        if role_str:
+            pair = (g.entity_type, role_str)
+            role_type_groups.setdefault(pair, set()).add(info.get("id", 1))
+
+    state.colliding_roles = {pair for pair, ids in role_type_groups.items() if len(ids) > 1}
+
+    # 3. Generate placeholders
     mapping: Dict[str, str] = {}
     final_entities_report = []
+    flat_occurrences = []
 
-    for item in active_occurrences:
-        orig = item["original"]
-        etype = item["type"]
-        norm_key = (orig.strip().lower(), etype)
+    for g in active_groups:
+        info = group_info.get(g.key, {"id": 1, "role": "", "surface_tag": ""})
+        ent_id = info["id"]
+        role_str = clean_tag(info["role"])
+        tag_str = clean_tag(info["surface_tag"])
+        suffix_tag = f"_{tag_str}" if tag_str else ""
+        pair = (g.entity_type, role_str)
+        is_colliding = pair in state.colliding_roles
 
-        if norm_key not in value_to_placeholder:
-            count = category_counters.get(etype, 0) + 1
-            category_counters[etype] = count
-            placeholder = f"[{etype}_{count}]"
-            value_to_placeholder[norm_key] = placeholder
-            mapping[placeholder] = orig
+        if state.format_mode == "role_only" and role_str and not is_colliding:
+            placeholder = f"[{g.entity_type}_{role_str}{suffix_tag}]"
+        elif (state.format_mode in ("numbered_role", "role_only") or is_colliding) and role_str:
+            placeholder = f"[{g.entity_type}_{ent_id}_{role_str}{suffix_tag}]"
         else:
-            placeholder = value_to_placeholder[norm_key]
+            # Modus 1 (Numbered)
+            placeholder = f"[{g.entity_type}_{ent_id}{suffix_tag}]"
 
-        item["placeholder"] = placeholder
-        final_entities_report.append({
-            "type": etype,
-            "original": orig,
-            "placeholder": placeholder,
-            "score": round(item["score"], 3),
-            "needs_review": item["needs_review"],
-        })
+        mapping[placeholder] = g.original_text
 
-    # Sort accepted items by start descending to replace in reverse character order
-    sorted_for_sub = sorted(active_occurrences, key=lambda x: x["start"], reverse=True)
+        for occ in g.occurrences:
+            flat_occurrences.append({
+                "start": occ.start,
+                "end": occ.end,
+                "score": occ.score,
+                "original": g.original_text,
+                "type": g.entity_type,
+                "placeholder": placeholder,
+                "needs_review": occ.needs_review,
+                "role": info["role"] or None,
+                "surface_tag": info["surface_tag"] or None,
+            })
+            final_entities_report.append({
+                "type": g.entity_type,
+                "original": g.original_text,
+                "placeholder": placeholder,
+                "score": round(occ.score, 3),
+                "needs_review": occ.needs_review,
+                "role": info["role"] or None,
+                "surface_tag": info["surface_tag"] or None,
+            })
+
+    # 4. Substitute in reverse character order
+    sorted_for_sub = sorted(flat_occurrences, key=lambda x: x["start"], reverse=True)
     chars = list(state.raw_text)
     for item in sorted_for_sub:
         start, end = item["start"], item["end"]
@@ -215,6 +301,7 @@ def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
 
     audit_report = {
         "source_file": state.filename,
+        "format_mode": state.format_mode,
         "entity_count": len(final_entities_report),
         "unique_entities_count": len(mapping),
         "mapping": mapping,
@@ -294,7 +381,13 @@ def create_ui():
 
         preview_holder.clear()
         with preview_holder:
-            ui.label("Anonymisierte Vorschau:").classes("font-semibold text-slate-700 mb-1")
+            if state.format_mode == "role_only" and state.colliding_roles:
+                with ui.row().classes("w-full items-center gap-2 p-3 mb-2 bg-amber-50 border border-amber-300 rounded text-amber-900 text-xs"):
+                    ui.icon("warning", size="sm").classes("text-amber-600")
+                    coll_str = ", ".join(f"'{pair[1]}' ({pair[0]})" for pair in state.colliding_roles)
+                    ui.label(f"Rollenkollision erkannt: Rolle {coll_str} ist mehrfach vergeben. Automatischer Fallback auf Modus 2 (nummeriert) für diese Entitäten.").classes("font-medium")
+
+            ui.label("Anonymisierte Vorschau (Live Markdown / Text):").classes("font-semibold text-slate-700 mb-1")
             ui.textarea(value=anon_text).props("readonly rows=12").classes("w-full font-mono text-sm bg-slate-50 border rounded p-2")
 
         export_holder.clear()
@@ -389,11 +482,11 @@ def create_ui():
             with table_holder:
                 with ui.row().classes("items-center gap-3 p-4 bg-blue-50 rounded border border-blue-200"):
                     ui.spinner(size="md", color="primary")
-                    ui.label("Dokument wird lokal analysiert (NER & Entitätserkennung)...").classes("text-slate-700 text-sm font-medium")
+                    ui.label("Dokument wird lokal analysiert (NER, Markdown & Entitätserkennung)...").classes("text-slate-700 text-sm font-medium")
 
         try:
             anonymizer = build_anonymizer()
-            # Run CPU-intensive NER in a background worker thread
+            # Run CPU-intensive NER in background worker thread
             results = await asyncio.to_thread(anonymizer.analyze, state.raw_text)
 
             # Group detected entities by canonical term
@@ -404,7 +497,7 @@ def create_ui():
                 key = norm.lower()
                 needs_rev = 0.70 <= res.score < 0.85
                 ctx_html = extract_context_snippet(state.raw_text, res.start, res.end)
-                
+
                 occ = EntityOccurrence(
                     start=res.start,
                     end=res.end,
@@ -418,8 +511,30 @@ def create_ui():
 
             state.entity_groups = list(groups_dict.values())
 
+            # Automatic Smart Linking Detection (e.g. "Julia" is substring of "Julia Meier")
+            all_keys = [g.original_text for g in state.entity_groups]
+            for g in state.entity_groups:
+                g_words = g.original_text.split()
+                if len(g_words) == 1:
+                    for other in state.entity_groups:
+                        if other.key != g.key and other.entity_type == g.entity_type:
+                            other_words = other.original_text.split()
+                            if len(other_words) > 1:
+                                if g.original_text.lower() == other_words[0].lower():
+                                    g.parent_group_text = other.original_text
+                                    g.surface_tag = "VORNAME"
+                                    if not other.surface_tag:
+                                        other.surface_tag = "VOLLNAME"
+                                    break
+                                elif g.original_text.lower() == other_words[-1].lower():
+                                    g.parent_group_text = other.original_text
+                                    g.surface_tag = "NACHNAME"
+                                    if not other.surface_tag:
+                                        other.surface_tag = "VOLLNAME"
+                                    break
+
             total_occurrences = sum(g.count for g in state.entity_groups)
-            ui.notify(f"Analyse abgeschlossen: {len(state.entity_groups)} einzigartige Begriffe ({total_occurrences} Fundstellen).", type="positive")
+            ui.notify(f"Analyse abgeschlossen: {len(state.entity_groups)} Begriffe ({total_occurrences} Fundstellen).", type="positive")
             build_review_table()
             refresh_preview_and_exports()
 
@@ -467,7 +582,6 @@ def create_ui():
         elif state.sort_by == "⚠️ Review-Bedarf zuerst":
             return sorted(state.entity_groups, key=lambda g: (not g.needs_review, -g.count, g.first_start))
         else:
-            # Default: Erstes Auftreten im Text
             return sorted(state.entity_groups, key=lambda g: g.first_start)
 
     def build_review_table():
@@ -483,7 +597,7 @@ def create_ui():
             unique_count = len(state.entity_groups)
 
             ui.label(f"Erkannte Entitäten ({unique_count} Begriffe, {total_hits} Fundstellen gesamt)").classes("text-lg font-bold text-slate-800 mb-1")
-            ui.label("Prüfen Sie gefundene Begriffe gebündelt. Ein Klick auf die Zeile klappt alle Fundstellen im Kontext auf:").classes("text-sm text-slate-600 mb-3")
+            ui.label("Vergeben Sie optionale Rollen oder verknüpfen Sie Schreibweisen (z. B. Julia ↳ Julia Meier). Klick auf die Zeile klappt Kontext auf:").classes("text-sm text-slate-600 mb-3")
 
             # Toolbar: Sorting & Bulk actions
             with ui.row().classes("w-full items-center justify-between bg-slate-100 p-2.5 rounded-lg border mb-3 flex-wrap gap-2"):
@@ -525,15 +639,16 @@ def create_ui():
 
             sorted_groups = get_sorted_groups()
 
-            # Grouped Entity Rows (Accordion for Context Snippets)
+            # Grouped Entity Rows with Role, Linking & Context
             for idx, group in enumerate(sorted_groups):
                 row_bg = "bg-amber-50" if group.needs_review else ("bg-white" if idx % 2 == 0 else "bg-slate-50")
-                
-                with ui.expansion().classes(f"w-full border rounded mb-1 {row_bg}") as exp:
+                is_linked = bool(group.parent_group_text and group.parent_group_text.strip().lower() != group.key)
+
+                with ui.expansion().classes(f"w-full border rounded mb-1.5 {row_bg}") as exp:
                     with exp.add_slot("header"):
-                        with ui.row().classes("w-full items-center justify-between gap-3 pr-2"):
-                            # Left part: Checkbox + Name + Count Badge
-                            with ui.row().classes("items-center gap-2 flex-1 min-w-[200px]"):
+                        with ui.row().classes("w-full items-center justify-between gap-3 pr-2 flex-wrap"):
+                            # 1. Checkbox + Name + Count Badge
+                            with ui.row().classes("items-center gap-2 min-w-[220px]"):
                                 def make_group_check(grp):
                                     def on_change(e):
                                         grp.enabled = e.value
@@ -544,29 +659,101 @@ def create_ui():
                                 ui.label(group.original_text).classes("font-mono text-sm font-bold text-slate-800")
                                 ui.badge(f"{group.count}x", color="primary" if group.count > 1 else "grey-6").props("dense")
 
-                            # Middle: Type Selector
-                            with ui.row().classes("items-center gap-2"):
+                            # 2. Type Selector
+                            with ui.row().classes("items-center gap-1"):
                                 def make_group_select(grp):
                                     def on_change(e):
                                         grp.entity_type = e.value
                                         refresh_preview_and_exports()
+                                        build_review_table()
                                     return on_change
 
                                 ui.select(
                                     options=AVAILABLE_ENTITIES,
                                     value=group.entity_type,
                                     on_change=make_group_select(group),
-                                ).props("dense outlined bg-white").classes("w-44 text-xs")
+                                ).props("dense outlined bg-white").classes("w-36 text-xs")
 
-                            # Right part: Score & Review Badge
-                            with ui.row().classes("items-center gap-3"):
-                                ui.label(f"Score: {group.max_score:.2f}").classes("text-xs font-mono text-slate-600")
+                            # 3. Role / Context Input Field
+                            with ui.row().classes("items-center gap-1"):
+                                def make_role_change(grp):
+                                    def on_change(e):
+                                        grp.role = e.value.strip()
+                                        refresh_preview_and_exports()
+                                    return on_change
+
+                                ui.input(
+                                    label="Rolle (optional)",
+                                    value=group.role,
+                                    placeholder="z.B. Student",
+                                    on_change=make_role_change(group),
+                                ).props("dense outlined bg-white").classes("w-32 text-xs")
+
+                            # 4. Linking Selector & Unlink Button
+                            with ui.row().classes("items-center gap-1"):
+                                other_master_candidates = [
+                                    g.original_text for g in state.entity_groups
+                                    if g.key != group.key and g.entity_type == group.entity_type and not g.parent_group_text
+                                ]
+                                link_options = ["Eigenständig"] + other_master_candidates
+                                current_link_val = group.parent_group_text if is_linked else "Eigenständig"
+
+                                def make_link_change(grp):
+                                    def on_change(e):
+                                        if e.value == "Eigenständig" or not e.value:
+                                            grp.parent_group_text = None
+                                        else:
+                                            grp.parent_group_text = e.value
+                                            if not grp.surface_tag:
+                                                grp.surface_tag = "VORNAME"
+                                        refresh_preview_and_exports()
+                                        build_review_table()
+                                    return on_change
+
+                                ui.select(
+                                    options=link_options,
+                                    value=current_link_val,
+                                    label="Verknüpft mit:",
+                                    on_change=make_link_change(group),
+                                ).props("dense outlined bg-white").classes("w-40 text-xs")
+
+                                if is_linked:
+                                    def make_tag_change(grp):
+                                        def on_change(e):
+                                            grp.surface_tag = e.value
+                                            refresh_preview_and_exports()
+                                        return on_change
+
+                                    ui.select(
+                                        options=[opt[0] for opt in SURFACE_TAG_OPTIONS],
+                                        value=group.surface_tag or "VORNAME",
+                                        label="Form:",
+                                        on_change=make_tag_change(group),
+                                    ).props("dense outlined bg-white").classes("w-28 text-xs")
+
+                                    # Explicit UNLINK Button
+                                    def make_unlink_btn(grp):
+                                        def on_click():
+                                            grp.parent_group_text = None
+                                            grp.surface_tag = ""
+                                            ui.notify(f"Verknüpfung von '{grp.original_text}' gelöst.", type="info")
+                                            refresh_preview_and_exports()
+                                            build_review_table()
+                                        return on_click
+
+                                    ui.button(
+                                        "✕ Trennen",
+                                        on_click=make_unlink_btn(group),
+                                    ).props("flat dense color=negative size=sm").tooltip("Verknüpfung aufheben und als eigenständige Person behandeln")
+
+                            # 5. Score & Action
+                            with ui.row().classes("items-center gap-2"):
+                                ui.label(f"{group.max_score:.2f}").classes("text-xs font-mono text-slate-600")
                                 if group.needs_review:
                                     ui.badge("⚠️ Review", color="warning").props("dense")
                                 else:
                                     ui.badge("✓ Sicher", color="positive").props("dense outline")
 
-                                # Action: Ignore Term
                                 def make_group_ignore(term, grp):
                                     def on_click():
                                         current_ignores = parse_ignore_terms(state.ignore_terms_text)
@@ -585,7 +772,7 @@ def create_ui():
                                     on_click=make_group_ignore(group.original_text, group),
                                 ).props("flat dense size=sm color=grey-8")
 
-                    # Expanded slot: Occurrences in context
+                    # Expanded content: Context occurrences
                     with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
                         ui.label(f"Fundstellen im Text ({group.count} Vorkommen):").classes("text-xs font-bold text-slate-700")
                         for occ_idx, occ in enumerate(group.occurrences, start=1):
@@ -605,7 +792,25 @@ def create_ui():
                 on_upload=handle_upload,
                 auto_upload=True,
                 max_files=1,
-            ).props("accept='.txt,.md,.docx,.pdf,.json,.csv' outlined dense flat").classes("w-full mb-4")
+            ).props("accept='.txt,.md,.docx,.pdf,.json,.csv' outlined dense flat").classes("w-full mb-3")
+
+            ui.separator().classes("my-2")
+
+            # Format Mode Selector (Phase 3 Feature)
+            ui.label("Platzhalter-Format:").classes("text-xs font-semibold text-slate-700 mb-1")
+            def on_mode_change(e):
+                state.format_mode = e.value
+                refresh_preview_and_exports()
+
+            ui.radio(
+                {
+                    "numbered": "Modus 1: [TYP_NR] (Standard)",
+                    "numbered_role": "Modus 2: [TYP_NR_ROLLE] (Empfohlen)",
+                    "role_only": "Modus 3: [TYP_ROLLE] (Kompakt)",
+                },
+                value=state.format_mode,
+                on_change=on_mode_change,
+            ).props("dense").classes("text-xs mb-3")
 
             ui.separator().classes("my-2")
 
@@ -665,8 +870,8 @@ def create_ui():
                 # TAB 1: Anonymize
                 with ui.tab_panel(tab_anonymize):
                     ui.label("Stufe 1: Dokument & Text-Eingabe").classes("text-base font-bold text-slate-800 mb-1")
-                    
-                    with ui.expansion("Originaltext anzeigen / direkt bearbeiten", icon="edit_note").classes("w-full mb-4"):
+
+                    with ui.expansion("Originaltext anzeigen / direkt bearbeiten (Markdown unterstützt)", icon="edit_note").classes("w-full mb-4"):
                         def on_raw_text_change(e):
                             state.raw_text = e.value
                         raw_text_area = ui.textarea(
@@ -677,7 +882,7 @@ def create_ui():
 
                     ui.separator().classes("my-4")
 
-                    ui.label("Stufe 2: Interaktive Review-Tabelle").classes("text-base font-bold text-slate-800 mb-1")
+                    ui.label("Stufe 2: Interaktive Review- & Linking-Tabelle").classes("text-base font-bold text-slate-800 mb-1")
                     table_holder = ui.column().classes("w-full mb-4")
 
                     ui.separator().classes("my-4")
@@ -697,7 +902,7 @@ def create_ui():
                             def on_anon_change(e):
                                 state.restore_anon_text = e.value
                             restore_anon_input = ui.textarea(
-                                placeholder="[PERSON_1] arbeitet an [ORGANIZATION_1]...",
+                                placeholder="[PERSON_1_STUDENT_VOLLNAME] arbeitet an [ORGANIZATION_1_HOCHSCHULE]...",
                                 on_change=on_anon_change,
                             ).props("outlined rows=8").classes("w-full font-mono text-xs")
 
@@ -727,7 +932,7 @@ def create_ui():
                                 except Exception:
                                     pass
                             map_json_input = ui.textarea(
-                                placeholder='{\n  "[PERSON_1]": "Max Mustermann"\n}',
+                                placeholder='{\n  "[PERSON_1_STUDENT_VOLLNAME]": "Julia Meier"\n}',
                                 on_change=on_map_text_change,
                             ).props("outlined rows=4").classes("w-full font-mono text-xs")
 

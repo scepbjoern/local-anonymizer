@@ -29,6 +29,7 @@ DEFAULT_IGNORE_TERMS = [
     "Unternehmen", "Unternehmens", "Firma", "Organisation", "Hochschule", "Universität",
     "Prüfung", "Prüfungen", "Vorlesung", "Modul", "Lehrgang", "Weiterbildung",
     "Telefon", "Tel", "Email", "E-Mail", "Mail", "Adresse", "Website", "Datum",
+    "Name", "Namen", "Vorname", "Vornamen", "Nachname", "Nachnamen", "Rolle", "Titel", "Status",
 ]
 
 
@@ -49,6 +50,14 @@ class BlankSpacyNlpEngine(SpacyNlpEngine):
         return list(self.nlp.keys())
 
 
+def clean_tag(text: str) -> str:
+    """Clean a role or surface tag to be uppercase alphanumeric with underscores."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", text.strip().upper())
+    return cleaned.strip("_")
+
+
 @dataclass
 class DetectedEntity:
     """Represents an entity detected in the text."""
@@ -59,6 +68,8 @@ class DetectedEntity:
     end: int
     score: float
     needs_review: bool = False
+    role: Optional[str] = None
+    surface_tag: Optional[str] = None
 
 
 @dataclass
@@ -82,6 +93,8 @@ class AnonymizationResult:
                     "placeholder": e.placeholder,
                     "score": round(e.score, 3),
                     "needs_review": e.needs_review,
+                    "role": e.role,
+                    "surface_tag": e.surface_tag,
                 }
                 for e in self.entities
             ],
@@ -218,41 +231,150 @@ class LocalAnonymizer:
         accepted.sort(key=lambda r: r.start)
         return accepted
 
-    def anonymize(self, text: str) -> AnonymizationResult:
+    def anonymize(
+        self,
+        text: str,
+        format_mode: str = "numbered",
+        roles: Optional[Dict[str, str]] = None,
+        entity_links: Optional[Dict[str, Tuple[str, str]]] = None,
+    ) -> AnonymizationResult:
         """
         Anonymize text, producing a placeholder-substituted text and a local mapping.
-        Placeholders follow the format [CATEGORY_N] (e.g. [PERSON_1], [ORGANIZATION_1]).
-        Identical original texts for the same entity type receive the identical placeholder.
+
+        Format Modes:
+          - "numbered" (Modus 1): [TYPE_N] or [TYPE_N_TAG]
+          - "numbered_role" (Modus 2): [TYPE_N_ROLE] or [TYPE_N_ROLE_TAG]
+          - "role_only" (Modus 3): [TYPE_ROLE] (falls back to Modus 2 if multiple entities share (type, role))
+
+        Parameters:
+          - roles: dict of normalized_term -> role (e.g. {"julia": "STUDENT"})
+          - entity_links: dict of child_term -> (parent_term, surface_tag)
+            (e.g. {"julia": ("julia meier", "VORNAME"), "julia meier": ("", "VOLLNAME")})
         """
         if not text:
             return AnonymizationResult(anonymized_text="", mapping={})
 
+        roles = {k.strip().lower(): v.strip() for k, v in (roles or {}).items() if v and v.strip()}
+        entity_links = {
+            k.strip().lower(): (v[0].strip().lower(), v[1].strip())
+            for k, v in (entity_links or {}).items()
+            if v and len(v) == 2
+        }
+
         recognizer_results = self.analyze(text)
 
-        # Track category counters and entity-to-placeholder mappings
-        category_counters: Dict[str, int] = {}
-        # Mapping from (normalized_original_text, entity_type) -> placeholder
-        value_to_placeholder: Dict[Tuple[str, str], str] = {}
-        # Final mapping: placeholder -> original_text
-        mapping: Dict[str, str] = {}
+        # 1. Identify all unique entity terms and their types in order of first appearance
+        # Key: (normalized_term, entity_type)
+        unique_entities: List[Tuple[str, str]] = []
+        for res in recognizer_results:
+            orig = text[res.start:res.end].strip()
+            key = (orig.lower(), res.entity_type)
+            if key not in unique_entities:
+                unique_entities.append(key)
 
+        # 2. Assign entity IDs and roles (master vs linked)
+        category_counters: Dict[str, int] = {}
+        # entity_info: (norm_term, entity_type) -> {"id": int, "role": str, "surface_tag": str}
+        entity_info: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        # First pass: Process master entities (entities not linked to a different parent)
+        for norm_term, etype in unique_entities:
+            parent_info = entity_links.get(norm_term)
+            is_child = parent_info and parent_info[0] and parent_info[0] != norm_term
+
+            if not is_child:
+                count = category_counters.get(etype, 0) + 1
+                category_counters[etype] = count
+                role = roles.get(norm_term, "")
+                tag = parent_info[1] if parent_info else ""
+                entity_info[(norm_term, etype)] = {
+                    "id": count,
+                    "role": role,
+                    "surface_tag": tag,
+                }
+
+        # Second pass: Process linked child entities (inheriting parent's ID and role)
+        for norm_term, etype in unique_entities:
+            parent_info = entity_links.get(norm_term)
+            is_child = parent_info and parent_info[0] and parent_info[0] != norm_term
+
+            if is_child:
+                parent_term, tag = parent_info
+                parent_key = (parent_term, etype)
+                if parent_key in entity_info:
+                    p_id = entity_info[parent_key]["id"]
+                    p_role = entity_info[parent_key]["role"] or roles.get(norm_term, "")
+                else:
+                    # Fallback if parent wasn't found as master
+                    count = category_counters.get(etype, 0) + 1
+                    category_counters[etype] = count
+                    p_id = count
+                    p_role = roles.get(norm_term, "")
+
+                entity_info[(norm_term, etype)] = {
+                    "id": p_id,
+                    "role": p_role,
+                    "surface_tag": tag or "VARIANT",
+                }
+
+        # 3. Collision check for Modus 3 ("role_only")
+        # Count distinct master entities sharing the exact same (entity_type, role) pair
+        role_type_groups: Dict[Tuple[str, str], Set[int]] = {}
+        for (norm_term, etype), info in entity_info.items():
+            if info["role"]:
+                c_role = clean_tag(info["role"])
+                if c_role:
+                    pair = (etype, c_role)
+                    role_type_groups.setdefault(pair, set()).add(info["id"])
+
+        colliding_pairs: Set[Tuple[str, str]] = {
+            pair for pair, ids in role_type_groups.items() if len(ids) > 1
+        }
+
+        if format_mode == "role_only" and colliding_pairs:
+            for etype, c_role in colliding_pairs:
+                warnings.warn(
+                    f"Rollenkollision bei Entitätstyp '{etype}' mit Rolle '{c_role}': "
+                    f"Mehrere Entitäten teilen dieselbe Rolle. Automatischer Fallback auf Modus 2 (nummeriert) für diese Rolle.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        # 4. Generate placeholders and mapping
+        value_to_placeholder: Dict[Tuple[str, str], str] = {}
+        mapping: Dict[str, str] = {}
         detected_entities: List[DetectedEntity] = []
         review_needed: List[DetectedEntity] = []
 
         for res in recognizer_results:
             orig_val = text[res.start:res.end]
-            norm_key = (orig_val.strip().lower(), res.entity_type)
+            norm_term = orig_val.strip().lower()
+            key = (norm_term, res.entity_type)
 
-            if norm_key not in value_to_placeholder:
-                count = category_counters.get(res.entity_type, 0) + 1
-                category_counters[res.entity_type] = count
-                placeholder = f"[{res.entity_type}_{count}]"
-                value_to_placeholder[norm_key] = placeholder
+            info = entity_info.get(key, {"id": 1, "role": "", "surface_tag": ""})
+            ent_id = info["id"]
+            role_str = clean_tag(info["role"])
+            tag_str = clean_tag(info["surface_tag"])
+
+            if key not in value_to_placeholder:
+                # Build placeholder according to format_mode & collision rules
+                suffix_tag = f"_{tag_str}" if tag_str else ""
+                pair = (res.entity_type, role_str)
+                is_colliding = pair in colliding_pairs
+
+                if format_mode == "role_only" and role_str and not is_colliding:
+                    placeholder = f"[{res.entity_type}_{role_str}{suffix_tag}]"
+                elif (format_mode in ("numbered_role", "role_only") or is_colliding) and role_str:
+                    placeholder = f"[{res.entity_type}_{ent_id}_{role_str}{suffix_tag}]"
+                else:
+                    # Modus 1 (Numbered) or no role given
+                    placeholder = f"[{res.entity_type}_{ent_id}{suffix_tag}]"
+
+                value_to_placeholder[key] = placeholder
                 mapping[placeholder] = orig_val
             else:
-                placeholder = value_to_placeholder[norm_key]
+                placeholder = value_to_placeholder[key]
 
-            # Review flag: confidence between 0.70 and 0.85
             needs_review = 0.70 <= res.score < 0.85
             entity = DetectedEntity(
                 entity_type=res.entity_type,
@@ -262,12 +384,14 @@ class LocalAnonymizer:
                 end=res.end,
                 score=res.score,
                 needs_review=needs_review,
+                role=info["role"] or None,
+                surface_tag=info["surface_tag"] or None,
             )
             detected_entities.append(entity)
             if needs_review:
                 review_needed.append(entity)
 
-        # Replace spans in reverse order (from end of text to start) to maintain character indices
+        # 5. Single-pass text substitution in reverse character order
         anonymized_chars = list(text)
         for entity in reversed(detected_entities):
             anonymized_chars[entity.start:entity.end] = list(entity.placeholder)

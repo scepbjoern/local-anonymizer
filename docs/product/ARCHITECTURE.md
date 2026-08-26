@@ -88,11 +88,11 @@
   - Nutzt `rapidfuzz.fuzz.ratio` mit Schwellenwerten (High Confidence $\ge 90\%$, Review-Bedarf $\ge 75\%$).
   - Bevorzugt exakte Treffer (Score 1.0) vor Fuzzy-Treffern.
 
-### 2.3 Platzhalter-Engine & Entity-Linking (`anonymizer.py`) *(Geplant für Phase 3 / In Prüfung)*
+### 2.3 Platzhalter-Engine & Entity-Linking (`anonymizer.py`) *(Umgesetzt in Phase 3)*
 - **Format-Modi:**
   - **Modus 1:** `[<TYPE>_<N>]`
   - **Modus 2:** `[<TYPE>_<N>_<ROLE>]`
-  - **Modus 3:** `[<TYPE>_<ROLE>]` *(mit automatischer Kollisions-Prüfung und Fallback auf Modus 2)*
+  - **Modus 3:** `[<TYPE>_<ROLE>]` *(mit automatischer (Typ, Rolle)-Kollisions-Prüfung und Fallback auf Modus 2)*
 - **Co-Referenz-Tags:**
   - Verknüpfte Entitäten erhalten ein gemeinsames Präfix `[<TYPE>_<N>_...]` und ein Oberflächen-Tag (`_VOLLNAME`, `_VORNAME`, `_NACHNAME`, `_KURZFORM`).
 - **De-Anonymisierung:**
