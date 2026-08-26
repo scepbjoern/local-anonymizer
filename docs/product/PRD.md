@@ -131,3 +131,13 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 
 ### 🔮 Phase 4: Lokaler SLM-Triage-Layer (Geplant / Ausblick)
 * Optionaler Triage-Filter mit lokalem SLM (z. B. via Ollama / LM Studio) zur automatischen Vorfilterung von Grenzfall-Entitäten.
+
+### 🔮 Phase 5a: Homonym-Zuordnung pro Fundstelle (Geplant nach CAS-Deliverable)
+* Granulare Disambiguierung identischer Textstellen innerhalb eines Dokuments (z. B. das Wort *„Julia“* an Stelle 1 ist Person 1, an Stelle 3 jedoch Person 2) direkt über Einzelauswahlen in den aufklappbaren Kontext-Akkordeons des Review-GUIs.
+
+### 🔮 Phase 5b: Projekt-Registry für dokumentübergreifende Mappings (Geplant nach CAS-Deliverable)
+* Verschlüsselte, strikt projekt- und kontextbezogene Mapping-Registry (Passphrase-geschützt via KeePass) zur Wiederverwendung konsistenter Pseudonyme über mehrere Dokumente hinweg.
+* **Leitplanken:** 
+  1. Strikt projekt-gescoped (keine globalen Mappings; saubere Trennung beruflich/privat).
+  2. Registry-Treffer sind immer bestätigungspflichtige Vorschläge im Review-GUI (kein automatisches Überschreiben).
+  3. Dokument-Mappings bleiben zu 100% autark und selbsttragend ohne Laufzeitabhängigkeit von der Registry.
