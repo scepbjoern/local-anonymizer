@@ -223,39 +223,49 @@ def create_ui():
                     ),
                 ).props("outline")
 
-    def run_analysis():
+    async def run_analysis():
         if not state.raw_text:
             ui.notify("Bitte laden Sie zuerst ein Dokument hoch oder fügen Sie Text ein.", type="warning")
             return
 
-        with ui.loading_indicator():
-            try:
-                anonymizer = build_anonymizer()
-                results = anonymizer.analyze(state.raw_text)
+        if table_holder:
+            table_holder.clear()
+            with table_holder:
+                with ui.row().classes("items-center gap-3 p-4 bg-blue-50 rounded border border-blue-200"):
+                    ui.spinner(size="md", color="primary")
+                    ui.label("Dokument wird lokal analysiert (NER & Entitätserkennung)...").classes("text-slate-700 text-sm font-medium")
 
-                state.detected_items = []
-                for res in results:
-                    orig_val = state.raw_text[res.start:res.end]
-                    needs_review = 0.70 <= res.score < 0.85
-                    state.detected_items.append({
-                        "enabled": True,
-                        "original": orig_val,
-                        "type": res.entity_type,
-                        "score": res.score,
-                        "start": res.start,
-                        "end": res.end,
-                        "needs_review": needs_review,
-                        "placeholder": f"[{res.entity_type}]",
-                    })
+        n = ui.notify("Analysiere Dokument lokal...", type="info", timeout=0, spinner=True)
+        try:
+            anonymizer = build_anonymizer()
+            results = anonymizer.analyze(state.raw_text)
 
-                ui.notify(f"Analyse abgeschlossen: {len(state.detected_items)} Entitäten gefunden.", type="positive")
-                build_review_table()
-                refresh_preview_and_exports()
+            state.detected_items = []
+            for res in results:
+                orig_val = state.raw_text[res.start:res.end]
+                needs_review = 0.70 <= res.score < 0.85
+                state.detected_items.append({
+                    "enabled": True,
+                    "original": orig_val,
+                    "type": res.entity_type,
+                    "score": res.score,
+                    "start": res.start,
+                    "end": res.end,
+                    "needs_review": needs_review,
+                    "placeholder": f"[{res.entity_type}]",
+                })
 
-            except ValueError as ve:
-                ui.notify(f"Verarbeitungsfehler: {str(ve)}", type="negative", close_button=True, timeout=10000)
-            except Exception as e:
-                ui.notify(f"Unerwarteter Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
+            n.dismiss()
+            ui.notify(f"Analyse abgeschlossen: {len(state.detected_items)} Entitäten gefunden.", type="positive")
+            build_review_table()
+            refresh_preview_and_exports()
+
+        except ValueError as ve:
+            n.dismiss()
+            ui.notify(f"Verarbeitungsfehler: {str(ve)}", type="negative", close_button=True, timeout=10000)
+        except Exception as e:
+            n.dismiss()
+            ui.notify(f"Unerwarteter Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
 
     async def handle_upload(e):
         try:
@@ -273,7 +283,7 @@ def create_ui():
             if raw_text_area is not None:
                 raw_text_area.value = state.raw_text
             ui.notify(f"Datei '{filename}' erfolgreich geladen ({len(state.raw_text)} Zeichen).", type="positive")
-            run_analysis()
+            await run_analysis()
         except UnsupportedFileFormatError as fe:
             ui.notify(f"Nicht unterstütztes Format: {str(fe)}", type="negative")
         except ValueError as ve:
@@ -378,12 +388,13 @@ def create_ui():
             ui.label("Zu anonymisierende Entitäten:").classes("text-xs font-semibold text-slate-700 mb-1")
             for ent in ["PERSON", "ORGANIZATION", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION", "DATE_TIME", "IBAN_CODE"]:
                 def make_ent_toggle(e_name):
-                    def toggle(val):
+                    async def toggle(val):
                         if val.value and e_name not in state.active_entities:
                             state.active_entities.append(e_name)
                         elif not val.value and e_name in state.active_entities:
                             state.active_entities.remove(e_name)
-                        run_analysis()
+                        if state.raw_text:
+                            await run_analysis()
                     return toggle
 
                 ui.checkbox(
