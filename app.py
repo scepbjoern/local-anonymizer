@@ -179,6 +179,7 @@ def create_ui():
     preview_holder = None
     table_holder = None
     export_holder = None
+    raw_text_area = None
 
     def refresh_preview_and_exports():
         if not preview_holder or not export_holder:
@@ -256,12 +257,22 @@ def create_ui():
             except Exception as e:
                 ui.notify(f"Unerwarteter Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
 
-    def handle_upload(e):
+    async def handle_upload(e):
         try:
-            data = e.content.read()
-            state.filename = e.name
-            state.raw_text = read_document_from_bytes(data, e.name)
-            ui.notify(f"Datei '{e.name}' erfolgreich geladen ({len(state.raw_text)} Zeichen).", type="positive")
+            if hasattr(e, 'file'):
+                data = await e.file.read()
+                filename = e.file.name
+            elif hasattr(e, 'content'):
+                data = e.content.read()
+                filename = e.name
+            else:
+                raise ValueError("Unbekanntes Upload-Event-Format")
+
+            state.filename = filename
+            state.raw_text = read_document_from_bytes(data, filename)
+            if raw_text_area is not None:
+                raw_text_area.value = state.raw_text
+            ui.notify(f"Datei '{filename}' erfolgreich geladen ({len(state.raw_text)} Zeichen).", type="positive")
             run_analysis()
         except UnsupportedFileFormatError as fe:
             ui.notify(f"Nicht unterstütztes Format: {str(fe)}", type="negative")
@@ -457,9 +468,15 @@ def create_ui():
 
                         with ui.column().classes("flex-1"):
                             ui.label("2. Mapping-Tabelle (.json):").classes("font-semibold text-xs text-slate-700")
-                            def on_map_upload(e):
+                            async def on_map_upload(e):
                                 try:
-                                    mapping_data = json.loads(e.content.read().decode("utf-8"))
+                                    if hasattr(e, 'file'):
+                                        data = await e.file.read()
+                                    elif hasattr(e, 'content'):
+                                        data = e.content.read()
+                                    else:
+                                        raise ValueError("Unbekanntes Upload-Format")
+                                    mapping_data = json.loads(data.decode("utf-8"))
                                     state.restore_mapping = mapping_data
                                     map_json_input.value = json.dumps(mapping_data, indent=2, ensure_ascii=False)
                                     ui.notify("Mapping-Tabelle geladen.", type="positive")
