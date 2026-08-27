@@ -133,3 +133,26 @@ def test_person_prompts_are_specific_and_role_prompts_are_available():
     assert recognizer.label_mapping["job title"] == "ROLE"
     assert recognizer.label_mapping["professional role"] == "ROLE"
     assert recognizer.label_mapping["position"] == "ROLE"
+
+
+def test_gliner_does_not_merge_a_whitespace_separated_name_list():
+    class DummyModel:
+        def inference(self, chunk_texts, labels, threshold, batch_size):
+            text = chunk_texts[0]
+            tokens = list(re.finditer(r"\S+", text))
+            return [[
+                {"label": "person", "start": match.start(), "end": match.end(), "score": 0.9}
+                for match in tokens
+            ]]
+
+    recognizer = GLiNERRecognizer(label_mapping={"person": "PERSON"}, threshold=0.5)
+    recognizer.model = DummyModel()
+    text = "Benjamin Kägi Egzona Musliu Christoph Jampen"
+
+    results = recognizer.analyze(text, entities=["PERSON"])
+
+    assert [text[result.start:result.end] for result in results] == [
+        "Benjamin Kägi",
+        "Egzona Musliu",
+        "Christoph Jampen",
+    ]

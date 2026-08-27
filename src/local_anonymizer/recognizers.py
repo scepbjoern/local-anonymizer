@@ -422,21 +422,27 @@ class GLiNERRecognizer(EntityRecognizer):
                     )
 
         # GLiNER can occasionally return adjacent name components as separate PERSON spans
-        # (e.g. "Julia" + "Meier") when several semantic prompts are active. Merge only
-        # directly whitespace-adjacent PERSON spans; punctuation or other words keep identities
-        # separate. The weakest component score represents the combined span conservatively.
+        # (e.g. "Julia" + "Meier") when several semantic prompts are active. Merge at most two
+        # whitespace-separated components. The previous unbounded merge incorrectly joined
+        # complete name lists such as "Benjamin Kägi Egzona Musliu" into one person. Punctuation
+        # or a third component keeps identities separate. The weakest component score represents
+        # the combined span conservatively.
         results.sort(key=lambda result: (result.start, result.end))
         merged_results: List[RecognizerResult] = []
         for result in results:
+            previous = merged_results[-1] if merged_results else None
+            previous_parts = text[previous.start:previous.end].split() if previous else []
+            current_parts = text[result.start:result.end].split()
             if (
-                merged_results
+                previous is not None
                 and result.entity_type == "PERSON"
-                and merged_results[-1].entity_type == "PERSON"
+                and previous.entity_type == "PERSON"
                 and result.start >= merged_results[-1].end
                 and not text[merged_results[-1].end:result.start].strip()
+                and len(previous_parts) + len(current_parts) <= 2
             ):
-                merged_results[-1].end = result.end
-                merged_results[-1].score = min(merged_results[-1].score, result.score)
+                previous.end = result.end
+                previous.score = min(previous.score, result.score)
             else:
                 merged_results.append(result)
 
