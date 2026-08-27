@@ -790,6 +790,14 @@ def create_ui():
                     on_click=export_all,
                 ).props("unelevated")
 
+    PIPELINE_STEPS = [
+        "1. Vorverarbeitung & Text-Filterung",
+        "2. Lokale KI-Erkennung & Presidio NER",
+        "3. Span-Deduplizierung & Genitiv-Erweiterung",
+        "4. Smart-Linking (Rollen- & Namensbezüge)",
+        "5. Vorschau-Berechnung & Mapping-Export",
+    ]
+
     async def run_analysis():
         if not state.raw_text or not state.raw_text.strip():
             ui.notify("Bitte laden Sie zuerst ein Dokument hoch oder fügen Sie Text ein.", type="warning")
@@ -801,14 +809,22 @@ def create_ui():
         # Show visual indicators immediately (< 20ms)
         if analyze_btn:
             analyze_btn.props("loading")
-        
+
         progress_bar = None
         progress_label = None
+        step_labels = []
         if progress_holder:
             progress_holder.clear()
             with progress_holder:
                 progress_bar = ui.linear_progress(value=0.0, show_value=False).props("color=primary stripe rounded instant-feedback").classes("w-full mb-1")
-                progress_label = ui.label("0% - Lokale Analyse gestartet...").classes("text-xs text-slate-600 font-medium mb-2")
+                progress_label = ui.label("0% - Lokale Analyse gestartet...").classes("text-xs text-slate-700 font-bold mb-1")
+                with ui.card().classes("w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg shadow-none flex flex-col gap-1 mb-2"):
+                    for idx, name in enumerate(PIPELINE_STEPS):
+                        if idx == 0:
+                            lbl = ui.label(f"⏳ {name}").classes("text-[11px] text-blue-700 font-bold")
+                        else:
+                            lbl = ui.label(f"○ {name}").classes("text-[11px] text-rose-600 font-normal")
+                        step_labels.append(lbl)
 
         if table_holder:
             table_holder.clear()
@@ -820,6 +836,23 @@ def create_ui():
         # Yield to event loop so DOM updates render immediately in the browser
         await asyncio.sleep(0.02)
 
+        def update_step_ui(active_idx: int, val: float, msg: str):
+            if progress_bar:
+                progress_bar.set_value(val)
+            if progress_label:
+                progress_label.set_text(f"{int(val * 100)}% - {msg}")
+            for i, lbl in enumerate(step_labels):
+                name = PIPELINE_STEPS[i]
+                if i < active_idx:
+                    lbl.set_text(f"✓ {name}")
+                    lbl.classes(replace="text-[11px] text-emerald-700 font-semibold")
+                elif i == active_idx:
+                    lbl.set_text(f"⏳ {name} ({msg})")
+                    lbl.classes(replace="text-[11px] text-blue-700 font-bold")
+                else:
+                    lbl.set_text(f"○ {name}")
+                    lbl.classes(replace="text-[11px] text-rose-600 font-normal")
+
         try:
             # Wait for background warmup if still running
             while not _model_ready:
@@ -827,25 +860,47 @@ def create_ui():
                     progress_label.set_text("Warte auf KI-Modell-Initialisierung...")
                 await asyncio.sleep(0.1)
 
-            loop = asyncio.get_running_loop()
+            # Step 1: Preprocessing & Ignore filter
+            update_step_ui(0, 0.15, "Ignore-Filterung...")
+            await asyncio.sleep(0.05)
 
-            def update_progress(val: float, msg: str):
-                if progress_bar and progress_label:
-                    progress_bar.set_value(val)
-                    progress_label.set_text(f"{int(val * 100)}% - {msg}")
-
-            def thread_progress_cb(val: float, msg: str):
-                loop.call_soon_threadsafe(update_progress, val, msg)
+            # Step 2: Local AI & Presidio NER (with periodic live ticker updates every 2s)
+            update_step_ui(1, 0.25, "Inferenz läuft...")
 
             def do_analysis(text):
                 global _cached_anonymizer
                 if _cached_anonymizer is None:
                     _cached_anonymizer = build_anonymizer()
-                return _cached_anonymizer.analyze(text, on_progress=thread_progress_cb)
+                return _cached_anonymizer.analyze(text)
 
-            results = await asyncio.to_thread(do_analysis, state.raw_text)
+            loop = asyncio.get_running_loop()
+            analysis_task = asyncio.create_task(asyncio.to_thread(do_analysis, state.raw_text))
 
-            update_progress(0.92, "Fundstellen werden gruppiert...")
+            start_t = loop.time()
+            ticker_messages = [
+                "KI-Modell & Presidio Inferenz...",
+                "Texteinbettungen & NER-Modell aktiv...",
+                "Erkennung von Personen, Rollen & Orten...",
+                "Kontextuelle Analyse längerer Passagen...",
+                "Muster- & Wörterbuchabgleich...",
+            ]
+            msg_idx = 0
+            cur_pct = 0.25
+            while not analysis_task.done():
+                await asyncio.sleep(2.0)
+                if analysis_task.done():
+                    break
+                elapsed = int(loop.time() - start_t)
+                cur_pct = min(0.65, cur_pct + 0.08)
+                sub_msg = f"{ticker_messages[msg_idx % len(ticker_messages)]} ({elapsed}s)"
+                msg_idx += 1
+                update_step_ui(1, cur_pct, sub_msg)
+
+            results = await analysis_task
+
+            # Step 3: Deduplication & Genitives
+            update_step_ui(2, 0.75, "Span-Deduplizierung & Genitiv-Erweiterung...")
+            await asyncio.sleep(0.05)
 
             groups_dict: Dict[str, EntityGroup] = {}
             for res in results:
@@ -868,21 +923,28 @@ def create_ui():
 
             state.entity_groups = list(groups_dict.values())
 
-            update_progress(0.96, "Smart-Linking & Vorschau werden berechnet...")
+            # Step 4: Smart-Linking proposals
+            update_step_ui(3, 0.90, "Namensbezüge & Rollen-Kandidaten...")
+            await asyncio.sleep(0.05)
 
-            # Compute interactive smart-linking suggestions (Proposal model, NO auto-commit)
             from local_anonymizer.anonymizer import compute_smart_link_proposals
             compute_smart_link_proposals(state.entity_groups)
 
-            # Compute initial placeholders so badges exist immediately
-            compute_reactive_preview()
+            # Step 5: Reactive Preview & Mapping
+            update_step_ui(4, 0.98, "Generiere Vorschau & Mapping...")
+            await asyncio.sleep(0.05)
 
+            compute_reactive_preview()
             total_occurrences = sum(g.count for g in state.entity_groups)
             build_review_table()
             refresh_preview_and_exports()
 
-            update_progress(1.0, f"Abgeschlossen: {len(state.entity_groups)} Begriffe ({total_occurrences} Fundstellen)")
+            # Mark all complete (green)
+            update_step_ui(5, 1.0, f"Abgeschlossen: {len(state.entity_groups)} Begriffe ({total_occurrences} Fundstellen)")
             ui.notify(f"Analyse abgeschlossen: {len(state.entity_groups)} Begriffe ({total_occurrences} Fundstellen).", type="positive")
+
+            # Keep visible for 1.2s so user sees all checkmarks, then auto-disappear
+            await asyncio.sleep(1.2)
 
         except Exception as e:
             if table_holder:
@@ -893,7 +955,6 @@ def create_ui():
             if analyze_btn:
                 analyze_btn.props(remove="loading")
             if progress_holder:
-                await asyncio.sleep(0.8)
                 progress_holder.clear()
 
     def get_sorted_groups() -> List[EntityGroup]:
@@ -1064,39 +1125,40 @@ def create_ui():
                                     elif master.suggested_candidates:
                                         ui.badge(f"💡 {len(master.suggested_candidates)} Namenskandidaten", color="amber-8").props("outline dense").tooltip("Mehrere passende Personen gefunden. Bitte im Dropdown rechts auswählen.")
 
-                                    # Manual Link Dropdown
-                                    other_masters = sorted(
-                                        [
-                                            g.original_text for g in state.entity_groups
-                                            if g.key != master.key and g.entity_type == master.entity_type and not g.parent_group_text
-                                        ],
+                                    # Manual Link Dropdown: All other recognized entities in the workspace
+                                    all_other_names = sorted(
+                                        list({
+                                            g.original_text.strip() for g in state.entity_groups
+                                            if g.key != master.key and g.original_text.strip()
+                                        }),
                                         key=lambda s: s.lower(),
                                     )
-                                    if other_masters:
+                                    if all_other_names:
                                         with ui.row().classes("items-center gap-1"):
                                             def make_link_to_master(grp):
                                                 def on_change(e):
-                                                    if e.value and e.value != "Eigenständig":
-                                                        grp.parent_group_text = e.value
+                                                    val = (e.value or "").strip()
+                                                    if val and val != "Eigenständig":
+                                                        grp.parent_group_text = val
                                                         if not grp.surface_tag:
                                                             grp.surface_tag = "VORNAME"
                                                         grp.suggested_parent = None
                                                         grp.suggested_candidates = []
-                                                        p_match = next((x for x in state.entity_groups if x.original_text == e.value), None)
+                                                        p_match = next((x for x in state.entity_groups if x.original_text.lower() == val.lower()), None)
                                                         if p_match and not p_match.surface_tag:
                                                             p_match.surface_tag = "VOLLNAME"
-                                                        ui.notify(f"'{grp.original_text}' verknüpft mit '{e.value}'.", type="info")
+                                                        ui.notify(f"'{grp.original_text}' verknüpft mit '{val}'.", type="info")
                                                         refresh_preview_and_exports()
                                                         build_review_table()
                                                 return on_change
 
                                             ui.select(
-                                                options=["Eigenständig"] + other_masters,
+                                                options=["Eigenständig"] + all_other_names,
                                                 value="Eigenständig",
                                                 label="Verknüpfen mit:",
                                                 with_input=True,
                                                 on_change=make_link_to_master(master),
-                                            ).props('dense outlined bg-white use-input clearable options-dense menu-props="{ maxHeight: \'280px\' }"').classes("min-w-[180px] max-w-[280px] text-xs")
+                                            ).props('dense outlined bg-white use-input new-value-mode="add-unique" clearable options-dense menu-props="{ maxHeight: \'300px\' }"').classes("min-w-[200px] max-w-[320px] text-xs").tooltip("Zielperson / Bezug auswählen oder durch Tippen filtern")
 
                                 # 5. Score & Action
                                 with ui.row().classes("items-center gap-2"):
@@ -1307,7 +1369,7 @@ def create_ui():
                     
                     # 100% Unified Modern Dropzone (Click anywhere to pick, or Drag & Drop anywhere)
                     with ui.card().classes(
-                        "w-full py-7 px-4 bg-slate-50 hover:bg-slate-100 border-2 border-dashed border-blue-400 hover:border-blue-600 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-3 select-none"
+                        "w-full py-7 px-4 bg-slate-50 hover:bg-slate-100 border-2 border-dashed border-blue-400 hover:border-blue-600 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-2 select-none"
                     ) as dropzone_card:
                         drop_card_id = dropzone_card.id
                         dropzone_card.props(f'id="custom_dropzone_{drop_card_id}"')
@@ -1323,20 +1385,21 @@ def create_ui():
                         # Drop handler via HTTP streaming / path / base64
                         async def on_file_dropped(e):
                             data = e.args
+                            logging.info(f"on_file_dropped received: {type(data)} -> {list(data.keys()) if isinstance(data, dict) else data}")
                             filename = data.get("name", "dokument")
                             filepath = data.get("path", "")
                             file_id = data.get("file_id", "")
                             try:
-                                if filepath and Path(filepath).exists():
-                                    raw_bytes = safe_read_bytes(filepath)
-                                elif file_id and file_id in _upload_cache:
+                                if file_id and file_id in _upload_cache:
                                     cached = _upload_cache.pop(file_id)
                                     raw_bytes = cached["content"]
                                     filename = cached["filename"] or filename
-                                elif "base64" in data:
+                                elif filepath and Path(filepath).is_file():
+                                    raw_bytes = safe_read_bytes(filepath)
+                                elif "base64" in data and data["base64"]:
                                     raw_bytes = base64.b64decode(data["base64"])
                                 else:
-                                    raise ValueError("Keine Dateidaten empfangen")
+                                    raise ValueError(f"Keine Dateidaten empfangen (keys={list(data.keys()) if isinstance(data, dict) else data})")
 
                                 await extract_and_load_file_bytes(raw_bytes, filename)
                             except Exception as ex:
@@ -1390,11 +1453,6 @@ def create_ui():
                                     if (!files || files.length === 0) return;
                                     const file = files[0];
 
-                                    if (file.path) {{
-                                        emitEvent('file_dropped', {{ name: file.name, path: file.path }});
-                                        return;
-                                    }}
-
                                     const formData = new FormData();
                                     formData.append('file', file);
                                     fetch('/api/upload', {{
@@ -1428,6 +1486,11 @@ def create_ui():
                         }})();
                         </script>
                         """)
+
+                    # Info badge explaining digital text & image/OCR scope
+                    with ui.row().classes("w-full items-center gap-1.5 px-3 py-1.5 bg-blue-50/60 border border-blue-200/60 rounded-lg text-xs text-slate-600 mb-3"):
+                        ui.icon("info", size="xs").classes("text-blue-600")
+                        ui.label("Hinweis: Extrahiert digitalen Text, Aufzählungen & Tabellen aus Word (.docx), PDF, Text (.txt, .md), CSV und JSON. Eingebettete Screenshots/Bilder ohne Textschicht erfordern OCR und werden nicht mitgelesen.").classes("flex-1 text-[11px]")
 
                     # Live extraction progress card (for large PDF/Docx files)
                     with ui.card().classes("w-full p-3 bg-blue-50 border border-blue-200 rounded-xl mb-3 flex-col gap-1") as extraction_progress_card:
@@ -1630,16 +1693,16 @@ def create_ui():
                                 filepath = data.get("path", "")
                                 file_id = data.get("file_id", "")
                                 try:
-                                    if filepath and Path(filepath).exists():
-                                        raw_bytes = safe_read_bytes(filepath)
-                                    elif file_id and file_id in _upload_cache:
+                                    if file_id and file_id in _upload_cache:
                                         cached = _upload_cache.pop(file_id)
                                         raw_bytes = cached["content"]
                                         filename = cached["filename"] or filename
-                                    elif "base64" in data:
+                                    elif filepath and Path(filepath).is_file():
+                                        raw_bytes = safe_read_bytes(filepath)
+                                    elif "base64" in data and data["base64"]:
                                         raw_bytes = base64.b64decode(data["base64"])
                                     else:
-                                        raise ValueError("Keine Dateidaten empfangen")
+                                        raise ValueError(f"Keine Dateidaten empfangen (keys={list(data.keys()) if isinstance(data, dict) else data})")
                                     text = await asyncio.to_thread(read_document_from_bytes, raw_bytes, filename)
                                     load_restore_text(text, filename)
                                 except Exception as ex:
@@ -1672,7 +1735,6 @@ def create_ui():
                                         const files = e.dataTransfer.files;
                                         if (!files || !files.length) return;
                                         const file = files[0];
-                                        if (file.path) {{ emitEvent('restore_file_dropped', {{ name: file.name, path: file.path }}); return; }}
                                         const formData = new FormData();
                                         formData.append('file', file);
                                         fetch('/api/upload', {{
@@ -1754,16 +1816,16 @@ def create_ui():
                                 filepath = data.get("path", "")
                                 file_id = data.get("file_id", "")
                                 try:
-                                    if filepath and Path(filepath).exists():
-                                        raw_bytes = safe_read_bytes(filepath)
-                                    elif file_id and file_id in _upload_cache:
+                                    if file_id and file_id in _upload_cache:
                                         cached = _upload_cache.pop(file_id)
                                         raw_bytes = cached["content"]
                                         filename = cached["filename"] or filename
-                                    elif "base64" in data:
+                                    elif filepath and Path(filepath).is_file():
+                                        raw_bytes = safe_read_bytes(filepath)
+                                    elif "base64" in data and data["base64"]:
                                         raw_bytes = base64.b64decode(data["base64"])
                                     else:
-                                        raise ValueError("Keine Dateidaten empfangen")
+                                        raise ValueError(f"Keine Dateidaten empfangen (keys={list(data.keys()) if isinstance(data, dict) else data})")
                                     load_mapping_data(json.loads(raw_bytes.decode("utf-8")))
                                 except Exception as ex:
                                     ui.notify(f"Fehler beim Laden: {str(ex)}", type="negative", timeout=15000)
@@ -1798,7 +1860,6 @@ def create_ui():
                                         const files = e.dataTransfer.files;
                                         if (!files || !files.length) return;
                                         const file = files[0];
-                                        if (file.path) {{ emitEvent('mapping_file_dropped', {{ name: file.name, path: file.path }}); return; }}
                                         const formData = new FormData();
                                         formData.append('file', file);
                                         fetch('/api/upload', {{
