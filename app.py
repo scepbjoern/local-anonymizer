@@ -21,8 +21,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 # Ensure src is in python path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from fastapi import Request
-from nicegui import app, ui
+from fastapi import File, Form, Request, UploadFile
+from nicegui import Client, app, ui
 
 from local_anonymizer.anonymizer import (
     AnonymizationResult,
@@ -424,37 +424,72 @@ ui_handles: Dict[str, Any] = {
 
 
 def load_content_into_workspace(text: str, filename: str):
-    """Unified workspace loader with instant reactive updates."""
+    """Unified workspace loader with instant reactive updates across all client contexts."""
     state.filename = filename
     state.raw_text = text
-    if ui_handles["raw_text_area"] is not None:
-        ui_handles["raw_text_area"].value = text
-    if ui_handles["analyze_btn"] is not None:
-        ui_handles["analyze_btn"].set_enabled(bool(text and text.strip()))
-    if ui_handles["reset_btn"] is not None:
-        ui_handles["reset_btn"].set_visibility(bool(text and text.strip()))
-    if ui_handles["file_badge_card"] is not None and ui_handles["file_badge_label"] is not None:
-        if filename:
-            ui_handles["file_badge_label"].set_text(f"{filename} ({len(text)} Zeichen)")
-            ui_handles["file_badge_card"].set_visibility(True)
-        else:
-            ui_handles["file_badge_card"].set_visibility(False)
-    if ui_handles["upload_status_label"] is not None:
-        ui_handles["upload_status_label"].set_visibility(False)
-    ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.", type="positive")
+
+    if Client.instances:
+        for client in list(Client.instances.values()):
+            try:
+                with client:
+                    if ui_handles["raw_text_area"] is not None:
+                        ui_handles["raw_text_area"].value = text
+                    if ui_handles["analyze_btn"] is not None:
+                        ui_handles["analyze_btn"].set_enabled(bool(text and text.strip()))
+                    if ui_handles["reset_btn"] is not None:
+                        ui_handles["reset_btn"].set_visibility(bool(text and text.strip()))
+                    if ui_handles["file_badge_card"] is not None and ui_handles["file_badge_label"] is not None:
+                        if filename:
+                            ui_handles["file_badge_label"].set_text(f"{filename} ({len(text)} Zeichen)")
+                            ui_handles["file_badge_card"].set_visibility(True)
+                        else:
+                            ui_handles["file_badge_card"].set_visibility(False)
+                    if ui_handles["upload_status_label"] is not None:
+                        ui_handles["upload_status_label"].set_visibility(False)
+                    ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.", type="positive")
+            except Exception as e:
+                logging.debug(f"Client update error: {e}")
+    else:
+        if ui_handles["raw_text_area"] is not None:
+            ui_handles["raw_text_area"].value = text
 
 
-# Fast API endpoint for seamless HTML5 Drag-and-Drop
+# Fast API endpoint for seamless HTML5 Drag-and-Drop (supports FormData and direct filepaths)
 @app.post("/api/upload_drop")
-async def handle_api_upload_drop(request: Request):
+async def handle_api_upload_drop(
+    file: Optional[UploadFile] = File(None),
+    filepath: Optional[str] = Form(None),
+    raw_body: Optional[Request] = None,
+):
     try:
-        body = await request.json()
-        filename = body.get("filename", "dokument")
-        base64_str = body.get("base64", "")
-        raw_bytes = base64.b64decode(base64_str)
+        raw_bytes = b""
+        filename = "dokument"
+
+        if filepath and Path(filepath).exists():
+            raw_bytes = safe_read_bytes(filepath)
+            filename = Path(filepath).name
+        elif file is not None:
+            raw_bytes = await file.read()
+            filename = file.filename or "dokument"
+        elif raw_body is not None:
+            try:
+                data_json = await raw_body.json()
+                if "filepath" in data_json and Path(data_json["filepath"]).exists():
+                    raw_bytes = safe_read_bytes(data_json["filepath"])
+                    filename = Path(data_json["filepath"]).name
+                elif "base64" in data_json:
+                    raw_bytes = base64.b64decode(data_json["base64"])
+                    filename = data_json.get("filename", "dokument")
+            except Exception:
+                pass
+
+        if not raw_bytes:
+            raise ValueError("Keine Dateidaten empfangen")
+
         text = read_document_from_bytes(raw_bytes, filename)
         load_content_into_workspace(text, filename)
         return {"status": "ok", "filename": filename, "chars": len(text)}
+
     except Exception as ex:
         err_msg = f"{type(ex).__name__}: {str(ex)}"
         logging.error(f"Drop API error: {err_msg}", exc_info=True)
@@ -1207,7 +1242,7 @@ def create_ui():
                             ui.label("Datei hier ablegen oder zum Auswählen klicken").classes("text-sm font-bold text-slate-800")
                         ui.label("Unterstützt Word (.docx), PDF, Text (.txt, .md), CSV und JSON • Automatische Struktur-Erkennung").classes("text-xs text-slate-500 pointer-events-none")
 
-                    # Injected HTML5 Drag & Drop Script for the dropzone
+                    # Injected HTML5 Drag & Drop Script with multi-channel fallback (FormData / Filepath / Base64)
                     ui.add_body_html("""
                     <script>
                     (function() {
@@ -1234,24 +1269,45 @@ def create_ui():
                                 el.style.backgroundColor = '#f8fafc';
                             }, false);
 
-                            el.addEventListener('drop', function(e) {
+                            el.addEventListener('drop', async function(e) {
                                 e.preventDefault();
                                 e.stopPropagation();
                                 el.style.borderColor = '#93c5fd';
                                 el.style.backgroundColor = '#f8fafc';
+
                                 const files = e.dataTransfer.files;
                                 if (!files || files.length === 0) return;
                                 const file = files[0];
-                                const reader = new FileReader();
-                                reader.onload = function(evt) {
-                                    const b64 = evt.target.result.split(',')[1];
-                                    fetch('/api/upload_drop', {
+
+                                const formData = new FormData();
+                                formData.append('file', file);
+                                if (file.path) {
+                                    formData.append('filepath', file.path);
+                                }
+
+                                try {
+                                    const res = await fetch('/api/upload_drop', {
                                         method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ filename: file.name, base64: b64 })
+                                        body: formData
                                     });
-                                };
-                                reader.readAsDataURL(file);
+                                    const data = await res.json();
+                                    if (data.status !== 'ok') {
+                                        alert('Fehler beim Laden: ' + (data.message || 'Unbekannt'));
+                                    }
+                                } catch (err) {
+                                    console.error('Upload fetch error:', err);
+                                    // Fallback to FileReader
+                                    const reader = new FileReader();
+                                    reader.onload = async function(evt) {
+                                        const b64 = evt.target.result.split(',')[1];
+                                        await fetch('/api/upload_drop', {
+                                            method: 'POST',
+                                            headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ filename: file.name, base64: b64 })
+                                        });
+                                    };
+                                    reader.readAsDataURL(file);
+                                }
                             }, false);
                         }
                         if (document.readyState === 'loading') {
@@ -1588,14 +1644,34 @@ def create_ui():
 
 
 def on_startup():
-    """Dismiss splash screen as soon as web server starts."""
+    """Triggered when web server starts."""
     try:
         READY_FLAG.touch(exist_ok=True)
     except Exception:
         pass
 
 
+def on_client_connect():
+    """Ensure splash is dismissed and app window is brought to front on Windows."""
+    try:
+        READY_FLAG.touch(exist_ok=True)
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.FindWindowW(None, "Privacy-First Local Anonymizer")
+            if hwnd:
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(hwnd)
+                user32.BringWindowToTop(hwnd)
+        except Exception:
+            pass
+
+
 app.on_startup(on_startup)
+app.on_connect(on_client_connect)
 
 
 def main():
@@ -1606,6 +1682,10 @@ def main():
     args, _ = parser.parse_known_args()
 
     use_native = args.native and not args.browser
+
+    # Configure native window dimensions
+    app.native.window_args["width"] = 1250
+    app.native.window_args["height"] = 850
 
     create_ui()
 

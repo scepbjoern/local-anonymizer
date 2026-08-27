@@ -14,7 +14,7 @@ except Exception:
 
 try:
     root = tk.Tk()
-    root.title("Privacy-First Local Anonymizer")
+    root.title("Privacy-First Local Anonymizer Splash")
     root.geometry("420x150")
     root.overrideredirect(True)
     root.eval("tk::PlaceWindow . center")
@@ -32,19 +32,33 @@ try:
     badge = tk.Label(frame, text="100% Lokal & Offline • Keine Cloud", font=("Segoe UI", 8, "italic"), fg="#94a3b8", bg="#0f172a")
     badge.pack(pady=(10, 0))
 
+    def bring_main_to_front():
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                hwnd = user32.FindWindowW(None, "Privacy-First Local Anonymizer")
+                if hwnd:
+                    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                    user32.SetForegroundWindow(hwnd)
+                    user32.BringWindowToTop(hwnd)
+            except Exception:
+                pass
+
     def check_ready():
         if READY_FLAG.exists():
             try:
                 READY_FLAG.unlink(missing_ok=True)
             except Exception:
                 pass
+            bring_main_to_front()
             root.destroy()
         else:
             root.after(100, check_ready)
 
-    # Check every 100ms if main app is ready; max fallback timeout 20s
+    # Check every 100ms if main app is ready; max fallback timeout 25s
     root.after(100, check_ready)
-    root.after(20000, root.destroy)
+    root.after(25000, root.destroy)
     root.mainloop()
 except Exception:
     pass
