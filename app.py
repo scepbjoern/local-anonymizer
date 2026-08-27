@@ -429,11 +429,102 @@ def create_ui():
     progress_holder = None
     upload_ui_elem = None
     reset_btn = None
-    ignore_input = None
-    glossary_textarea = None
+    ignore_container = None
+    glossary_container = None
     restore_anon_input = None
     map_json_input = None
     restored_preview = None
+
+    def render_ignore_list_ui():
+        if not ignore_container:
+            return
+        ignore_container.clear()
+        with ignore_container:
+            raw_ignores = parse_ignore_terms(state.ignore_terms_text)
+            unique_ignores = sorted(list({t.strip() for t in raw_ignores if t.strip()}), key=lambda s: s.lower())
+
+            with ui.row().classes("w-full items-center gap-1 mb-2"):
+                new_ig_input = ui.input(placeholder="Neuer Begriff...").props("dense outlined bg-white").classes("flex-grow text-xs")
+                def add_ig():
+                    val = new_ig_input.value.strip()
+                    if val:
+                        curr = parse_ignore_terms(state.ignore_terms_text)
+                        if val not in curr:
+                            curr.append(val)
+                            state.ignore_terms_text = ", ".join(curr)
+                            save_current_config()
+                            render_ignore_list_ui()
+                            refresh_preview_and_exports()
+                            ui.notify(f"'{val}' zur Ignore-Liste hinzugefügt.", type="info")
+                        new_ig_input.value = ""
+                ui.button(icon="add", on_click=add_ig, color="primary").props("dense flat size=sm")
+
+            with ui.column().classes("w-full max-h-48 overflow-y-auto gap-1 pr-1"):
+                if not unique_ignores:
+                    ui.label("Keine Begriffe auf der Ignore-Liste.").classes("text-[11px] text-slate-400 italic")
+                else:
+                    with ui.row().classes("w-full flex-wrap gap-1"):
+                        for term in unique_ignores:
+                            def make_remove_ig(t):
+                                def on_remove():
+                                    curr = [x for x in parse_ignore_terms(state.ignore_terms_text) if x.lower() != t.lower()]
+                                    state.ignore_terms_text = ", ".join(curr)
+                                    save_current_config()
+                                    render_ignore_list_ui()
+                                    refresh_preview_and_exports()
+                                    ui.notify(f"'{t}' aus Ignore-Liste entfernt.", type="info")
+                                return on_remove
+
+                            with ui.badge(color="slate-2").props("outline dense").classes("text-[11px] text-slate-700 items-center gap-1 pl-1.5 pr-0.5 py-0.5"):
+                                ui.label(term).classes("font-mono")
+                                ui.button(icon="close", on_click=make_remove_ig(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0")
+
+    def render_glossary_list_ui():
+        if not glossary_container:
+            return
+        glossary_container.clear()
+        with glossary_container:
+            glossary_dict = parse_glossary(state.glossary_text)
+            sorted_keys = sorted(glossary_dict.keys(), key=lambda s: s.lower())
+
+            with ui.row().classes("w-full items-center gap-1 mb-2 flex-wrap"):
+                new_g_term = ui.input(placeholder="Begriff...").props("dense outlined bg-white").classes("flex-grow text-xs")
+                new_g_type = ui.select(options=AVAILABLE_ENTITIES, value="ORGANIZATION").props("dense outlined bg-white").classes("w-28 text-xs")
+                def add_g():
+                    t = new_g_term.value.strip()
+                    if t:
+                        lines = [l.strip() for l in state.glossary_text.splitlines() if l.strip()]
+                        lines = [l for l in lines if not (l.lower().startswith(f"{t.lower()}:") or l.lower().startswith(f"{t.lower()}="))]
+                        lines.append(f"{t}: {new_g_type.value}")
+                        state.glossary_text = "\n".join(lines)
+                        save_current_config()
+                        render_glossary_list_ui()
+                        refresh_preview_and_exports()
+                        ui.notify(f"'{t}' ({new_g_type.value}) zum Glossar hinzugefügt.", type="positive")
+                        new_g_term.value = ""
+                ui.button(icon="add", on_click=add_g, color="positive").props("dense flat size=sm")
+
+            with ui.column().classes("w-full max-h-48 overflow-y-auto gap-1 pr-1"):
+                if not sorted_keys:
+                    ui.label("Keine eigenen Begriffe im Glossar.").classes("text-[11px] text-slate-400 italic")
+                else:
+                    with ui.row().classes("w-full flex-wrap gap-1"):
+                        for term in sorted_keys:
+                            ent_type = glossary_dict[term]
+                            def make_remove_g(t):
+                                def on_remove():
+                                    lines = [l for l in state.glossary_text.splitlines() if not (l.strip().lower().startswith(f"{t.lower()}:") or l.strip().lower().startswith(f"{t.lower()}="))]
+                                    state.glossary_text = "\n".join(lines)
+                                    save_current_config()
+                                    render_glossary_list_ui()
+                                    refresh_preview_and_exports()
+                                    ui.notify(f"'{t}' aus Glossar entfernt.", type="info")
+                                return on_remove
+
+                            with ui.badge(color="blue-1").props("outline dense").classes("text-[11px] text-slate-800 items-center gap-1 pl-1.5 pr-0.5 py-0.5"):
+                                ui.label(term).classes("font-mono font-bold")
+                                ui.label(f"({ent_type})").classes("text-[9px] text-blue-700")
+                                ui.button(icon="close", on_click=make_remove_g(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0")
 
     def refresh_preview_and_exports():
         if not preview_holder or not export_holder:
@@ -629,9 +720,6 @@ def create_ui():
         except Exception as ex:
             logging.error(f"Upload error: {ex}", exc_info=True)
             ui.notify(f"Fehler beim Upload: {str(ex)}", type="negative")
-
-    def handle_rejected(e):
-        ui.notify("Datei wurde abgelehnt (Dateiformat oder Grösse ungültig).", type="negative")
 
     def reset_workspace():
         """Reset raw text, filename, and analysis table."""
@@ -861,9 +949,9 @@ def create_ui():
                                         def on_click():
                                             current_ignores = parse_ignore_terms(state.ignore_terms_text)
                                             if term not in current_ignores:
-                                                state.ignore_terms_text += f", {term}"
-                                                if ignore_input is not None:
-                                                    ignore_input.value = state.ignore_terms_text
+                                                current_ignores.append(term)
+                                                state.ignore_terms_text = ", ".join(current_ignores)
+                                                render_ignore_list_ui()
                                                 save_current_config()
                                             grp.enabled = False
                                             ui.notify(f"'{term}' zur Ignore-Liste hinzugefügt.", type="info")
@@ -1016,23 +1104,15 @@ def create_ui():
 
             ui.separator().classes("my-2")
 
+            # Interactive Ignore List (Alphabetical with [x] delete buttons)
             with ui.expansion("Ignore-Liste (Nicht ersetzen)", icon="visibility_off").classes("w-full text-xs"):
-                def on_ignore_change(e):
-                    state.ignore_terms_text = e.value
-                    save_current_config()
-                ignore_input = ui.textarea(
-                    value=state.ignore_terms_text,
-                    on_change=on_ignore_change,
-                ).props("outlined dense rows=4").classes("w-full font-mono text-xs")
+                ignore_container = ui.column().classes("w-full")
+                render_ignore_list_ui()
 
+            # Interactive Fuzzy Glossary (Alphabetical with [x] delete buttons)
             with ui.expansion("Fuzzy-Glossar (Eigene Begriffe)", icon="library_books").classes("w-full text-xs mt-1"):
-                def on_glossary_change(e):
-                    state.glossary_text = e.value
-                    save_current_config()
-                glossary_textarea = ui.textarea(
-                    value=state.glossary_text,
-                    on_change=on_glossary_change,
-                ).props("outlined dense rows=4").classes("w-full font-mono text-xs")
+                glossary_container = ui.column().classes("w-full")
+                render_glossary_list_ui()
 
         # Main Workspace
         with ui.column().classes("flex-grow"):
@@ -1057,7 +1137,6 @@ def create_ui():
                             with ui.row().classes("items-center gap-2"):
                                 upload_ui_elem = ui.upload(
                                     on_upload=handle_upload,
-                                    on_rejected=handle_rejected,
                                     auto_upload=True,
                                     max_files=1,
                                 ).props("outlined dense flat").classes("w-72")
@@ -1114,8 +1193,7 @@ def create_ui():
                                     new_line = f"{term}: {manual_type.value}"
                                     if new_line not in current_lines:
                                         state.glossary_text += f"\n{new_line}"
-                                        if glossary_textarea is not None:
-                                            glossary_textarea.value = state.glossary_text
+                                        render_glossary_list_ui()
                                         save_current_config()
                                     ui.notify(f"Begriff '{term}' als {manual_type.value} erfasst und zum Glossar hinzugefügt.", type="positive", icon="check")
                                     manual_input.value = ""
@@ -1288,11 +1366,16 @@ def create_ui():
                             on_click=save_restored_md,
                         ).props("outline")
 
-    # Signal that UI is constructed and ready to dismiss splash screen
+
+def on_startup():
+    """Dismiss splash screen as soon as web server starts."""
     try:
         READY_FLAG.touch(exist_ok=True)
     except Exception:
         pass
+
+
+app.on_startup(on_startup)
 
 
 def main():

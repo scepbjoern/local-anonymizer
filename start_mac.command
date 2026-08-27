@@ -14,4 +14,12 @@ if ! command -v uv &> /dev/null; then
     exit 1
 fi
 
+# Launch splash screen in background if python is available
+if [ -f ".venv/bin/python" ]; then
+    .venv/bin/python splash.py &
+elif command -v python3 &> /dev/null; then
+    python3 splash.py &
+fi
+
+# Run main application
 uv run --extra gui python app.py
