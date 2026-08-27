@@ -6,11 +6,6 @@ import json
 import re
 from pathlib import Path
 from typing import Union
-import pymupdf  # PyMuPDF
-import pymupdf4llm
-import docx
-
-
 class UnsupportedFileFormatError(ValueError):
     """Raised when an unsupported file format is provided to the extractor."""
     pass
@@ -157,6 +152,7 @@ def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
     - Level 4: Strict false-positive protection for bold text (only < 60 chars, no ending period, >= 16pt)
     - Level 5: Markdown tables
     """
+    import docx
     doc = docx.Document(io.BytesIO(raw_bytes))
     full_text = []
     for para in doc.paragraphs:
@@ -243,12 +239,13 @@ def extract_text_from_docx(path: Path) -> str:
     return extract_text_from_docx_bytes(safe_read_bytes(path))
 
 
-def create_docx_from_markdown(md_text: str) -> docx.Document:
+def create_docx_from_markdown(md_text: str):
     """
     Convert Markdown text into a native Word .docx document using real Word paragraph styles
     (Heading 1, Heading 2, Heading 3, Heading 4, List Bullet, List Number, Normal).
     Does NOT output literal '#' or Markdown markers into the document.
     """
+    import docx
     doc = docx.Document()
     lines = md_text.splitlines()
     i = 0
@@ -325,6 +322,8 @@ def extract_text_from_pdf_bytes(raw_bytes: bytes, filename: str = "document.pdf"
     Preserves headings, lists, tables, and bold/italic styles.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
+    import pymupdf
+    import pymupdf4llm
     doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
     doc_pages = doc.page_count
 
@@ -353,6 +352,8 @@ def extract_text_from_pdf(path: Path) -> str:
     Extract structured Markdown text from PDF files using pymupdf4llm.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
+    import pymupdf
+    import pymupdf4llm
     doc = pymupdf.open(str(path))
     doc_pages = doc.page_count
 

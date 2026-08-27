@@ -1,5 +1,7 @@
 """Anonymization and de-anonymization engine using Presidio and local mappings."""
 
+from __future__ import annotations
+
 import json
 import re
 import warnings
@@ -7,11 +9,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-import spacy
-from presidio_analyzer import AnalyzerEngine, RecognizerResult
-from presidio_analyzer.nlp_engine import NerModelConfiguration, SpacyNlpEngine
+def _create_blank_spacy_engine(languages: Sequence[str] = ("de", "en")):
+    """Lazy factory for lightweight NLP engine using blank spaCy tokenizers."""
+    import spacy
+    from presidio_analyzer.nlp_engine import NerModelConfiguration, SpacyNlpEngine
 
-from local_anonymizer.recognizers import FuzzyGlossaryRecognizer, GLiNERRecognizer
+    class BlankSpacyNlpEngine(SpacyNlpEngine):
+        def __init__(self, langs: Sequence[str] = ("de", "en")):
+            self.ner_model_configuration = NerModelConfiguration()
+            self.nlp = {lang: spacy.blank(lang) for lang in langs}
+
+        def is_loaded(self) -> bool:
+            return True
+
+        def load(self) -> None:
+            pass
+
+        def get_supported_languages(self) -> List[str]:
+            return list(self.nlp.keys())
+
+    return BlankSpacyNlpEngine(languages)
+
 
 # Default terms that should never be scrubbed (common German academic, business, and role nouns)
 DEFAULT_IGNORE_TERMS = [
@@ -31,23 +49,6 @@ DEFAULT_IGNORE_TERMS = [
     "Telefon", "Tel", "Email", "E-Mail", "Mail", "Adresse", "Website", "Datum",
     "Name", "Namen", "Vorname", "Vornamen", "Nachname", "Nachnamen", "Rolle", "Titel", "Status",
 ]
-
-
-class BlankSpacyNlpEngine(SpacyNlpEngine):
-    """Lightweight NLP engine using blank spaCy tokenizers (no heavy models needed)."""
-
-    def __init__(self, languages: Sequence[str] = ("de", "en")):
-        self.ner_model_configuration = NerModelConfiguration()
-        self.nlp = {lang: spacy.blank(lang) for lang in languages}
-
-    def is_loaded(self) -> bool:
-        return True
-
-    def load(self) -> None:
-        pass
-
-    def get_supported_languages(self) -> List[str]:
-        return list(self.nlp.keys())
 
 
 def clean_tag(text: str) -> str:
@@ -257,7 +258,11 @@ class LocalAnonymizer:
         self.enabled_entities = list(enabled_entities) if enabled_entities is not None else None
 
         # Setup Presidio AnalyzerEngine with lightweight blank NLP engine
-        nlp_engine = BlankSpacyNlpEngine(languages=["de", "en"])
+        from presidio_analyzer import AnalyzerEngine, RecognizerResult
+        from local_anonymizer.recognizers import FuzzyGlossaryRecognizer, GLiNERRecognizer
+
+        self._RecognizerResult = RecognizerResult
+        nlp_engine = _create_blank_spacy_engine(languages=["de", "en"])
         self.analyzer = AnalyzerEngine(
             nlp_engine=nlp_engine,
             supported_languages=["de", "en"],
@@ -380,7 +385,7 @@ class LocalAnonymizer:
                     )
                     if not is_covered and not is_ignored:
                         genitive_results.append(
-                            RecognizerResult(
+                            self._RecognizerResult(
                                 entity_type="PERSON",
                                 start=m_start,
                                 end=m_end,

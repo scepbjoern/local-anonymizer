@@ -1,20 +1,19 @@
 """
 Privacy-First Local Anonymizer - NiceGUI Interactive Review Application.
 Runs completely locally and offline with in-memory processing.
-Instant startup with asynchronous background model initialization.
+Instant startup (< 0.5s) with background asynchronous model warmup.
 """
 
 import argparse
 import asyncio
 import base64
 import html
-import io
 import json
 import logging
 import os
 import re
 import sys
-from collections import Counter
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -24,16 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from nicegui import app, ui
 
-from local_anonymizer.anonymizer import (
-    AnonymizationResult,
-    DetectedEntity,
-    EntityTreeNode,
-    HONORIFICS,
-    LocalAnonymizer,
-    build_entity_tree,
-    clean_tag,
-    compute_smart_link_proposals,
-)
 from local_anonymizer.config import AppConfig, CONFIG_DIR, LOG_FILE
 from local_anonymizer.extractors import (
     UnsupportedFileFormatError,
@@ -122,63 +111,9 @@ class AppState:
 
 state = AppState()
 
-# Global background model warmup state
-_cached_anonymizer: Optional[LocalAnonymizer] = None
-_model_ready_event = asyncio.Event()
-_model_loading_started = False
-
-
-# Supported entity labels
-AVAILABLE_ENTITIES = [
-    "PERSON",
-    "ORGANIZATION",
-    "EMAIL_ADDRESS",
-    "PHONE_NUMBER",
-    "LOCATION",
-    "DATE_TIME",
-    "IBAN_CODE",
-    "CREDIT_CARD",
-    "ID_NUMBER",
-    "FINANCIAL_DATA",
-    "HEALTH_DATA",
-    "IP_ADDRESS",
-]
-
-# Surface tag options as a clean dictionary
-SURFACE_TAG_OPTIONS: Dict[str, str] = {
-    "VOLLNAME": "Vollname (z. B. Julia Meier)",
-    "VORNAME": "Vorname (z. B. Julia)",
-    "NACHNAME": "Nachname (z. B. Meier)",
-    "ANREDE": "Anrede / Titel (z. B. Frau Meier, Mr. Smith)",
-    "GENITIV": "Genitiv (z. B. Julias)",
-    "KURZFORM": "Kurzform / Kürzel (z. B. JM)",
-}
-
-
-def save_current_config():
-    """Save user modifications back to persistent config."""
-    state.config.format_mode = state.format_mode
-    state.config.active_entities = state.active_entities
-    state.config.gliner_threshold = state.gliner_threshold
-    state.config.ignore_terms = state.ignore_terms_text
-    state.config.glossary = state.glossary_text
-    state.config.export_format = state.export_format
-    state.config.save()
-
-
-def extract_context_snippet(raw_text: str, start: int, end: int, window: int = 40) -> str:
-    """Extract contextual snippet around entity with highlighted keyword."""
-    ctx_start = max(0, start - window)
-    ctx_end = min(len(raw_text), end + window)
-
-    before = raw_text[ctx_start:start].replace("\r", " ").replace("\n", " ")
-    match = raw_text[start:end].replace("\r", " ").replace("\n", " ")
-    after = raw_text[end:ctx_end].replace("\r", " ").replace("\n", " ")
-
-    prefix = "…" if ctx_start > 0 else ""
-    suffix = "…" if ctx_end < len(raw_text) else ""
-
-    return f"{prefix}{html.escape(before)}<b class='text-blue-700 bg-blue-100 px-1 rounded'>{html.escape(match)}</b>{html.escape(after)}{suffix}"
+# Background model warmup state
+_model_ready: bool = False
+_cached_anonymizer: Any = None
 
 
 def parse_glossary(text: str) -> Dict[str, str]:
@@ -215,8 +150,10 @@ def parse_ignore_terms(text: str) -> List[str]:
     return terms
 
 
-def build_anonymizer() -> LocalAnonymizer:
+def build_anonymizer():
     """Build LocalAnonymizer instance with current state settings."""
+    from local_anonymizer.anonymizer import LocalAnonymizer
+
     glossary = parse_glossary(state.glossary_text)
     ignore_terms = parse_ignore_terms(state.ignore_terms_text)
     return LocalAnonymizer(
@@ -228,26 +165,80 @@ def build_anonymizer() -> LocalAnonymizer:
     )
 
 
-def _warmup_model_thread():
-    """Background worker to initialize GLiNER and Presidio."""
-    global _cached_anonymizer
+def _warmup_background_thread():
+    """Worker to initialize GLiNER and Presidio in the background without blocking the UI."""
+    global _cached_anonymizer, _model_ready
     try:
-        logging.info("Asynchronously pre-loading GLiNER AI model in background...")
+        logging.info("Background warming up GLiNER & Presidio AI models...")
         _cached_anonymizer = build_anonymizer()
-        logging.info("GLiNER AI model pre-loaded successfully.")
+        _model_ready = True
+        logging.info("GLiNER & Presidio AI models ready.")
     except Exception as e:
-        logging.error(f"Error during model preloading: {e}", exc_info=True)
+        logging.error(f"Error during background model warmup: {e}", exc_info=True)
+        _model_ready = True
 
 
-async def ensure_model_loaded():
-    """Ensure the background model is fully loaded before analysis."""
-    global _model_loading_started
-    if not _model_loading_started:
-        _model_loading_started = True
-        await asyncio.to_thread(_warmup_model_thread)
-        _model_ready_event.set()
-    elif not _model_ready_event.is_set():
-        await _model_ready_event.wait()
+# Start background warmup immediately in separate thread
+threading.Thread(target=_warmup_background_thread, daemon=True).start()
+
+
+# Supported entity labels
+AVAILABLE_ENTITIES = [
+    "PERSON",
+    "ORGANIZATION",
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "LOCATION",
+    "DATE_TIME",
+    "IBAN_CODE",
+    "CREDIT_CARD",
+    "ID_NUMBER",
+    "FINANCIAL_DATA",
+    "HEALTH_DATA",
+    "IP_ADDRESS",
+]
+
+# Surface tag options as a clean dictionary
+SURFACE_TAG_OPTIONS: Dict[str, str] = {
+    "VOLLNAME": "Vollname (z. B. Julia Meier)",
+    "VORNAME": "Vorname (z. B. Julia)",
+    "NACHNAME": "Nachname (z. B. Meier)",
+    "ANREDE": "Anrede / Titel (z. B. Frau Meier, Mr. Smith)",
+    "GENITIV": "Genitiv (z. B. Julias)",
+    "KURZFORM": "Kurzform / Kürzel (z. B. JM)",
+}
+
+
+def clean_tag(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"[^A-Za-z0-9_]+", "_", text.strip().upper()).strip("_")
+
+
+def save_current_config():
+    """Save user modifications back to persistent config."""
+    state.config.format_mode = state.format_mode
+    state.config.active_entities = state.active_entities
+    state.config.gliner_threshold = state.gliner_threshold
+    state.config.ignore_terms = state.ignore_terms_text
+    state.config.glossary = state.glossary_text
+    state.config.export_format = state.export_format
+    state.config.save()
+
+
+def extract_context_snippet(raw_text: str, start: int, end: int, window: int = 40) -> str:
+    """Extract contextual snippet around entity with highlighted keyword."""
+    ctx_start = max(0, start - window)
+    ctx_end = min(len(raw_text), end + window)
+
+    before = raw_text[ctx_start:start].replace("\r", " ").replace("\n", " ")
+    match = raw_text[start:end].replace("\r", " ").replace("\n", " ")
+    after = raw_text[end:ctx_end].replace("\r", " ").replace("\n", " ")
+
+    prefix = "…" if ctx_start > 0 else ""
+    suffix = "…" if ctx_end < len(raw_text) else ""
+
+    return f"{prefix}{html.escape(before)}<b class='text-blue-700 bg-blue-100 px-1 rounded'>{html.escape(match)}</b>{html.escape(after)}{suffix}"
 
 
 def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
@@ -436,7 +427,7 @@ def native_export_folder(stem: str, anon_text: str, mapping: dict, report: dict,
     return None
 
 
-# --- UI Building ---
+# --- UI Construction ---
 def create_ui():
     ui.colors(primary="#1976D2", secondary="#26A69A", accent="#9C27B0", positive="#2E7D32", warning="#F57C00", negative="#C62828")
 
@@ -447,27 +438,26 @@ def create_ui():
             ui.label("Privacy-First Local Anonymizer").classes("text-xl font-bold")
             ui.badge("100% Lokal & Offline", color="teal").props("outline")
         
-        # Dynamic AI model warmup status indicator
+        # Real-time background AI model warmup status
         with ui.row().classes("items-center gap-2"):
             model_spinner = ui.spinner(size="xs", color="teal")
             model_status_label = ui.label("KI-Modell lädt im Hintergrund...").classes("text-xs text-teal-200")
 
-            async def poll_model_status():
-                if not _model_ready_event.is_set():
-                    await _model_ready_event.wait()
-                model_spinner.set_visibility(False)
-                model_status_label.set_text("✅ KI-Modell bereit")
-                model_status_label.classes("text-teal-300 font-bold")
+            def check_warmup_status():
+                if _model_ready:
+                    model_spinner.set_visibility(False)
+                    model_status_label.set_text("✅ KI-Modell bereit (100% Lokal)")
+                    model_status_label.classes("text-teal-300 font-bold")
+                    warmup_timer.cancel()
 
-            ui.timer(0.2, poll_model_status, once=True)
+            warmup_timer = ui.timer(0.3, check_warmup_status)
 
-    # Reactive UI container holders
+    # UI container references
     preview_holder = None
     table_holder = None
     export_holder = None
     raw_text_area = None
     progress_holder = None
-    upload_ui_elem = None
     file_badge_card = None
     file_badge_label = None
     analyze_btn = None
@@ -479,7 +469,7 @@ def create_ui():
     restored_preview = None
 
     def load_content_into_workspace(text: str, filename: str):
-        """Unified workspace loader with instant reactive updates."""
+        """Unified workspace loader."""
         state.filename = filename
         state.raw_text = text
         if raw_text_area is not None:
@@ -494,35 +484,7 @@ def create_ui():
                 file_badge_card.set_visibility(True)
             else:
                 file_badge_card.set_visibility(False)
-        if upload_ui_elem is not None:
-            upload_ui_elem.reset()
         ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen).", type="positive")
-
-    async def handle_upload(e):
-        try:
-            if hasattr(e, "file") and e.file is not None:
-                data = await e.file.read()
-                filename = e.file.name
-            elif hasattr(e, "content") and e.content is not None:
-                data = e.content.read()
-                filename = getattr(e, "name", "document")
-            else:
-                raise ValueError("Unbekanntes Upload-Format")
-
-            text = read_document_from_bytes(data, filename)
-            load_content_into_workspace(text, filename)
-        except Exception as ex:
-            err_msg = f"{type(ex).__name__}: {str(ex)}"
-            logging.error(f"Upload error: {err_msg}", exc_info=True)
-            ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
-        finally:
-            if upload_ui_elem is not None:
-                upload_ui_elem.reset()
-
-    def handle_rejected(e):
-        ui.notify("Dateiformat nicht unterstützt.", type="negative", timeout=10000)
-        if upload_ui_elem is not None:
-            upload_ui_elem.reset()
 
     def open_native_file_dialog():
         """Open native OS file picker with full Win32 lock-sharing support."""
@@ -546,7 +508,6 @@ def create_ui():
             root.destroy()
             if filepath:
                 p = Path(filepath)
-                # safe_read_bytes opens with FILE_SHARE_READ | FILE_SHARE_WRITE so files open in Word/OneDrive load cleanly
                 data = safe_read_bytes(p)
                 text = read_document_from_bytes(data, p.name)
                 load_content_into_workspace(text, p.name)
@@ -572,8 +533,6 @@ def create_ui():
             table_holder.clear()
         if file_badge_card is not None:
             file_badge_card.set_visibility(False)
-        if upload_ui_elem is not None:
-            upload_ui_elem.reset()
         if analyze_btn is not None:
             analyze_btn.set_enabled(False)
         if reset_btn is not None:
@@ -789,15 +748,15 @@ def create_ui():
             with table_holder:
                 with ui.row().classes("items-center gap-3 p-4 bg-blue-50 rounded border border-blue-200"):
                     ui.spinner(size="md", color="primary")
-                    msg = "KI-Modell wird vorbereitet..." if not _model_ready_event.is_set() else "Dokument wird lokal analysiert (NER, Markdown, Struktur)..."
-                    ui.label(msg).classes("text-slate-700 text-sm font-medium")
+                    ui.label("Dokument wird lokal analysiert (NER, Markdown, Struktur)...").classes("text-slate-700 text-sm font-medium")
 
         # Yield to event loop so DOM updates render immediately in the browser
         await asyncio.sleep(0.02)
 
         try:
-            # Ensure model is ready
-            await ensure_model_loaded()
+            # Wait for background warmup if still running
+            while not _model_ready:
+                await asyncio.sleep(0.1)
 
             def do_analysis(text):
                 global _cached_anonymizer
@@ -829,6 +788,7 @@ def create_ui():
             state.entity_groups = list(groups_dict.values())
 
             # Compute interactive smart-linking suggestions (Proposal model, NO auto-commit)
+            from local_anonymizer.anonymizer import compute_smart_link_proposals
             compute_smart_link_proposals(state.entity_groups)
 
             # Compute initial placeholders so badges exist immediately
@@ -919,6 +879,7 @@ def create_ui():
                     ui.button("Alle abwählen", icon="deselect", on_click=deselect_all, color="slate").props("outline dense size=sm")
 
             sorted_groups = get_sorted_groups()
+            from local_anonymizer.anonymizer import build_entity_tree
             tree = build_entity_tree(sorted_groups)
 
             # Render Tree Nodes (Roots & Indented Children)
@@ -1236,19 +1197,107 @@ def create_ui():
                 with ui.tab_panel(tab_anonymize):
                     ui.label("Stufe 1: Dokument laden & Text-Eingabe").classes("text-base font-bold text-slate-800 mb-1")
                     
-                    # Single Modern Full-Width Drop-Zone Card
-                    with ui.card().classes("w-full p-4 bg-slate-50 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-xl mb-3 shadow-none transition-colors"):
-                        upload_ui_elem = ui.upload(
-                            label="Datei hier hineinziehen oder klicken (.docx, .pdf, .txt, .md, .csv, .json)",
-                            auto_upload=True,
-                            on_upload=handle_upload,
-                            on_rejected=handle_rejected,
-                            max_files=1,
-                        ).props("flat bordered color=primary").classes("w-full bg-white rounded-lg")
+                    # 100% Unified Modern Dropzone (Click anywhere to pick, or Drag & Drop anywhere)
+                    with ui.card().classes(
+                        "w-full py-7 px-4 bg-slate-50 hover:bg-slate-100 border-2 border-dashed border-blue-400 hover:border-blue-600 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-3 select-none"
+                    ) as dropzone_card:
+                        drop_card_id = dropzone_card.id
+                        dropzone_card.props(f'id="custom_dropzone_{drop_card_id}"')
 
-                        with ui.row().classes("w-full justify-between items-center mt-2 px-1 flex-wrap"):
-                            ui.button("📂 Datei über Windows-Explorer auswählen...", icon="folder_open", on_click=open_native_file_dialog, color="slate").props("flat dense size=xs").tooltip("Öffnet den Explorer (liest auch geöffnete Word-Dateien fehlerfrei)")
-                            ui.label("Automatische Struktur-, Überschriften- & Tabellenerkennung").classes("text-[11px] text-slate-400 italic")
+                        with ui.row().classes("items-center gap-2 mb-1 pointer-events-none"):
+                            ui.icon("cloud_upload", size="lg").classes("text-blue-600")
+                            ui.label("Datei hier ablegen oder zum Auswählen klicken").classes("text-base font-bold text-slate-800")
+                        ui.label("Word (.docx), PDF, Text (.txt, .md), CSV, JSON • Liest auch geöffnete Dateien fehlerfrei").classes("text-xs text-slate-500 pointer-events-none")
+
+                        # Click opens Explorer
+                        dropzone_card.on("click", open_native_file_dialog)
+
+                        # Drop handler directly via NiceGUI WebSocket connection
+                        def on_file_dropped(e):
+                            data = e.args
+                            filename = data.get("name", "dokument")
+                            filepath = data.get("path", "")
+                            try:
+                                if filepath and Path(filepath).exists():
+                                    raw_bytes = safe_read_bytes(filepath)
+                                elif "base64" in data:
+                                    raw_bytes = base64.b64decode(data["base64"])
+                                else:
+                                    raise ValueError("Keine Dateidaten empfangen")
+
+                                text = read_document_from_bytes(raw_bytes, filename)
+                                load_content_into_workspace(text, filename)
+                            except Exception as ex:
+                                err_msg = f"{type(ex).__name__}: {str(ex)}"
+                                logging.error(f"Drop error: {err_msg}", exc_info=True)
+                                ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
+
+                        dropzone_card.on("file_dropped", on_file_dropped)
+
+                        # Hook HTML5 drag events to the card
+                        ui.run_javascript(f"""
+                        (function() {{
+                            const cardId = {drop_card_id};
+                            const el = document.getElementById('custom_dropzone_' + cardId);
+                            if (!el || el._dropAttached) return;
+                            el._dropAttached = true;
+
+                            window.addEventListener('dragover', function(e) {{ e.preventDefault(); }}, false);
+                            window.addEventListener('drop', function(e) {{ e.preventDefault(); }}, false);
+
+                            el.addEventListener('dragenter', function(e) {{
+                                e.preventDefault();
+                                e.stopPropagation();
+                                el.style.borderColor = '#1d4ed8';
+                                el.style.backgroundColor = '#dbeafe';
+                            }}, false);
+
+                            el.addEventListener('dragover', function(e) {{
+                                e.preventDefault();
+                                e.stopPropagation();
+                                el.style.borderColor = '#1d4ed8';
+                                el.style.backgroundColor = '#dbeafe';
+                            }}, false);
+
+                            el.addEventListener('dragleave', function(e) {{
+                                e.preventDefault();
+                                e.stopPropagation();
+                                el.style.borderColor = '#60a5fa';
+                                el.style.backgroundColor = '#f8fafc';
+                            }}, false);
+
+                            el.addEventListener('drop', function(e) {{
+                                e.preventDefault();
+                                e.stopPropagation();
+                                el.style.borderColor = '#60a5fa';
+                                el.style.backgroundColor = '#f8fafc';
+
+                                const files = e.dataTransfer.files;
+                                if (!files || files.length === 0) return;
+                                const file = files[0];
+
+                                if (file.path) {{
+                                    window.socket.emit('event', {{
+                                        id: cardId,
+                                        name: 'file_dropped',
+                                        args: {{ name: file.name, path: file.path }}
+                                    }});
+                                    return;
+                                }}
+
+                                const reader = new FileReader();
+                                reader.onload = function(evt) {{
+                                    const b64 = evt.target.result.split(',')[1];
+                                    window.socket.emit('event', {{
+                                        id: cardId,
+                                        name: 'file_dropped',
+                                        args: {{ name: file.name, base64: b64 }}
+                                    }});
+                                }};
+                                reader.readAsDataURL(file);
+                            }}, false);
+                        }})();
+                        """)
 
                     # Document info badge when loaded (with remove button)
                     with ui.row().classes("w-full mb-2 items-center gap-2") as file_badge_card:
@@ -1372,6 +1421,7 @@ def create_ui():
                                             save_current_config()
                                             ui.notify(f"'{term}' dauerhaft in der Begriffsliste gespeichert.", type="info")
 
+                                    from local_anonymizer.anonymizer import compute_smart_link_proposals
                                     compute_smart_link_proposals(state.entity_groups)
                                     compute_reactive_preview()
                                     build_review_table()
@@ -1492,6 +1542,7 @@ def create_ui():
                             ui.notify("Bitte Mapping-Tabelle laden oder eingeben.", type="warning")
                             return
 
+                        from local_anonymizer.anonymizer import LocalAnonymizer
                         restored = LocalAnonymizer.de_anonymize(state.restore_anon_text, state.restore_mapping)
                         state.restored_text = restored
                         restored_preview.value = restored
@@ -1562,14 +1613,6 @@ def create_ui():
                             color="slate",
                             on_click=save_restored_md,
                         ).props("outline")
-
-
-def on_startup():
-    """Start asynchronous background preloading as soon as the app starts."""
-    asyncio.create_task(ensure_model_loaded())
-
-
-app.on_startup(on_startup)
 
 
 def main():
