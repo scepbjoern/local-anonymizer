@@ -103,6 +103,8 @@ class EntityOccurrence:
     context_html: str
     needs_review: bool
     source: str = "automatic"
+    method: str = "ai"
+    method_detail: Optional[str] = None
 
 
 class EntityGroup:
@@ -388,6 +390,49 @@ ENTITY_MODE_OPTIONS: Dict[str, str] = {
     ENTITY_MODE_EXPLICIT_ONLY: "Nur Glossar & manuell",
     ENTITY_MODE_ALL: "Alle Quellen",
 }
+
+ENTITY_MODE_COLORS: Dict[str, str] = {
+    ENTITY_MODE_OFF: "bg-red-100 text-red-900 border-red-300",
+    ENTITY_MODE_EXPLICIT_ONLY: "bg-orange-100 text-orange-900 border-orange-300",
+    ENTITY_MODE_ALL: "bg-green-100 text-green-900 border-green-300",
+}
+
+
+def entity_mode_classes(mode: str) -> str:
+    """Return stable base and state color classes for one category mode selector."""
+    return f"w-44 text-xs {ENTITY_MODE_COLORS.get(mode, ENTITY_MODE_COLORS[ENTITY_MODE_OFF])}"
+
+RECOGNIZER_METHODS: Dict[str, str] = {
+    "GLiNERRecognizer": "ai",
+    "AddressPatternRecognizer": "regex",
+    "AHVNumberRecognizer": "regex",
+    "UIDNumberRecognizer": "regex",
+}
+
+METHOD_DISPLAY: Dict[str, Tuple[str, str, str]] = {
+    "ai": ("🤖 KI", "blue", "Durch den lokalen KI-Erkenner gefunden"),
+    "regex": ("🔤 Regex", "purple", "Durch einen regulären Ausdruck gefunden"),
+    "library": ("📚 Bibliothek", "grey-7", "Durch eine lokale Bibliotheks-Erkennung gefunden"),
+    "glossary_direct": ("📖 Glossar · direkt", "teal", "Direkter Treffer in der eigenen Begriffsliste"),
+    "glossary_fuzzy": ("📖 Glossar · Fuzzy", "orange", "Ähnlichkeitstreffer in der eigenen Begriffsliste"),
+    "manual": ("✍ Manuell", "green", "Manuell für diesen Durchlauf markiert"),
+}
+
+
+def classify_recognition_result(result: Any) -> Tuple[str, str]:
+    """Return the coarse source and display method for one Presidio result."""
+    metadata = result.recognition_metadata or {}
+    recognizer_name = metadata.get("recognizer_name", "")
+    if recognizer_name == "FuzzyGlossaryRecognizer":
+        match_kind = metadata.get("glossary_match", "direct")
+        return "glossary", "glossary_fuzzy" if match_kind == "fuzzy" else "glossary_direct"
+    method = metadata.get("detection_method") or RECOGNIZER_METHODS.get(recognizer_name, "library")
+    return "automatic", method
+
+
+def method_display(method: str) -> Tuple[str, str, str]:
+    """Return label, badge color, and tooltip for an occurrence method."""
+    return METHOD_DISPLAY.get(method, (method, "grey-7", "Erkennungsmethode"))
 
 
 def resolve_entity_modes(config: AppConfig) -> Dict[str, str]:
@@ -1128,8 +1173,7 @@ def create_ui():
                 needs_rev = 0.70 <= res.score < 0.85
                 ctx_html = extract_context_snippet(state.raw_text, res.start, res.end)
 
-                metadata = res.recognition_metadata or {}
-                source = "glossary" if metadata.get("recognizer_name") == "FuzzyGlossaryRecognizer" else "automatic"
+                source, method = classify_recognition_result(res)
                 occ = EntityOccurrence(
                     start=res.start,
                     end=res.end,
@@ -1137,6 +1181,7 @@ def create_ui():
                     context_html=ctx_html,
                     needs_review=needs_rev,
                     source=source,
+                    method=method,
                 )
                 if key not in groups_dict:
                     groups_dict[key] = EntityGroup(original_text=norm, entity_type=res.entity_type)
@@ -1408,11 +1453,61 @@ def create_ui():
                                             build_review_table()
                                         return on_click
 
+                                    def make_add_to_glossary(term, grp):
+                                        def on_click():
+                                            lines = [line.strip() for line in state.glossary_text.splitlines() if line.strip()]
+                                            lines = [
+                                                line for line in lines
+                                                if not (
+                                                    line.lower().startswith(f"{term.lower()}:")
+                                                    or line.lower().startswith(f"{term.lower()}=")
+                                                )
+                                            ]
+                                            lines.append(f"{term}: {grp.entity_type}")
+                                            state.glossary_text = "\n".join(lines)
+                                            # Make the action effective immediately in the current
+                                            # review, even before the next full analysis.
+                                            for occurrence in grp.occurrences:
+                                                occurrence.source = "glossary"
+                                                occurrence.method = "glossary_direct"
+                                                occurrence.method_detail = "direct"
+                                            grp.enabled = True
+                                            save_current_config(state)
+                                            render_glossary_list_ui()
+                                            compute_reactive_preview(state)
+                                            refresh_preview_and_exports()
+                                            build_review_table()
+                                            ui.notify(f"'{term}' als {grp.entity_type} zur Begriffsliste hinzugefügt.", type="positive", icon="library_add")
+                                        return on_click
+
+                                    def make_mark_manual(term, grp):
+                                        def on_click():
+                                            for occurrence in grp.occurrences:
+                                                occurrence.source = "manual"
+                                                occurrence.method = "manual"
+                                                occurrence.method_detail = "manual"
+                                                occurrence.needs_review = False
+                                            grp.enabled = True
+                                            compute_reactive_preview(state)
+                                            refresh_preview_and_exports()
+                                            build_review_table()
+                                            ui.notify(f"'{term}' nur für diesen Durchlauf manuell markiert.", type="info", icon="edit_note")
+                                        return on_click
+
                                     ui.button(
-                                        "Ignorieren",
                                         icon="block",
                                         on_click=make_group_ignore(master.original_text, master),
-                                    ).props("flat dense size=sm color=grey-8")
+                                    ).props("flat round dense size=sm color=grey-8").tooltip("Begriff ignorieren und zur Ignore-Liste hinzufügen")
+                                    ui.button(
+                                        icon="library_add",
+                                        on_click=make_add_to_glossary(master.original_text, master),
+                                    ).props("flat round dense size=sm color=teal-8").tooltip("Diesen Begriff dauerhaft mit diesem Entitätstyp zum Glossar hinzufügen")
+                                    manual_button = ui.button(
+                                        icon="edit_note",
+                                        on_click=make_mark_manual(master.original_text, master),
+                                    ).props("flat round dense size=sm color=orange-8").tooltip("Diesen Begriff nur für den aktuellen Durchlauf als manuell markiert behandeln")
+                                    if not is_category_enabled(state, master.entity_type):
+                                        manual_button.disable()
 
                         # Expanded content: Context occurrences
                         with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
@@ -1421,6 +1516,8 @@ def create_ui():
                                 with ui.row().classes("items-center gap-2 p-1.5 bg-slate-50 rounded border text-xs w-full"):
                                     ui.label(f"#{occ_idx}").classes("font-bold text-slate-500 w-6")
                                     ui.html(occ.context_html).classes("flex-1 text-slate-800")
+                                    method_label, method_color, method_tooltip = method_display(occ.method)
+                                    ui.badge(method_label, color=method_color).props("dense outline").tooltip(method_tooltip)
                                     ui.label(f"Score: {occ.score:.2f}").classes("text-slate-400 font-mono text-[10px]")
 
                     # Render Indented Linked Children
@@ -1476,11 +1573,13 @@ def create_ui():
                             # Child Occurrences
                             with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
                                 ui.label(f"Fundstellen von '{child.original_text}' ({child.count} Vorkommen):").classes("text-xs font-bold text-slate-700")
-                                for occ_idx, occ in enumerate(child.occurrences, start=1):
-                                    with ui.row().classes("items-center gap-2 p-1.5 bg-slate-50 rounded border text-xs w-full"):
-                                        ui.label(f"#{occ_idx}").classes("font-bold text-slate-500 w-6")
-                                        ui.html(occ.context_html).classes("flex-1 text-slate-800")
-                                        ui.label(f"Score: {occ.score:.2f}").classes("text-slate-400 font-mono text-[10px]")
+                            for occ_idx, occ in enumerate(child.occurrences, start=1):
+                                with ui.row().classes("items-center gap-2 p-1.5 bg-slate-50 rounded border text-xs w-full"):
+                                    ui.label(f"#{occ_idx}").classes("font-bold text-slate-500 w-6")
+                                    ui.html(occ.context_html).classes("flex-1 text-slate-800")
+                                    method_label, method_color, method_tooltip = method_display(occ.method)
+                                    ui.badge(method_label, color=method_color).props("dense outline").tooltip(method_tooltip)
+                                    ui.label(f"Score: {occ.score:.2f}").classes("text-slate-400 font-mono text-[10px]")
 
     # --- Main Layout ---
     with ui.row().classes("w-full no-wrap p-4 gap-6"):
@@ -1532,12 +1631,17 @@ def create_ui():
                     ui.label(ent).classes("text-xs font-mono text-slate-700")
 
                     def make_entity_mode_change(e_name):
+                        selector_ref: List[Any] = []
+
                         def change_mode(e):
-                            state.entity_modes[e_name] = e.value or ENTITY_MODE_OFF
+                            mode = e.value or ENTITY_MODE_OFF
+                            state.entity_modes[e_name] = mode
                             state.active_entities = [
                                 entity for entity, mode in state.entity_modes.items()
                                 if mode == ENTITY_MODE_ALL
                             ]
+                            if selector_ref:
+                                selector_ref[0].classes(replace=entity_mode_classes(mode))
                             save_current_config(state)
                             # Existing groups are re-filtered immediately by source; a new analysis
                             # is still needed when automatic detection has just been enabled.
@@ -1547,13 +1651,17 @@ def create_ui():
                                 build_review_table()
                                 if reanalysis_warning_card is not None:
                                     reanalysis_warning_card.set_visibility(True)
-                        return change_mode
+                        return change_mode, selector_ref
 
-                    ui.select(
+                    mode_change, selector_ref = make_entity_mode_change(ent)
+                    mode_select = ui.select(
                         options=ENTITY_MODE_OPTIONS,
                         value=state.entity_modes.get(ent, ENTITY_MODE_OFF),
-                        on_change=make_entity_mode_change(ent),
-                    ).props("dense outlined bg-white options-dense").classes("w-44 text-xs")
+                        on_change=mode_change,
+                    ).props("dense outlined options-dense").classes(
+                        entity_mode_classes(state.entity_modes.get(ent, ENTITY_MODE_OFF))
+                    )
+                    selector_ref.append(mode_select)
 
             ui.separator().classes("my-2")
 
@@ -1832,7 +1940,7 @@ def create_ui():
                         reanalysis_warning_card.set_visibility(False)
                         with ui.row().classes("w-full items-center gap-2 text-amber-900 text-xs"):
                             ui.icon("warning", size="sm").classes("text-amber-600")
-                            ui.label("Die Entitäten-Auswahl / Einstellungen wurden geändert. Klicken Sie auf „Text / Dokument analysieren“, um die Tabelle zu aktualisieren.").classes("font-medium")
+                            ui.label("Die Erkennungs-Einstellungen wurden geändert. Deaktivierte Treffer sind bereits aus der Vorschau entfernt; klicken Sie auf „Text / Dokument analysieren“, um neue automatische Treffer zu übernehmen.").classes("font-medium")
 
                     # Prominent Analysis & Workspace Reset Buttons in Action Row
                     with ui.row().classes("w-full items-center justify-between mt-1 mb-4 gap-3 flex-wrap"):
@@ -1912,6 +2020,7 @@ def create_ui():
                                                     context_html=ctx_html,
                                                     needs_review=False,
                                                     source="manual",
+                                                    method="manual",
                                                 )
                                             )
 

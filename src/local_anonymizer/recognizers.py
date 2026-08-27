@@ -376,6 +376,10 @@ class GLiNERRecognizer(EntityRecognizer):
                             start=global_start,
                             end=global_end,
                             score=float(pred["score"]),
+                            recognition_metadata={
+                                "recognizer_name": self.name,
+                                "detection_method": "ai",
+                            },
                         )
                     )
 
@@ -447,7 +451,7 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
         # Determine max number of words in glossary terms
         max_glossary_words = max(len(term.split()) for term in self.glossary.keys())
 
-        raw_candidates: List[Tuple[int, int, str, float, str]] = []  # (start, end, entity_type, score, term)
+        raw_candidates: List[Tuple[int, int, str, float, str, str]] = []  # (..., term, match_kind)
 
         num_words = len(word_matches)
         for i in range(num_words):
@@ -466,7 +470,7 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
                     # Exact match (Case-insensitive or Case-sensitive)
                     if span_text.lower() == canonical_term.lower():
                         raw_candidates.append(
-                            (start_char, end_char, entity_type, 1.0, canonical_term)
+                            (start_char, end_char, entity_type, 1.0, canonical_term, "direct")
                         )
                         continue
 
@@ -477,11 +481,11 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
                     ratio = fuzz.ratio(span_text.lower(), canonical_term.lower())
                     if ratio >= self.high_confidence_threshold:
                         raw_candidates.append(
-                            (start_char, end_char, entity_type, 0.95, canonical_term)
+                            (start_char, end_char, entity_type, 0.95, canonical_term, "fuzzy")
                         )
                     elif ratio >= self.review_threshold:
                         raw_candidates.append(
-                            (start_char, end_char, entity_type, 0.80, canonical_term)
+                            (start_char, end_char, entity_type, 0.80, canonical_term, "fuzzy")
                         )
 
         # Deduplicate overlapping candidates: sort by score desc, then span length desc
@@ -489,7 +493,7 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
         accepted_spans: List[Tuple[int, int]] = []
         results: List[RecognizerResult] = []
 
-        for start, end, entity_type, score, canonical_term in raw_candidates:
+        for start, end, entity_type, score, canonical_term, match_kind in raw_candidates:
             # Check overlap with already accepted spans
             overlaps = any(
                 not (end <= existing_start or start >= existing_end)
@@ -503,7 +507,10 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
                         start=start,
                         end=end,
                         score=score,
-                        recognition_metadata={"recognizer_name": self.name},
+                        recognition_metadata={
+                            "recognizer_name": self.name,
+                            "glossary_match": match_kind,
+                        },
                     )
                 )
 

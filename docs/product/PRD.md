@@ -104,6 +104,7 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 * **Gebündelte Entitäten-Ansicht:** Identische Begriffe (z. B. 8x „Julia“) werden auf eine einzige Zeile mit Mengenzähler (`8x`) aggregiert.
 * **Aufklappbare Kontext-Vorschau:** Akkordeon-Ansicht zeigt alle Fundstellen im Satzkontext mit visueller Hervorhebung (`... für <mark>Julia</mark> im Herbst ...`).
 * **Sortier-Toolbar:** Umschaltbar nach *Erstes Auftreten*, *Häufigkeit*, *Entitätstyp*, *Alphabetisch* und *Review-Bedarf*.
+* **Transparente Fundstellen:** Jede Fundstelle zeigt ihre Erkennungsmethode (`KI`, `Regex`, `Bibliothek`, `Glossar direkt`, `Glossar Fuzzy` oder `manuell`). Gruppenaktionen erlauben Ignorieren, dauerhaftes Übernehmen ins Glossar oder eine nur für den aktuellen Durchlauf gültige manuelle Markierung.
 * **Persistente Einstellungen (`config.json`):** Format-Modus, aktivierte Entitäten, Schwellenwerte, Ignore-Listen und Glossare werden automatisch in `~/.local-anonymizer/config.json` gespeichert.
 * **Desktop-Export-Aktionen:**
   * 📋 *In Zwischenablage kopieren*

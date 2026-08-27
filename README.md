@@ -19,6 +19,7 @@
 - **🔍 Fuzzy Glossary & Overrides:** Uses [RapidFuzz](https://github.com/rapidfuzz/RapidFuzz) to catch custom internal terms, project codes, employee acronyms (e.g., mapping `"abcd"` -> `PERSON`), and typos (e.g. `"ZHW"` -> `"ZHAW"`).
 - **🚫 Interactive Ignore Lists:** Exclude generic roles, academic degrees, or product names that should never be scrubbed (e.g., `"CAS"`, `"BSc"`, `"Dozent"`).
 - **🇨🇭 Deterministic Swiss/CH-PII Detection:** Recognizes Swiss/German addresses plus checksum-validated AHV and CHE/UID numbers; internal IT systems are supported through the glossary and GLiNER safety-net prompts.
+- **🔎 Transparent Review Sources:** Each finding shows whether it came from AI, Regex, a local library, the glossary (direct or fuzzy), or a manual marking. Icon actions can ignore a group, add it permanently to the glossary, or mark it only for the current run.
 - **📄 Multi-Format Document Support:** Structured text and Markdown extraction for Word `.docx`, `.pdf`, `.csv`, `.json`, `.txt`, and `.md` with robust multi-encoding fallback (`utf-8-sig`, `cp1252`, `iso-8859-15`).
 - **📊 Advanced PDF-to-Markdown Extraction:** Powered by `pymupdf4llm` with table structure cleanup, broken hyphenation repair, picture text extraction toggle, and recurring header/footer suppression with Page-1 title protection.
 - **🖥️ Native Desktop GUI:** Responsive, instant-startup NiceGUI interface running as a native desktop window (with `--browser` option for web workflows).

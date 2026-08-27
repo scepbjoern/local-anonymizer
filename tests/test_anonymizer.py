@@ -52,6 +52,29 @@ def test_glossary_can_be_disabled_independently_of_general_detection(monkeypatch
     assert anonymizer.analyze("SAP") == []
 
 
+def test_detection_method_is_annotated_from_recognizer(monkeypatch):
+    """Review metadata distinguishes a deterministic regex result from generic automation."""
+    from presidio_analyzer import RecognizerResult
+
+    anonymizer = LocalAnonymizer(enabled_entities=["ADDRESS"])
+
+    def fake_general_detection(**kwargs):
+        return [
+            RecognizerResult(
+                entity_type="ADDRESS",
+                start=0,
+                end=10,
+                score=1.0,
+                recognition_metadata={"recognizer_name": "AddressPatternRecognizer"},
+            )
+        ]
+
+    monkeypatch.setattr(anonymizer.analyzer, "analyze", fake_general_detection)
+    results = anonymizer.analyze("Hauptstrasse")
+
+    assert results[0].recognition_metadata["detection_method"] == "regex"
+
+
 def test_builtin_generic_terms_are_ignored_but_explicit_glossary_wins(monkeypatch):
     """Generic labels such as E-Mail and App are suppressed unless explicitly configured."""
     from presidio_analyzer import RecognizerResult
@@ -535,4 +558,3 @@ def test_entity_source_overview_reflects_glossary_master_switch():
 
     assert overview["IT_SYSTEM"]["active"] is False
     assert overview["IT_SYSTEM"]["mode"] == "off"
-

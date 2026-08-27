@@ -383,6 +383,28 @@ class LocalAnonymizer:
             combined_ignore.update(ignore_terms)
         self.ignore_terms = list(combined_ignore)
 
+    def _annotate_detection_methods(self, results: List[RecognizerResult]) -> None:
+        """Attach a stable source label to every result for transparent review display."""
+        method_by_recognizer: Dict[str, str] = {}
+        for recognizer in self.analyzer.registry.get_recognizers(
+            language=self.language,
+            all_fields=True,
+        ):
+            if recognizer.name == "GLiNERRecognizer":
+                method_by_recognizer[recognizer.name] = "ai"
+            elif recognizer.name == "FuzzyGlossaryRecognizer":
+                method_by_recognizer[recognizer.name] = "glossary"
+            elif getattr(recognizer, "patterns", None):
+                method_by_recognizer[recognizer.name] = "regex"
+            else:
+                method_by_recognizer[recognizer.name] = "library"
+
+        for result in results:
+            metadata = dict(result.recognition_metadata or {})
+            recognizer_name = metadata.get("recognizer_name", "")
+            metadata["detection_method"] = method_by_recognizer.get(recognizer_name, "library")
+            result.recognition_metadata = metadata
+
     def add_ignore_term(self, term: str) -> None:
         """Add a term to the ignore list."""
         if term not in self.ignore_terms:
@@ -528,6 +550,8 @@ class LocalAnonymizer:
                     self.fuzzy_recognizer.analyze(text=text, entities=sorted(disabled_glossary_types))
                 )
 
+        self._annotate_detection_methods(results)
+
         if on_progress:
             on_progress(0.65, "Filterung & Deduplizierung der Fundstellen...")
 
@@ -659,12 +683,13 @@ class LocalAnonymizer:
                     )
                     if not is_covered and not is_ignored:
                         genitive_results.append(
-                            self._RecognizerResult(
-                                entity_type="PERSON",
-                                start=m_start,
-                                end=m_end,
-                                score=min(0.85, r.score),
-                            )
+                        self._RecognizerResult(
+                            entity_type="PERSON",
+                            start=m_start,
+                            end=m_end,
+                            score=min(0.85, r.score),
+                            recognition_metadata=r.recognition_metadata,
+                        )
                         )
                         accepted_spans.append((m_start, m_end))
 

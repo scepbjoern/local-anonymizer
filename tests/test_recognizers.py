@@ -30,7 +30,8 @@ def test_fuzzy_glossary_typo_matching():
     recognizer = FuzzyGlossaryRecognizer(glossary={"ZHAW": "ORGANIZATION"}, high_confidence_threshold=80.0, review_threshold=70.0)
     results = recognizer.analyze("Die Studenten der ZHW sind hier.", entities=["ORGANIZATION"])
     # Should find ZHW as ORGANIZATION
-    assert any(r.entity_type == "ORGANIZATION" and r.start == 18 and r.end == 21 for r in results)
+    typo_result = next(r for r in results if r.entity_type == "ORGANIZATION" and r.start == 18 and r.end == 21)
+    assert typo_result.recognition_metadata["glossary_match"] == "fuzzy"
 
 def test_fuzzy_glossary_exact_match_priority():
     recognizer = FuzzyGlossaryRecognizer(glossary={"ZHAW": "ORGANIZATION"}, high_confidence_threshold=80.0, review_threshold=70.0)
@@ -38,6 +39,7 @@ def test_fuzzy_glossary_exact_match_priority():
     # Both should be found, but ZHAW should have score 1.0
     zhaw_match = next(r for r in results if r.start == 4)
     assert zhaw_match.score == 1.0
+    assert zhaw_match.recognition_metadata["glossary_match"] == "direct"
 
 
 def test_get_optimal_device():
