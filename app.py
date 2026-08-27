@@ -340,10 +340,16 @@ AVAILABLE_ENTITIES = [
     "DATE_TIME",
     "IBAN_CODE",
     "CREDIT_CARD",
+    "BANK_ACCOUNT",
     "ID_NUMBER",
     "FINANCIAL_DATA",
     "HEALTH_DATA",
     "IP_ADDRESS",
+    "MAC_ADDRESS",
+    "URL",
+    "USERNAME",
+    "CRYPTO",
+    "MEDICAL_LICENSE",
 ]
 
 # Surface tag options as a clean dictionary
@@ -2226,7 +2232,13 @@ def create_ui():
                         "Pro Kategorie: ob sie aktuell aktiv ist, und über welchen Mechanismus sie erkannt wird -- "
                         "ein KI-Prompt an das Zero-Shot-Modell, ein regulärer Ausdruck, eine externe Bibliothek, "
                         "oder deine eigene Begriffsliste. Reine Anzeige, hier wird nichts verändert."
-                    ).classes("text-xs text-slate-500 mb-3")
+                    ).classes("text-xs text-slate-500 mb-1")
+                    ui.label(
+                        "Hat eine Kategorie mehrere Quellen (z. B. KI-Prompt + Regex), arbeiten sie ergänzend "
+                        "zusammen statt sich zu widersprechen: alle Kandidaten werden gesammelt, und bei "
+                        "überlappenden Funden gewinnt der längere Fund -- bei gleicher Länge dein Glossar vor "
+                        "allen anderen Quellen, sonst der höhere Konfidenzwert."
+                    ).classes("text-xs text-slate-400 italic mb-3")
 
                     ui.button("🔄 Aktualisieren", on_click=lambda: load_transparency_view()).props("outline dense size=sm").classes("mb-2")
                     transparency_container = ui.column().classes("w-full gap-1")
