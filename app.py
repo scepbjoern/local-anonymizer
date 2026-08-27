@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import atexit
 import sys
 import threading
 import uuid
@@ -26,6 +27,7 @@ from fastapi import File, UploadFile
 from fastapi.responses import JSONResponse
 from nicegui import app, ui
 
+from local_anonymizer.anonymizer import clean_tag
 from local_anonymizer.config import AppConfig, CONFIG_DIR, LOG_FILE
 from local_anonymizer.extractors import (
     UnsupportedFileFormatError,
@@ -34,6 +36,7 @@ from local_anonymizer.extractors import (
     read_document_from_bytes,
     safe_read_bytes,
     save_markdown_to_docx_bytes,
+    strip_html_markup,
 )
 
 # Silence presidio analyzer language mismatch warnings
@@ -42,6 +45,8 @@ logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
 # Shared temp upload directory for large file Drag & Drop (cross-process, zero WebSocket limits)
 UPLOAD_DIR = CONFIG_DIR / "temp_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB limit
 
 
 def cleanup_temp_uploads():
@@ -58,14 +63,18 @@ def cleanup_temp_uploads():
 
 
 cleanup_temp_uploads()
+atexit.register(cleanup_temp_uploads)
 
 
 @app.post("/api/upload")
 async def api_upload(file: UploadFile = File(...)):
-    """FastAPI endpoint to receive large dropped files via HTTP streaming to disk."""
+    """FastAPI endpoint to receive large dropped files via HTTP streaming to disk with size limits."""
     try:
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         content = await file.read()
+        if len(content) > MAX_UPLOAD_SIZE:
+            return JSONResponse({"error": "Dateigröße überschreitet das Limit von 50 MB."}, status_code=413)
+
         file_id = str(uuid.uuid4())
         bin_path = UPLOAD_DIR / f"{file_id}.bin"
         meta_path = UPLOAD_DIR / f"{file_id}.json"
@@ -155,11 +164,10 @@ class AppState:
         self.last_raw_bytes: Optional[bytes] = None
 
 
-state = AppState()
-
 # Background model warmup state
 _model_ready: bool = False
 _cached_anonymizer: Any = None
+_model_lock = threading.Lock()
 
 
 def parse_glossary(text: str) -> Dict[str, str]:
@@ -196,19 +204,29 @@ def parse_ignore_terms(text: str) -> List[str]:
     return terms
 
 
-def build_anonymizer():
-    """Build LocalAnonymizer instance with current state settings."""
+def build_anonymizer(app_state: Optional[AppState] = None):
+    """Build LocalAnonymizer instance with specified state settings or loaded config."""
     from local_anonymizer.anonymizer import LocalAnonymizer
 
-    glossary = parse_glossary(state.glossary_text)
-    ignore_terms = parse_ignore_terms(state.ignore_terms_text)
-    return LocalAnonymizer(
-        language="de",
-        glossary=glossary,
-        ignore_terms=ignore_terms,
-        enabled_entities=state.active_entities if state.active_entities else None,
-        gliner_threshold=state.gliner_threshold,
-    )
+    if app_state is not None:
+        glossary = parse_glossary(app_state.glossary_text)
+        ignore_terms = parse_ignore_terms(app_state.ignore_terms_text)
+        return LocalAnonymizer(
+            language="de",
+            glossary=glossary,
+            ignore_terms=ignore_terms,
+            enabled_entities=app_state.active_entities if app_state.active_entities else None,
+            gliner_threshold=app_state.gliner_threshold,
+        )
+    else:
+        cfg = AppConfig.load()
+        return LocalAnonymizer(
+            language="de",
+            glossary=parse_glossary(cfg.glossary),
+            ignore_terms=parse_ignore_terms(cfg.ignore_terms),
+            enabled_entities=list(cfg.active_entities) if cfg.active_entities else None,
+            gliner_threshold=cfg.gliner_threshold,
+        )
 
 
 def _warmup_background_thread():
@@ -216,12 +234,15 @@ def _warmup_background_thread():
     global _cached_anonymizer, _model_ready
     try:
         logging.info("Background warming up GLiNER & Presidio AI models...")
-        _cached_anonymizer = build_anonymizer()
-        _model_ready = True
+        anon = build_anonymizer()
+        with _model_lock:
+            _cached_anonymizer = anon
+            _model_ready = True
         logging.info("GLiNER & Presidio AI models ready.")
     except Exception as e:
         logging.error(f"Error during background model warmup: {e}", exc_info=True)
-        _model_ready = True
+        with _model_lock:
+            _model_ready = True
 
 
 # Start background warmup immediately in separate thread
@@ -255,21 +276,15 @@ SURFACE_TAG_OPTIONS: Dict[str, str] = {
 }
 
 
-def clean_tag(text: str) -> str:
-    if not text:
-        return ""
-    return re.sub(r"[^A-Za-z0-9_]+", "_", text.strip().upper()).strip("_")
-
-
-def save_current_config():
+def save_current_config(st: AppState):
     """Save user modifications back to persistent config."""
-    state.config.format_mode = state.format_mode
-    state.config.active_entities = state.active_entities
-    state.config.gliner_threshold = state.gliner_threshold
-    state.config.ignore_terms = state.ignore_terms_text
-    state.config.glossary = state.glossary_text
-    state.config.export_format = state.export_format
-    state.config.save()
+    st.config.format_mode = st.format_mode
+    st.config.active_entities = st.active_entities
+    st.config.gliner_threshold = st.gliner_threshold
+    st.config.ignore_terms = st.ignore_terms_text
+    st.config.glossary = st.glossary_text
+    st.config.export_format = st.export_format
+    st.config.save()
 
 
 def extract_context_snippet(raw_text: str, start: int, end: int, window: int = 40) -> str:
@@ -287,19 +302,19 @@ def extract_context_snippet(raw_text: str, start: int, end: int, window: int = 4
     return f"{prefix}{html.escape(before)}<b class='text-blue-700 bg-blue-100 px-1 rounded'>{html.escape(match)}</b>{html.escape(after)}{suffix}"
 
 
-def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
+def compute_reactive_preview(st: AppState) -> Tuple[str, Dict[str, str], Dict]:
     """
     Recalculate placeholder substitution based on current active groups, roles, format mode, and entity links.
     """
-    if not state.raw_text:
+    if not st.raw_text:
         return "", {}, {}
 
-    active_groups = [g for g in state.entity_groups if g.enabled]
+    active_groups = [g for g in st.entity_groups if g.enabled]
     if not active_groups:
-        state.current_mapping = {}
-        state.current_anon_text = state.raw_text
-        state.current_report = {"source_file": state.filename, "entity_count": 0, "mapping": {}, "entities": []}
-        return state.raw_text, {}, state.current_report
+        st.current_mapping = {}
+        st.current_anon_text = st.raw_text
+        st.current_report = {"source_file": st.filename, "entity_count": 0, "mapping": {}, "entities": []}
+        return st.raw_text, {}, st.current_report
 
     # 1. Assign entity numbering to master groups
     category_counters: Dict[str, int] = {}
@@ -346,14 +361,14 @@ def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
             pair = (g.entity_type, role_str)
             role_type_groups.setdefault(pair, set()).add(info.get("id", 1))
 
-    state.colliding_roles = {pair for pair, ids in role_type_groups.items() if len(ids) > 1}
+    st.colliding_roles = {pair for pair, ids in role_type_groups.items() if len(ids) > 1}
 
     # 3. Generate placeholders
     mapping: Dict[str, str] = {}
     final_entities_report = []
     flat_occurrences = []
 
-    for g in state.entity_groups:
+    for g in st.entity_groups:
         if not g.enabled:
             g.placeholder = "(ignoriert / inaktiv)"
             continue
@@ -364,11 +379,11 @@ def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
         tag_str = clean_tag(info["surface_tag"])
         suffix_tag = f"_{tag_str}" if tag_str else ""
         pair = (g.entity_type, role_str)
-        is_colliding = pair in state.colliding_roles
+        is_colliding = pair in st.colliding_roles
 
-        if state.format_mode == "role_only" and role_str and not is_colliding:
+        if st.format_mode == "role_only" and role_str and not is_colliding:
             placeholder = f"[{g.entity_type}_{role_str}{suffix_tag}]"
-        elif (state.format_mode in ("numbered_role", "role_only") or is_colliding) and role_str:
+        elif (st.format_mode in ("numbered_role", "role_only") or is_colliding) and role_str:
             placeholder = f"[{g.entity_type}_{ent_id}_{role_str}{suffix_tag}]"
         else:
             # Modus 1 (Numbered)
@@ -401,7 +416,7 @@ def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
 
     # 4. Substitute in reverse character order
     sorted_for_sub = sorted(flat_occurrences, key=lambda x: x["start"], reverse=True)
-    chars = list(state.raw_text)
+    chars = list(st.raw_text)
     for item in sorted_for_sub:
         start, end = item["start"], item["end"]
         chars[start:end] = list(item["placeholder"])
@@ -409,17 +424,17 @@ def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
     anonymized_text = "".join(chars)
 
     audit_report = {
-        "source_file": state.filename,
-        "format_mode": state.format_mode,
+        "source_file": st.filename,
+        "format_mode": st.format_mode,
         "entity_count": len(final_entities_report),
         "unique_entities_count": len(mapping),
         "mapping": mapping,
         "entities": final_entities_report,
     }
 
-    state.current_mapping = mapping
-    state.current_report = audit_report
-    state.current_anon_text = anonymized_text
+    st.current_mapping = mapping
+    st.current_report = audit_report
+    st.current_anon_text = anonymized_text
 
     return anonymized_text, mapping, audit_report
 
@@ -474,7 +489,9 @@ def native_export_folder(stem: str, anon_text: str, mapping: dict, report: dict,
 
 
 # --- UI Construction ---
+@ui.page("/")
 def create_ui():
+    state = AppState()
     ui.colors(primary="#1976D2", secondary="#26A69A", accent="#9C27B0", positive="#2E7D32", warning="#F57C00", negative="#C62828")
 
     # Header
@@ -644,7 +661,7 @@ def create_ui():
                         if val not in curr:
                             curr.append(val)
                             state.ignore_terms_text = ", ".join(curr)
-                            save_current_config()
+                            save_current_config(state)
                             render_ignore_list_ui()
                             refresh_preview_and_exports()
                             ui.notify(f"'{val}' zur Ignore-Liste hinzugefügt.", type="info")
@@ -661,7 +678,7 @@ def create_ui():
                                 def on_remove():
                                     curr = [x for x in parse_ignore_terms(state.ignore_terms_text) if x.lower() != t.lower()]
                                     state.ignore_terms_text = ", ".join(curr)
-                                    save_current_config()
+                                    save_current_config(state)
                                     render_ignore_list_ui()
                                     refresh_preview_and_exports()
                                     ui.notify(f"'{t}' aus Ignore-Liste entfernt.", type="info")
@@ -689,7 +706,7 @@ def create_ui():
                         lines = [l for l in lines if not (l.lower().startswith(f"{t.lower()}:") or l.lower().startswith(f"{t.lower()}="))]
                         lines.append(f"{t}: {new_g_type.value}")
                         state.glossary_text = "\n".join(lines)
-                        save_current_config()
+                        save_current_config(state)
                         render_glossary_list_ui()
                         refresh_preview_and_exports()
                         ui.notify(f"'{t}' ({new_g_type.value}) zur Begriffsliste hinzugefügt.", type="positive")
@@ -707,7 +724,7 @@ def create_ui():
                                 def on_remove():
                                     lines = [l for l in state.glossary_text.splitlines() if not (l.strip().lower().startswith(f"{t.lower()}:") or l.strip().lower().startswith(f"{t.lower()}="))]
                                     state.glossary_text = "\n".join(lines)
-                                    save_current_config()
+                                    save_current_config(state)
                                     render_glossary_list_ui()
                                     refresh_preview_and_exports()
                                     ui.notify(f"'{t}' aus Begriffsliste entfernt.", type="info")
@@ -721,7 +738,7 @@ def create_ui():
     def refresh_preview_and_exports():
         if not preview_holder or not export_holder:
             return
-        anon_text, mapping, audit_report = compute_reactive_preview()
+        anon_text, mapping, audit_report = compute_reactive_preview(state)
         stem = Path(state.filename).stem or "dokument"
         ext = state.export_format
 
@@ -729,9 +746,9 @@ def create_ui():
         if mapping and map_json_input is not None:
             state.restore_mapping = dict(mapping)
             map_json_input.value = json.dumps(mapping, indent=2, ensure_ascii=False)
-            logging.info(f"[Tab2 sync] mapping synced: {len(mapping)} entries")
+            logging.debug(f"[Tab2 sync] mapping synced: {len(mapping)} entries")
         else:
-            logging.info(f"[Tab2 sync] SKIPPED: mapping={bool(mapping)}, map_json_input is None={map_json_input is None}")
+            logging.debug(f"[Tab2 sync] SKIPPED: mapping={bool(mapping)}, map_json_input is None={map_json_input is None}")
 
 
         preview_holder.clear()
@@ -905,10 +922,17 @@ def create_ui():
             update_step_ui(1, 0.25, "Inferenz läuft...")
 
             def do_analysis(text):
-                global _cached_anonymizer
-                if _cached_anonymizer is None:
-                    _cached_anonymizer = build_anonymizer()
-                return _cached_anonymizer.analyze(text)
+                with _model_lock:
+                    global _cached_anonymizer
+                    if _cached_anonymizer is None:
+                        _cached_anonymizer = build_anonymizer(state)
+                    else:
+                        _cached_anonymizer.enabled_entities = state.active_entities if state.active_entities else None
+                        _cached_anonymizer.gliner_recognizer.threshold = state.gliner_threshold
+                        _cached_anonymizer.ignore_terms = parse_ignore_terms(state.ignore_terms_text)
+                        _cached_anonymizer.fuzzy_recognizer.terms = parse_glossary(state.glossary_text)
+                    anon = _cached_anonymizer
+                return anon.analyze(text)
 
             loop = asyncio.get_running_loop()
             analysis_task = asyncio.create_task(asyncio.to_thread(do_analysis, state.raw_text))
@@ -971,7 +995,7 @@ def create_ui():
             update_step_ui(4, 0.98, "Generiere Vorschau & Mapping...")
             await asyncio.sleep(0.05)
 
-            compute_reactive_preview()
+            compute_reactive_preview(state)
             total_occurrences = sum(g.count for g in state.entity_groups)
             build_review_table()
             refresh_preview_and_exports()
@@ -1020,6 +1044,12 @@ def create_ui():
 
             total_hits = sum(g.count for g in state.entity_groups)
             unique_count = len(state.entity_groups)
+
+            # Precompute all entity names once in O(n) for linking dropdowns
+            all_entity_names = sorted(
+                list({g.original_text.strip() for g in state.entity_groups if g.original_text.strip()}),
+                key=lambda s: s.lower(),
+            )
 
             ui.label(f"Erkannte Entitäten ({unique_count} Begriffe, {total_hits} Fundstellen gesamt)").classes("text-lg font-bold text-slate-800 mb-1")
             ui.label("Vergeben Sie optionale Rollen oder übernehmen Sie Verknüpfungsvorschläge. Jede Zeile zeigt den zugeordneten Platzhalter und klappt Fundstellen auf:").classes("text-sm text-slate-600 mb-3")
@@ -1118,7 +1148,7 @@ def create_ui():
                                     def make_role_change(grp, m_badge, c_badges):
                                         def on_change(e):
                                             grp.role = (e.value or "").strip()
-                                            compute_reactive_preview()
+                                            compute_reactive_preview(state)
                                             m_badge.set_text(grp.placeholder)
                                             for c_grp, c_badge in c_badges:
                                                 c_badge.set_text(c_grp.placeholder)
@@ -1163,30 +1193,27 @@ def create_ui():
                                         ui.badge(f"💡 {len(master.suggested_candidates)} Namenskandidaten", color="amber-8").props("outline dense").tooltip("Mehrere passende Personen gefunden. Bitte im Dropdown rechts auswählen.")
 
                                     # Manual Link Dropdown: All other recognized entities in the workspace
-                                    all_other_names = sorted(
-                                        list({
-                                            g.original_text.strip() for g in state.entity_groups
-                                            if g.key != master.key and g.original_text.strip()
-                                        }),
-                                        key=lambda s: s.lower(),
-                                    )
+                                    all_other_names = [n for n in all_entity_names if n.lower() != master.key]
                                     if all_other_names:
                                         with ui.row().classes("items-center gap-1"):
                                             def make_link_to_master(grp):
                                                 def on_change(e):
                                                     val = (e.value or "").strip()
                                                     if val and val != "Eigenständig":
-                                                        grp.parent_group_text = val
-                                                        if not grp.surface_tag:
-                                                            grp.surface_tag = "VORNAME"
-                                                        grp.suggested_parent = None
-                                                        grp.suggested_candidates = []
                                                         p_match = next((x for x in state.entity_groups if x.original_text.lower() == val.lower()), None)
-                                                        if p_match and not p_match.surface_tag:
-                                                            p_match.surface_tag = "VOLLNAME"
-                                                        ui.notify(f"'{grp.original_text}' verknüpft mit '{val}'.", type="info")
-                                                        refresh_preview_and_exports()
-                                                        build_review_table()
+                                                        if p_match:
+                                                            grp.parent_group_text = p_match.original_text
+                                                            if not grp.surface_tag:
+                                                                grp.surface_tag = "VORNAME"
+                                                            grp.suggested_parent = None
+                                                            grp.suggested_candidates = []
+                                                            if not p_match.surface_tag:
+                                                                p_match.surface_tag = "VOLLNAME"
+                                                            ui.notify(f"'{grp.original_text}' verknüpft mit '{p_match.original_text}'.", type="info")
+                                                            refresh_preview_and_exports()
+                                                            build_review_table()
+                                                        else:
+                                                            ui.notify(f"Ungültige Verknüpfung: '{val}' existiert nicht.", type="warning")
                                                 return on_change
 
                                             ui.select(
@@ -1195,7 +1222,7 @@ def create_ui():
                                                 label="Verknüpfen mit:",
                                                 with_input=True,
                                                 on_change=make_link_to_master(master),
-                                            ).props('dense outlined bg-white use-input new-value-mode="add-unique" clearable options-dense menu-props="{ maxHeight: \'300px\' }"').classes("min-w-[200px] max-w-[320px] text-xs").tooltip("Zielperson / Bezug auswählen oder durch Tippen filtern")
+                                            ).props('dense outlined bg-white use-input clearable options-dense menu-props="{ maxHeight: \'300px\' }"').classes("min-w-[200px] max-w-[320px] text-xs").tooltip("Zielperson / Bezug auswählen oder durch Tippen filtern")
 
                                 # 5. Score & Action
                                 with ui.row().classes("items-center gap-2"):
@@ -1212,7 +1239,7 @@ def create_ui():
                                                 current_ignores.append(term)
                                                 state.ignore_terms_text = ", ".join(current_ignores)
                                                 render_ignore_list_ui()
-                                                save_current_config()
+                                                save_current_config(state)
                                             grp.enabled = False
                                             ui.notify(f"'{term}' zur Ignore-Liste hinzugefügt.", type="info")
                                             refresh_preview_and_exports()
@@ -1301,7 +1328,7 @@ def create_ui():
             ui.label("Platzhalter-Format:").classes("text-xs font-semibold text-slate-700 mb-1")
             def on_mode_change(e):
                 state.format_mode = e.value
-                save_current_config()
+                save_current_config(state)
                 refresh_preview_and_exports()
                 build_review_table()
 
@@ -1320,7 +1347,7 @@ def create_ui():
             ui.label("Standard Export-Format:").classes("text-xs font-semibold text-slate-700 mb-1")
             def on_export_fmt_change(e):
                 state.export_format = e.value
-                save_current_config()
+                save_current_config(state)
                 refresh_preview_and_exports()
 
             ui.radio(
@@ -1338,13 +1365,11 @@ def create_ui():
             for ent in AVAILABLE_ENTITIES:
                 def make_ent_toggle(e_name):
                     def toggle(val):
-                        global _cached_anonymizer
                         if val.value and e_name not in state.active_entities:
                             state.active_entities.append(e_name)
                         elif not val.value and e_name in state.active_entities:
                             state.active_entities.remove(e_name)
-                        _cached_anonymizer = None
-                        save_current_config()
+                        save_current_config(state)
                         if state.entity_groups and reanalysis_warning_card is not None:
                             reanalysis_warning_card.set_visibility(True)
                     return toggle
@@ -1359,10 +1384,8 @@ def create_ui():
 
             ui.label("Erkennungs-Schwellenwert:").classes("text-xs font-semibold text-slate-700")
             def on_thresh_change(e):
-                global _cached_anonymizer
                 state.gliner_threshold = e.value
-                _cached_anonymizer = None
-                save_current_config()
+                save_current_config(state)
                 if state.entity_groups and reanalysis_warning_card is not None:
                     reanalysis_warning_card.set_visibility(True)
             thresh_slider = ui.slider(min=0.20, max=0.95, step=0.05, value=state.gliner_threshold, on_change=on_thresh_change)
@@ -1426,9 +1449,9 @@ def create_ui():
                             filename = data.get("name", "dokument")
                             filepath = data.get("path", "")
                             file_id = data.get("file_id", "")
+                            bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
+                            meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
                             try:
-                                bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
-                                meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
                                 if bin_path and bin_path.exists():
                                     raw_bytes = bin_path.read_bytes()
                                     if meta_path and meta_path.exists():
@@ -1437,12 +1460,6 @@ def create_ui():
                                             filename = meta.get("filename") or filename
                                         except Exception:
                                             pass
-                                    try:
-                                        bin_path.unlink(missing_ok=True)
-                                        if meta_path:
-                                            meta_path.unlink(missing_ok=True)
-                                    except Exception:
-                                        pass
                                 elif filepath and Path(filepath).is_file():
                                     raw_bytes = safe_read_bytes(filepath)
                                 elif "base64" in data and data["base64"]:
@@ -1456,6 +1473,17 @@ def create_ui():
                                 err_msg = f"{type(ex).__name__}: {str(ex)}"
                                 logging.error(f"Drop error: {err_msg}", exc_info=True)
                                 ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
+                            finally:
+                                if bin_path:
+                                    try:
+                                        bin_path.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                                if meta_path:
+                                    try:
+                                        meta_path.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
 
                         ui.on("file_dropped", on_file_dropped)
 
@@ -1716,12 +1744,12 @@ def create_ui():
                                         if new_line not in lines:
                                             state.glossary_text += f"\n{new_line}"
                                             render_glossary_list_ui()
-                                            save_current_config()
+                                            save_current_config(state)
                                             ui.notify(f"'{term}' dauerhaft in der Begriffsliste gespeichert.", type="info")
 
                                     from local_anonymizer.anonymizer import compute_smart_link_proposals
                                     compute_smart_link_proposals(state.entity_groups)
-                                    compute_reactive_preview()
+                                    compute_reactive_preview(state)
                                     build_review_table()
                                     refresh_preview_and_exports()
 
@@ -1782,9 +1810,9 @@ def create_ui():
                                 filename = data.get("name", "dokument")
                                 filepath = data.get("path", "")
                                 file_id = data.get("file_id", "")
+                                bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
+                                meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
                                 try:
-                                    bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
-                                    meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
                                     if bin_path and bin_path.exists():
                                         raw_bytes = bin_path.read_bytes()
                                         if meta_path and meta_path.exists():
@@ -1793,12 +1821,6 @@ def create_ui():
                                                 filename = meta.get("filename") or filename
                                             except Exception:
                                                 pass
-                                        try:
-                                            bin_path.unlink(missing_ok=True)
-                                            if meta_path:
-                                                meta_path.unlink(missing_ok=True)
-                                        except Exception:
-                                            pass
                                     elif filepath and Path(filepath).is_file():
                                         raw_bytes = safe_read_bytes(filepath)
                                     elif "base64" in data and data["base64"]:
@@ -1810,6 +1832,17 @@ def create_ui():
                                     load_restore_text(text, filename)
                                 except Exception as ex:
                                     ui.notify(f"Fehler beim Laden: {type(ex).__name__}: {str(ex)}", type="negative", timeout=15000)
+                                finally:
+                                    if bin_path:
+                                        try:
+                                            bin_path.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
+                                    if meta_path:
+                                        try:
+                                            meta_path.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
 
                             with ui.card().classes(
                                 "w-full py-4 px-3 bg-slate-50 hover:bg-slate-100 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-2 select-none"
@@ -1918,9 +1951,9 @@ def create_ui():
                                 filename = data.get("name", "mapping.json")
                                 filepath = data.get("path", "")
                                 file_id = data.get("file_id", "")
+                                bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
+                                meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
                                 try:
-                                    bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
-                                    meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
                                     if bin_path and bin_path.exists():
                                         raw_bytes = bin_path.read_bytes()
                                         if meta_path and meta_path.exists():
@@ -1929,12 +1962,6 @@ def create_ui():
                                                 filename = meta.get("filename") or filename
                                             except Exception:
                                                 pass
-                                        try:
-                                            bin_path.unlink(missing_ok=True)
-                                            if meta_path:
-                                                meta_path.unlink(missing_ok=True)
-                                        except Exception:
-                                            pass
                                     elif filepath and Path(filepath).is_file():
                                         raw_bytes = safe_read_bytes(filepath)
                                     elif "base64" in data and data["base64"]:
@@ -1945,6 +1972,17 @@ def create_ui():
                                     load_mapping_data(json.loads(raw_bytes.decode("utf-8")))
                                 except Exception as ex:
                                     ui.notify(f"Fehler beim Laden: {str(ex)}", type="negative", timeout=15000)
+                                finally:
+                                    if bin_path:
+                                        try:
+                                            bin_path.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
+                                    if meta_path:
+                                        try:
+                                            meta_path.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
 
                             with ui.card().classes(
                                 "w-full py-4 px-3 bg-slate-50 hover:bg-slate-100 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-2 select-none"
@@ -2110,8 +2148,6 @@ def main():
     # Configure native window dimensions
     app.native.window_args["width"] = 1250
     app.native.window_args["height"] = 850
-
-    create_ui()
 
     logging.info(f"Starting application (native={use_native}, port={args.port})...")
     ui.run(
