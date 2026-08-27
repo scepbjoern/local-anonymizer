@@ -46,12 +46,13 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 ### 4.2 Feature 2: Hybride Entitätserkennung (Zero-Shot NER & Glossar) *(Umgesetzt)*
 
 * **Multilinguales Zero-Shot NER:** Basiert auf [GLiNER](https://github.com/urchade/GLiNER) (`urchade/gliner_multi_pii-v1`) zur Erkennung von:
-  * `PERSON`, `ORGANIZATION`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `LOCATION`, `DATE_TIME`, `IBAN_CODE`, `CREDIT_CARD`, `ID_NUMBER`, `FINANCIAL_DATA`, `HEALTH_DATA`, `IP_ADDRESS`.
+  * `PERSON`, `ORGANIZATION`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `LOCATION`, `DATE_TIME`, `IBAN_CODE`, `CREDIT_CARD`, `ID_NUMBER`, `FINANCIAL_DATA`, `HEALTH_DATA`, `IP_ADDRESS`, `IT_SYSTEM`.
 * **Abkürzungs-bewusstes Chunking:** Zerlegung langer Texte in überlappungsfreie Abschnitte (<800 Zeichen), ohne Satzgrenzen bei typischen Abkürzungen (`Dr.`, `Prof.`, `Bahnhofstr.`, `14. Juli`) zu zerschneiden.
 * **Fuzzy-Glossar (RapidFuzz):**
   * Zuordnung interner Firmenkürzel (z. B. `"abcd"` $\rightarrow$ `PERSON`).
   * Fehlertolerantes Matching bei Tippfehlern (z. B. `"ZHW"` $\rightarrow$ `"ZHAW"`).
 * **Globale & Session-Ignore-Listen:** Schutz generischer Rollen und Grade (`CAS`, `BSc`, `Studierende`, `Dozent`, `Unternehmen`).
+* **Deterministische Schweizer Erweiterungen:** `ADDRESS` erkennt Schweizer und deutsche Adressmuster; `AHV_NUMBER` wird mit der AHV-Kontrollziffer und `UID_NUMBER` mit der offiziellen Modulo-11-Prüfziffer validiert. `IT_SYSTEM` nutzt das Glossar als Primärquelle und GLiNER-Prompts als Sicherheitsnetz.
 
 ---
 

@@ -243,10 +243,7 @@ def sync_cached_anonymizer_settings(anon, app_state: "AppState") -> None:
     anon.gliner_recognizer.threshold = app_state.gliner_threshold
     anon.ignore_terms = parse_ignore_terms(app_state.ignore_terms_text)
     new_glossary = parse_glossary(app_state.glossary_text)
-    anon.fuzzy_recognizer.glossary = new_glossary
-    anon.fuzzy_recognizer.supported_entities = (
-        list(set(new_glossary.values())) if new_glossary else ["ORGANIZATION", "PERSON", "CUSTOM_TERM"]
-    )
+    anon.set_glossary(new_glossary)
 
 
 def get_synced_cached_anonymizer(app_state: "AppState"):
@@ -350,6 +347,10 @@ AVAILABLE_ENTITIES = [
     "USERNAME",
     "CRYPTO",
     "MEDICAL_LICENSE",
+    "ADDRESS",
+    "AHV_NUMBER",
+    "UID_NUMBER",
+    "IT_SYSTEM",
 ]
 
 # Surface tag options as a clean dictionary

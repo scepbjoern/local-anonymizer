@@ -25,6 +25,8 @@
 │    • Token-Overlap Chunking (<800 Zeichen)                             │
 │    • GLiNER Zero-Shot Multi-PII Recognizer (mit Memory-Cache)          │
 │    • RapidFuzz Fuzzy Glossary Recognizer (Tippfehler & Kürzel)         │
+│    • CH/DE Address Pattern & Swiss Checksum Recognizers                │
+│    • IT-System Glossar + GLiNER-Sicherheitsnetz                        │
 │    • Ignore-Listen-Filterung (Rollen, Grade, Begriffe)                 │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
@@ -87,6 +89,10 @@
 - **`FuzzyGlossaryRecognizer`:**
   - Nutzt `rapidfuzz.fuzz.ratio` mit Schwellenwerten (High Confidence $\ge 90\%$, Review-Bedarf $\ge 75\%$).
   - Bevorzugt exakte Treffer (Score 1.0) vor Fuzzy-Treffern.
+- **Deterministische Phase-B-Recognizer:**
+  - `AddressPatternRecognizer` erkennt zusammenhängende Schweizer und deutsche Adressen per Regex und weist die bekannte Kollision zwischen vierstelliger Schweizer PLZ und Jahreszahl konservativ zurück.
+  - `AHVNumberRecognizer` validiert die AHV-Kontrollziffer; `UIDNumberRecognizer` validiert CHE/UID nach Modulo 11. Formal korrekte, aber prüfziffern-ungültige Nummern werden nicht als Entitäten ausgegeben.
+  - `IT_SYSTEM` wird über das dynamisch aus dem Glossar abgeleitete Zieltypenset sowie separate GLiNER-Sicherheitsnetz-Prompts erkannt.
 
 ### 2.3 Platzhalter-Engine & Entity-Linking (`anonymizer.py`) *(Umgesetzt in Phase 3)*
 - **Format-Modi:**

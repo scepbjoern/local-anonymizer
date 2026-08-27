@@ -15,14 +15,19 @@
     "USERNAME",
     "URL",
     "HEALTH_DATA",
-    "FINANCIAL_DATA"
+    "FINANCIAL_DATA",
+    "ADDRESS",
+    "AHV_NUMBER",
+    "UID_NUMBER",
+    "IT_SYSTEM"
   ],
   "glossary": {
     "abcd": "PERSON",
     "efgh": "PERSON",
     "ijkl": "PERSON",
     "ZHAW": "ORGANIZATION",
-    "Zürcher Hochschule für Angewandte Wissenschaften": "ORGANIZATION"
+    "Zürcher Hochschule für Angewandte Wissenschaften": "ORGANIZATION",
+    "SAP": "IT_SYSTEM"
   },
   "ignore_terms": [
     "CAS",
