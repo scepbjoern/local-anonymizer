@@ -31,9 +31,63 @@ def extract_text_from_txt_bytes(raw_bytes: bytes) -> str:
     return raw_bytes.decode("utf-8", errors="replace")
 
 
+import sys
+import logging
+
+
+def safe_read_bytes(file_path: Union[str, Path]) -> bytes:
+    """
+    Safely read bytes from a file path. On Windows, uses Win32 API with full sharing
+    (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) so that files currently open
+    in Microsoft Word, Excel, OneDrive, or other editors can be read without PermissionError.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Datei nicht gefunden: {path}")
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            GENERIC_READ = 0x80000000
+            FILE_SHARE_READ = 1
+            FILE_SHARE_WRITE = 2
+            FILE_SHARE_DELETE = 4
+            OPEN_EXISTING = 3
+            FILE_ATTRIBUTE_NORMAL = 0x80
+            INVALID_HANDLE_VALUE = -1
+
+            handle = kernel32.CreateFileW(
+                str(path.resolve()),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            if handle != INVALID_HANDLE_VALUE:
+                try:
+                    size = kernel32.GetFileSize(handle, None)
+                    if size > 0:
+                        buf = ctypes.create_string_buffer(size)
+                        bytes_read = wintypes.DWORD()
+                        if kernel32.ReadFile(handle, buf, size, ctypes.byref(bytes_read), None):
+                            return buf.raw[:bytes_read.value]
+                finally:
+                    kernel32.CloseHandle(handle)
+        except Exception as e:
+            logging.debug(f"Win32 safe_read_bytes fallback: {e}")
+
+    # Standard fallback (macOS, Linux, or if Win32 wasn't used)
+    return path.read_bytes()
+
+
 def extract_text_from_txt(path: Path) -> str:
     """Extract text from plain text or markdown files."""
-    return extract_text_from_txt_bytes(path.read_bytes())
+    return extract_text_from_txt_bytes(safe_read_bytes(path))
 
 
 def extract_text_from_json_bytes(data: bytes) -> str:
@@ -186,7 +240,7 @@ def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
 
 def extract_text_from_docx(path: Path) -> str:
     """Extract text from Microsoft Word .docx files."""
-    return extract_text_from_docx_bytes(path.read_bytes())
+    return extract_text_from_docx_bytes(safe_read_bytes(path))
 
 
 def create_docx_from_markdown(md_text: str) -> docx.Document:
@@ -347,17 +401,5 @@ def read_document(file_path: Union[str, Path]) -> str:
         raise FileNotFoundError(f"File not found: {path}")
 
     ext = path.suffix.lower()
-    if ext in [".txt", ".md"]:
-        return extract_text_from_txt(path)
-    elif ext == ".json":
-        return extract_text_from_json_bytes(path.read_bytes())
-    elif ext == ".csv":
-        return extract_text_from_csv_bytes(path.read_bytes())
-    elif ext == ".docx":
-        return extract_text_from_docx(path)
-    elif ext == ".pdf":
-        return extract_text_from_pdf(path)
-    else:
-        raise UnsupportedFileFormatError(
-            f"Unsupported file format: '{ext}'. Supported formats: .txt, .md, .json, .csv, .docx, .pdf"
-        )
+    raw_data = safe_read_bytes(path)
+    return read_document_from_bytes(raw_data, path.name)

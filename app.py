@@ -38,6 +38,7 @@ from local_anonymizer.extractors import (
     create_docx_from_markdown,
     extract_text_from_txt_bytes,
     read_document_from_bytes,
+    safe_read_bytes,
     save_markdown_to_docx_bytes,
 )
 
@@ -429,6 +430,7 @@ def create_ui():
     progress_holder = None
     upload_ui_elem = None
     upload_status_label = None
+    file_badge_container = None
     analyze_btn = None
     reset_btn = None
     ignore_container = None
@@ -436,6 +438,19 @@ def create_ui():
     restore_anon_input = None
     map_json_input = None
     restored_preview = None
+
+    def update_file_badge():
+        if file_badge_container is None:
+            return
+        file_badge_container.clear()
+        if state.filename:
+            with file_badge_container:
+                with ui.row().classes("items-center gap-2 bg-blue-100/90 border border-blue-300 rounded-lg px-3 py-1 text-xs text-blue-950"):
+                    ui.icon("description", size="xs").classes("text-blue-700")
+                    ui.label(f"{state.filename} ({len(state.raw_text)} Zeichen)").classes("font-bold font-mono")
+                    def remove_file():
+                        reset_workspace()
+                    ui.button(icon="close", on_click=remove_file).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-1").tooltip("Datei entfernen")
 
     def render_ignore_list_ui():
         if not ignore_container:
@@ -502,13 +517,13 @@ def create_ui():
                         save_current_config()
                         render_glossary_list_ui()
                         refresh_preview_and_exports()
-                        ui.notify(f"'{t}' ({new_g_type.value}) zum Glossar hinzugefügt.", type="positive")
+                        ui.notify(f"'{t}' ({new_g_type.value}) zur Begriffsliste hinzugefügt.", type="positive")
                         new_g_term.value = ""
                 ui.button(icon="add", on_click=add_g, color="positive").props("dense flat size=sm")
 
             with ui.column().classes("w-full max-h-48 overflow-y-auto gap-1 pr-1"):
                 if not sorted_keys:
-                    ui.label("Keine eigenen Begriffe im Glossar.").classes("text-[11px] text-slate-400 italic")
+                    ui.label("Keine eigenen Begriffe in der Begriffsliste.").classes("text-[11px] text-slate-400 italic")
                 else:
                     with ui.row().classes("w-full flex-wrap gap-1"):
                         for term in sorted_keys:
@@ -520,7 +535,7 @@ def create_ui():
                                     save_current_config()
                                     render_glossary_list_ui()
                                     refresh_preview_and_exports()
-                                    ui.notify(f"'{t}' aus Glossar entfernt.", type="info")
+                                    ui.notify(f"'{t}' aus Begriffsliste entfernt.", type="info")
                                 return on_remove
 
                             with ui.row().classes("items-center gap-1.5 bg-blue-50 border border-blue-300 rounded px-2 py-0.5 shadow-none"):
@@ -633,6 +648,9 @@ def create_ui():
             ui.notify("Bitte laden Sie zuerst ein Dokument hoch oder fügen Sie Text ein.", type="warning")
             return
 
+        # Show visual indicators immediately (< 20ms)
+        if analyze_btn:
+            analyze_btn.props("loading")
         if progress_holder:
             progress_holder.clear()
             with progress_holder:
@@ -645,9 +663,15 @@ def create_ui():
                     ui.spinner(size="md", color="primary")
                     ui.label("Dokument wird lokal analysiert (NER, Markdown, Genitiv- & Struktur-Erkennung)...").classes("text-slate-700 text-sm font-medium")
 
+        # Yield to event loop so DOM updates render immediately in the browser
+        await asyncio.sleep(0.02)
+
         try:
-            anonymizer = build_anonymizer()
-            results = await asyncio.to_thread(anonymizer.analyze, state.raw_text)
+            def do_analysis(text):
+                anonymizer = build_anonymizer()
+                return anonymizer.analyze(text)
+
+            results = await asyncio.to_thread(do_analysis, state.raw_text)
 
             groups_dict: Dict[str, EntityGroup] = {}
             for res in results:
@@ -687,8 +711,27 @@ def create_ui():
             logging.error(f"Analysis error: {e}", exc_info=True)
             ui.notify(f"Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
         finally:
+            if analyze_btn:
+                analyze_btn.props(remove="loading")
             if progress_holder:
                 progress_holder.clear()
+
+    def load_content_into_workspace(text: str, filename: str):
+        """Unified workspace loader."""
+        state.filename = filename
+        state.raw_text = text
+        if raw_text_area is not None:
+            raw_text_area.value = text
+        if analyze_btn is not None:
+            analyze_btn.set_enabled(bool(text and text.strip()))
+        if reset_btn is not None:
+            reset_btn.set_visibility(bool(text and text.strip()))
+        if upload_ui_elem is not None:
+            upload_ui_elem.reset()
+        update_file_badge()
+        if upload_status_label is not None:
+            upload_status_label.set_visibility(False)
+        ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.", type="positive")
 
     async def handle_upload(e):
         if upload_status_label is not None:
@@ -703,22 +746,8 @@ def create_ui():
             else:
                 raise ValueError(f"Unbekanntes Upload-Format: {e}")
 
-            state.filename = filename
-            state.raw_text = read_document_from_bytes(data, filename)
-            if raw_text_area is not None:
-                raw_text_area.value = state.raw_text
-            if analyze_btn is not None:
-                analyze_btn.set_enabled(True)
-            if reset_btn is not None:
-                reset_btn.set_visibility(True)
-            if upload_ui_elem is not None:
-                upload_ui_elem.reset()
-
-            ui.notify(f"Datei '{filename}' geladen ({len(state.raw_text)} Zeichen). Klicken Sie auf 'Text & Dokument analysieren'.", type="positive")
-            if upload_status_label is not None:
-                upload_status_label.set_text(f"✅ Erfolgreich geladen: '{filename}' ({len(state.raw_text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.")
-                upload_status_label.classes("text-positive text-xs font-bold")
-                upload_status_label.set_visibility(True)
+            text = read_document_from_bytes(data, filename)
+            load_content_into_workspace(text, filename)
 
         except Exception as ex:
             err_msg = f"{type(ex).__name__}: {str(ex)}"
@@ -745,6 +774,41 @@ def create_ui():
         if upload_ui_elem is not None:
             upload_ui_elem.reset()
 
+    def open_native_file_dialog():
+        """Open native OS file picker with full lock-sharing support."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            filepath = filedialog.askopenfilename(
+                title="Dokument zum Anonymisieren auswählen",
+                filetypes=[
+                    ("Unterstützte Dokumente (*.docx, *.pdf, *.txt, *.md, *.csv, *.json)", "*.docx;*.pdf;*.txt;*.md;*.csv;*.json"),
+                    ("Word-Dokumente (*.docx)", "*.docx"),
+                    ("PDF-Dokumente (*.pdf)", "*.pdf"),
+                    ("Text & Markdown (*.txt, *.md)", "*.txt;*.md"),
+                    ("Tabellen & Daten (*.csv, *.json)", "*.csv;*.json"),
+                    ("Alle Dateien (*.*)", "*.*"),
+                ]
+            )
+            root.destroy()
+            if filepath:
+                p = Path(filepath)
+                # safe_read_bytes opens with FILE_SHARE_READ | FILE_SHARE_WRITE so files currently open in Word load cleanly
+                data = safe_read_bytes(p)
+                text = read_document_from_bytes(data, p.name)
+                load_content_into_workspace(text, p.name)
+        except Exception as ex:
+            err_msg = f"{type(ex).__name__}: {str(ex)}"
+            logging.error(f"Native file open error: {err_msg}", exc_info=True)
+            ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
+            if upload_status_label is not None:
+                upload_status_label.set_text(f"❌ Fehler beim Laden: {err_msg}")
+                upload_status_label.classes("text-negative text-xs font-bold")
+                upload_status_label.set_visibility(True)
+
     def reset_workspace():
         """Reset raw text, filename, and analysis table."""
         state.filename = ""
@@ -762,6 +826,8 @@ def create_ui():
             table_holder.clear()
         if upload_ui_elem is not None:
             upload_ui_elem.reset()
+        if file_badge_container is not None:
+            file_badge_container.clear()
         if upload_status_label is not None:
             upload_status_label.set_visibility(False)
         if analyze_btn is not None:
@@ -1137,8 +1203,9 @@ def create_ui():
                 ignore_container = ui.column().classes("w-full")
                 render_ignore_list_ui()
 
-            # Interactive Fuzzy Glossary (Alphabetical with [x] delete buttons, high-contrast)
-            with ui.expansion("Fuzzy-Glossar (Eigene Begriffe)", icon="library_books").classes("w-full text-xs mt-1"):
+            # Interactive Glossary / Word List (Alphabetical with [x] delete buttons, high-contrast)
+            with ui.expansion("Eigene Begriffsliste (Wortliste & Namen)", icon="library_books").classes("w-full text-xs mt-1"):
+                ui.label("Begriffe oder Namen, die bei jeder Analyse immer zuverlässig erkannt werden sollen:").classes("text-[11px] text-slate-500 mb-1")
                 glossary_container = ui.column().classes("w-full")
                 render_glossary_list_ui()
 
@@ -1153,70 +1220,24 @@ def create_ui():
                 with ui.tab_panel(tab_anonymize):
                     ui.label("Stufe 1: Dokument laden & Text-Eingabe").classes("text-base font-bold text-slate-800 mb-1")
                     
-                    # Direct Document Upload / File Selection in Main Workspace
-                    with ui.card().classes("w-full p-3 bg-slate-50 border border-dashed border-slate-300 rounded-lg mb-3"):
+                    # Modern Unified Drop-Zone with Native Click & Drag-Drop
+                    with ui.card().classes("w-full p-4 bg-slate-50 border-2 border-dashed border-blue-300 hover:border-blue-500 transition-colors rounded-xl mb-3 shadow-none"):
                         with ui.row().classes("w-full items-center justify-between gap-4 flex-wrap"):
-                            with ui.row().classes("items-center gap-3"):
-                                ui.icon("cloud_upload", size="md").classes("text-primary")
+                            with ui.row().classes("items-center gap-3 cursor-pointer flex-grow").on("click", open_native_file_dialog):
+                                ui.icon("cloud_upload", size="lg").classes("text-primary")
                                 with ui.column().classes("gap-0"):
-                                    ui.label("Dokument laden (.docx, .pdf, .txt, .md, .csv, .json):").classes("text-xs font-bold text-slate-700")
-                                    ui.label("Struktur (Überschriften, Listen & Tabellen) wird automatisch als Markdown extrahiert").classes("text-[11px] text-slate-500")
+                                    ui.label("Datei hier ablegen oder zum Auswählen klicken").classes("text-sm font-bold text-slate-800")
+                                    ui.label("Unterstützt Word (.docx), PDF, Text (.txt, .md), CSV und JSON • Automatische Struktur-Erkennung").classes("text-xs text-slate-500")
 
-                            with ui.row().classes("items-center gap-2 flex-wrap"):
-                                def open_native_file_dialog():
-                                    try:
-                                        import tkinter as tk
-                                        from tkinter import filedialog
-                                        root = tk.Tk()
-                                        root.withdraw()
-                                        root.attributes("-topmost", True)
-                                        filepath = filedialog.askopenfilename(
-                                            title="Dokument zum Anonymisieren auswählen",
-                                            filetypes=[
-                                                ("Unterstützte Dokumente (*.docx, *.pdf, *.txt, *.md, *.csv, *.json)", "*.docx;*.pdf;*.txt;*.md;*.csv;*.json"),
-                                                ("Word-Dokumente (*.docx)", "*.docx"),
-                                                ("PDF-Dokumente (*.pdf)", "*.pdf"),
-                                                ("Text & Markdown (*.txt, *.md)", "*.txt;*.md"),
-                                                ("Tabellen & Daten (*.csv, *.json)", "*.csv;*.json"),
-                                                ("Alle Dateien (*.*)", "*.*"),
-                                            ]
-                                        )
-                                        root.destroy()
-                                        if filepath:
-                                            p = Path(filepath)
-                                            data = p.read_bytes()
-                                            state.filename = p.name
-                                            state.raw_text = read_document_from_bytes(data, p.name)
-                                            if raw_text_area is not None:
-                                                raw_text_area.value = state.raw_text
-                                            if analyze_btn is not None:
-                                                analyze_btn.set_enabled(True)
-                                            if reset_btn is not None:
-                                                reset_btn.set_visibility(True)
-                                            ui.notify(f"Datei '{p.name}' erfolgreich geladen ({len(state.raw_text)} Zeichen).", type="positive")
-                                            if upload_status_label is not None:
-                                                upload_status_label.set_text(f"✅ Geladen: '{p.name}' ({len(state.raw_text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.")
-                                                upload_status_label.classes("text-positive text-xs font-bold")
-                                                upload_status_label.set_visibility(True)
-                                    except Exception as ex:
-                                        err_msg = f"{type(ex).__name__}: {str(ex)}"
-                                        logging.error(f"Native file open error: {err_msg}", exc_info=True)
-                                        ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
-                                        if upload_status_label is not None:
-                                            upload_status_label.set_text(f"❌ Fehler beim Laden: {err_msg}")
-                                            upload_status_label.classes("text-negative text-xs font-bold")
-                                            upload_status_label.set_visibility(True)
-
-                                ui.button("📂 Datei auswählen...", icon="folder_open", on_click=open_native_file_dialog, color="primary").props("unelevated dense").classes("text-xs font-bold")
-                                ui.label("oder hier ablegen:").classes("text-xs text-slate-500 font-medium")
-
+                            with ui.row().classes("items-center gap-2"):
                                 upload_ui_elem = ui.upload(
                                     on_upload=handle_upload,
                                     on_rejected=handle_rejected,
                                     auto_upload=True,
-                                ).props("outlined dense flat").classes("w-60")
+                                ).props("outlined dense flat").classes("w-52")
 
-                        upload_status_label = ui.label("").classes("text-xs font-bold mt-2")
+                        file_badge_container = ui.row().classes("w-full mt-2 items-center gap-2")
+                        upload_status_label = ui.label("").classes("text-xs font-bold mt-1")
                         upload_status_label.set_visibility(False)
 
                     with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note", value=True).classes("w-full mb-2"):
@@ -1230,7 +1251,7 @@ def create_ui():
 
                         raw_text_area = ui.textarea(
                             value=state.raw_text,
-                            placeholder="Text hier eingeben oder Dokument oben hochladen...",
+                            placeholder="Text hier eingeben oder Dokument oben hineinziehen...",
                             on_change=on_raw_text_change,
                         ).props("outlined rows=6").classes("w-full font-mono text-sm")
 
@@ -1256,33 +1277,92 @@ def create_ui():
 
                     ui.separator().classes("my-3")
 
-                    # Step 2: Manual Entity Marking
+                    # Step 2: Manual Entity Marking (Instant Document-Specific Search)
                     ui.label("Stufe 2: Review-Tabelle & Manuelles Markieren").classes("text-base font-bold text-slate-800 mb-1")
                     
                     with ui.card().classes("w-full p-3 bg-blue-50/70 border border-blue-200 rounded-lg mb-3"):
                         with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
-                            with ui.row().classes("items-center gap-2 flex-grow"):
+                            with ui.row().classes("items-center gap-2 flex-grow flex-wrap"):
                                 ui.icon("person_add", size="sm").classes("text-blue-700")
-                                ui.label("Fehlenden Begriff / Namen manuell erfassen:").classes("text-xs font-bold text-slate-800")
+                                ui.label("Fehlenden Begriff / Namen im Dokument markieren:").classes("text-xs font-bold text-slate-800")
                                 manual_input = ui.input(placeholder="z. B. Remo").props("dense outlined bg-white").classes("w-44 text-xs")
                                 manual_type = ui.select(options=AVAILABLE_ENTITIES, value="PERSON").props("dense outlined bg-white").classes("w-36 text-xs")
+                                save_perm_check = ui.checkbox("Dauerhaft in Begriffsliste speichern", value=False).props("dense").classes("text-xs text-slate-600")
 
                                 async def add_manual_entity():
                                     term = manual_input.value.strip()
                                     if not term:
                                         ui.notify("Bitte einen Begriff eingeben.", type="warning")
                                         return
-                                    current_lines = [l.strip() for l in state.glossary_text.splitlines() if l.strip()]
-                                    new_line = f"{term}: {manual_type.value}"
-                                    if new_line not in current_lines:
-                                        state.glossary_text += f"\n{new_line}"
-                                        render_glossary_list_ui()
-                                        save_current_config()
-                                    ui.notify(f"Begriff '{term}' als {manual_type.value} erfasst und zum Glossar hinzugefügt.", type="positive", icon="check")
-                                    manual_input.value = ""
-                                    await run_analysis()
+                                    if not state.raw_text or not state.raw_text.strip():
+                                        ui.notify("Kein Text im Workspace vorhanden.", type="warning")
+                                        return
 
-                                ui.button("➕ Hinzufügen & Analysieren", icon="add", color="positive", on_click=add_manual_entity).props("unelevated dense size=sm")
+                                    # Search whole-word matches in current document text
+                                    pattern = re.compile(r"\b" + re.escape(term) + r"\b", re.IGNORECASE)
+                                    matches = list(pattern.finditer(state.raw_text))
+                                    if not matches:
+                                        ui.notify(f"Begriff '{term}' wurde im aktuellen Dokumenttext nicht gefunden.", type="warning")
+                                        return
+
+                                    # Collect existing accepted spans
+                                    existing_spans = []
+                                    for g in state.entity_groups:
+                                        if g.key != term.lower():
+                                            for occ in g.occurrences:
+                                                existing_spans.append((occ.start, occ.end))
+
+                                    # Add occurrences that don't overlap with longer existing entities
+                                    new_occurrences = []
+                                    for m in matches:
+                                        start, end = m.start(), m.end()
+                                        overlaps_existing = any(not (end <= s or start >= e) for s, e in existing_spans)
+                                        if not overlaps_existing:
+                                            ctx_html = extract_context_snippet(state.raw_text, start, end)
+                                            new_occurrences.append(
+                                                EntityOccurrence(
+                                                    start=start,
+                                                    end=end,
+                                                    score=1.0,
+                                                    context_html=ctx_html,
+                                                    needs_review=False,
+                                                )
+                                            )
+
+                                    if not new_occurrences:
+                                        ui.notify(f"Alle Fundstellen von '{term}' sind bereits Teil von längeren Namen (z. B. Vollname).", type="info")
+                                        return
+
+                                    # Find or create EntityGroup
+                                    existing_group = next((g for g in state.entity_groups if g.key == term.lower()), None)
+                                    if existing_group:
+                                        existing_group.occurrences = new_occurrences
+                                        existing_group.entity_type = manual_type.value
+                                        existing_group.enabled = True
+                                    else:
+                                        new_g = EntityGroup(original_text=matches[0].group(0), entity_type=manual_type.value)
+                                        new_g.occurrences = new_occurrences
+                                        state.entity_groups.append(new_g)
+
+                                    # Only persist permanently if checkbox is checked
+                                    if save_perm_check.value:
+                                        lines = [l.strip() for l in state.glossary_text.splitlines() if l.strip()]
+                                        new_line = f"{term}: {manual_type.value}"
+                                        if new_line not in lines:
+                                            state.glossary_text += f"\n{new_line}"
+                                            render_glossary_list_ui()
+                                            save_current_config()
+                                            ui.notify(f"'{term}' dauerhaft in der Begriffsliste gespeichert.", type="info")
+
+                                    compute_smart_link_proposals(state.entity_groups)
+                                    compute_reactive_preview()
+                                    build_review_table()
+                                    refresh_preview_and_exports()
+
+                                    ui.notify(f"'{term}' ({len(new_occurrences)} Treffer) im aktuellen Dokument erfasst.", type="positive", icon="check")
+                                    manual_input.value = ""
+
+                                ui.button("➕ Hinzufügen", icon="add", color="positive", on_click=add_manual_entity).props("unelevated dense size=sm")
 
                     table_holder = ui.column().classes("w-full mb-4")
 
