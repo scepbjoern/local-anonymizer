@@ -39,20 +39,43 @@ from local_anonymizer.extractors import (
 # Silence presidio analyzer language mismatch warnings
 logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
 
-# In-memory upload cache for large file Drag & Drop (avoids WebSocket size limits)
-_upload_cache: Dict[str, Dict[str, Any]] = {}
+# Shared temp upload directory for large file Drag & Drop (cross-process, zero WebSocket limits)
+UPLOAD_DIR = CONFIG_DIR / "temp_uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_temp_uploads():
+    """Clean up any stale uploaded temporary files from previous sessions."""
+    try:
+        if UPLOAD_DIR.exists():
+            for f in UPLOAD_DIR.glob("*"):
+                try:
+                    f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+cleanup_temp_uploads()
 
 
 @app.post("/api/upload")
 async def api_upload(file: UploadFile = File(...)):
-    """FastAPI endpoint to receive large dropped files via HTTP streaming."""
-    content = await file.read()
-    file_id = str(uuid.uuid4())
-    _upload_cache[file_id] = {
-        "filename": file.filename or "upload",
-        "content": content,
-    }
-    return JSONResponse({"file_id": file_id, "filename": file.filename, "size": len(content)})
+    """FastAPI endpoint to receive large dropped files via HTTP streaming to disk."""
+    try:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        content = await file.read()
+        file_id = str(uuid.uuid4())
+        bin_path = UPLOAD_DIR / f"{file_id}.bin"
+        meta_path = UPLOAD_DIR / f"{file_id}.json"
+        bin_path.write_bytes(content)
+        meta_path.write_text(json.dumps({"filename": file.filename or "upload", "size": len(content)}), encoding="utf-8")
+        logging.info(f"api_upload: Saved {file.filename} ({len(content)} bytes) as {file_id}")
+        return JSONResponse({"file_id": file_id, "filename": file.filename, "size": len(content)})
+    except Exception as e:
+        logging.error(f"api_upload failed: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # --- Data Models for Grouped Review ---
@@ -1385,21 +1408,34 @@ def create_ui():
                         # Drop handler via HTTP streaming / path / base64
                         async def on_file_dropped(e):
                             data = e.args
-                            logging.info(f"on_file_dropped received: {type(data)} -> {list(data.keys()) if isinstance(data, dict) else data}")
+                            logging.info(f"on_file_dropped received: {type(data)} -> {data}")
                             filename = data.get("name", "dokument")
                             filepath = data.get("path", "")
                             file_id = data.get("file_id", "")
                             try:
-                                if file_id and file_id in _upload_cache:
-                                    cached = _upload_cache.pop(file_id)
-                                    raw_bytes = cached["content"]
-                                    filename = cached["filename"] or filename
+                                bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
+                                meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
+                                if bin_path and bin_path.exists():
+                                    raw_bytes = bin_path.read_bytes()
+                                    if meta_path and meta_path.exists():
+                                        try:
+                                            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                                            filename = meta.get("filename") or filename
+                                        except Exception:
+                                            pass
+                                    try:
+                                        bin_path.unlink(missing_ok=True)
+                                        if meta_path:
+                                            meta_path.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
                                 elif filepath and Path(filepath).is_file():
                                     raw_bytes = safe_read_bytes(filepath)
                                 elif "base64" in data and data["base64"]:
                                     raw_bytes = base64.b64decode(data["base64"])
                                 else:
-                                    raise ValueError(f"Keine Dateidaten empfangen (keys={list(data.keys()) if isinstance(data, dict) else data})")
+                                    exists = bin_path.exists() if bin_path else False
+                                    raise ValueError(f"Keine Dateidaten empfangen (file_id={file_id}, exists={exists}, keys={list(data.keys()) if isinstance(data, dict) else data})")
 
                                 await extract_and_load_file_bytes(raw_bytes, filename)
                             except Exception as ex:
@@ -1488,9 +1524,9 @@ def create_ui():
                         """)
 
                     # Info badge explaining digital text & image/OCR scope
-                    with ui.row().classes("w-full items-center gap-1.5 px-3 py-1.5 bg-blue-50/60 border border-blue-200/60 rounded-lg text-xs text-slate-600 mb-3"):
-                        ui.icon("info", size="xs").classes("text-blue-600")
-                        ui.label("Hinweis: Extrahiert digitalen Text, Aufzählungen & Tabellen aus Word (.docx), PDF, Text (.txt, .md), CSV und JSON. Eingebettete Screenshots/Bilder ohne Textschicht erfordern OCR und werden nicht mitgelesen.").classes("flex-1 text-[11px]")
+                    with ui.row().classes("w-full items-center gap-1.5 px-3 py-2 bg-blue-50/70 border border-blue-200/80 rounded-lg text-xs text-slate-700 mb-3"):
+                        ui.icon("info", size="xs").classes("text-blue-600 shrink-0")
+                        ui.label("Hinweis: Extrahiert digitalen Text, Formatierungen, Listen & Tabellen aus Word (.docx), PDF, Text (.txt, .md), CSV und JSON. Bei PDFs werden auch Vektordiagramme, Formularfelder und bestehende PDF-Textschichten erfasst (daher oft mehr Text als in Word). Reine Screenshots/Bilder ohne Textschicht erfordern OCR (für eine spätere Phase geplant).").classes("flex-1 text-[11px] leading-relaxed")
 
                     # Live extraction progress card (for large PDF/Docx files)
                     with ui.card().classes("w-full p-3 bg-blue-50 border border-blue-200 rounded-xl mb-3 flex-col gap-1") as extraction_progress_card:
@@ -1693,16 +1729,29 @@ def create_ui():
                                 filepath = data.get("path", "")
                                 file_id = data.get("file_id", "")
                                 try:
-                                    if file_id and file_id in _upload_cache:
-                                        cached = _upload_cache.pop(file_id)
-                                        raw_bytes = cached["content"]
-                                        filename = cached["filename"] or filename
+                                    bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
+                                    meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
+                                    if bin_path and bin_path.exists():
+                                        raw_bytes = bin_path.read_bytes()
+                                        if meta_path and meta_path.exists():
+                                            try:
+                                                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                                                filename = meta.get("filename") or filename
+                                            except Exception:
+                                                pass
+                                        try:
+                                            bin_path.unlink(missing_ok=True)
+                                            if meta_path:
+                                                meta_path.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
                                     elif filepath and Path(filepath).is_file():
                                         raw_bytes = safe_read_bytes(filepath)
                                     elif "base64" in data and data["base64"]:
                                         raw_bytes = base64.b64decode(data["base64"])
                                     else:
-                                        raise ValueError(f"Keine Dateidaten empfangen (keys={list(data.keys()) if isinstance(data, dict) else data})")
+                                        exists = bin_path.exists() if bin_path else False
+                                        raise ValueError(f"Keine Dateidaten empfangen (file_id={file_id}, exists={exists}, keys={list(data.keys()) if isinstance(data, dict) else data})")
                                     text = await asyncio.to_thread(read_document_from_bytes, raw_bytes, filename)
                                     load_restore_text(text, filename)
                                 except Exception as ex:
@@ -1816,16 +1865,29 @@ def create_ui():
                                 filepath = data.get("path", "")
                                 file_id = data.get("file_id", "")
                                 try:
-                                    if file_id and file_id in _upload_cache:
-                                        cached = _upload_cache.pop(file_id)
-                                        raw_bytes = cached["content"]
-                                        filename = cached["filename"] or filename
+                                    bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
+                                    meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
+                                    if bin_path and bin_path.exists():
+                                        raw_bytes = bin_path.read_bytes()
+                                        if meta_path and meta_path.exists():
+                                            try:
+                                                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                                                filename = meta.get("filename") or filename
+                                            except Exception:
+                                                pass
+                                        try:
+                                            bin_path.unlink(missing_ok=True)
+                                            if meta_path:
+                                                meta_path.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
                                     elif filepath and Path(filepath).is_file():
                                         raw_bytes = safe_read_bytes(filepath)
                                     elif "base64" in data and data["base64"]:
                                         raw_bytes = base64.b64decode(data["base64"])
                                     else:
-                                        raise ValueError(f"Keine Dateidaten empfangen (keys={list(data.keys()) if isinstance(data, dict) else data})")
+                                        exists = bin_path.exists() if bin_path else False
+                                        raise ValueError(f"Keine Dateidaten empfangen (file_id={file_id}, exists={exists}, keys={list(data.keys()) if isinstance(data, dict) else data})")
                                     load_mapping_data(json.loads(raw_bytes.decode("utf-8")))
                                 except Exception as ex:
                                     ui.notify(f"Fehler beim Laden: {str(ex)}", type="negative", timeout=15000)
