@@ -167,9 +167,9 @@ Customize detection behavior using a simple JSON file:
 ```
 
 - **`format_mode`**: Select `numbered` (`[TYP_NR]`), `numbered_role` (`[TYP_NR_ROLLE]`), or `role_only` (`[TYP_ROLLE]`).
-- **`enabled_entities`**: Choose which entity categories to detect and mask.
-- **`glossary`**: Explicitly map internal acronyms and company names to entity types.
-- **`ignore_terms`**: Whitelist words to prevent false-positive masking.
+- **`enabled_entities`**: Choose which entity categories general AI/library/regex detection should inspect and mask. Explicit glossary entries and document-specific manual entries remain active even when their category is disabled; an empty list therefore means "glossary/manual entries only".
+- **`glossary`**: Explicitly map internal acronyms and company names to entity types. These explicit entries take precedence over generic built-in ignore terms.
+- **`ignore_terms`**: Whitelist words to prevent false-positive masking. Generic labels such as `Email`, `E-Mail`, `App`, and `Applikation` are protected by default but can still be deliberately added to the glossary.
 
 ---
 

@@ -503,6 +503,7 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
                         start=start,
                         end=end,
                         score=score,
+                        recognition_metadata={"recognizer_name": self.name},
                     )
                 )
 

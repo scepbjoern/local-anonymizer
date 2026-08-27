@@ -215,7 +215,7 @@ def build_anonymizer(app_state: Optional[AppState] = None):
             language="de",
             glossary=glossary,
             ignore_terms=ignore_terms,
-            enabled_entities=app_state.active_entities if app_state.active_entities else None,
+            enabled_entities=list(app_state.active_entities),
             gliner_threshold=app_state.gliner_threshold,
         )
     else:
@@ -224,7 +224,7 @@ def build_anonymizer(app_state: Optional[AppState] = None):
             language="de",
             glossary=parse_glossary(cfg.glossary),
             ignore_terms=parse_ignore_terms(cfg.ignore_terms),
-            enabled_entities=list(cfg.active_entities) if cfg.active_entities else None,
+            enabled_entities=list(cfg.active_entities),
             gliner_threshold=cfg.gliner_threshold,
         )
 
@@ -239,9 +239,9 @@ def sync_cached_anonymizer_settings(anon, app_state: "AppState") -> None:
     glossary update silently wrote to a dead `.terms` attribute instead of the real `.glossary`
     for a while without anyone noticing.
     """
-    anon.enabled_entities = app_state.active_entities if app_state.active_entities else None
+    anon.enabled_entities = list(app_state.active_entities)
     anon.gliner_recognizer.threshold = app_state.gliner_threshold
-    anon.ignore_terms = parse_ignore_terms(app_state.ignore_terms_text)
+    anon.set_ignore_terms(parse_ignore_terms(app_state.ignore_terms_text))
     new_glossary = parse_glossary(app_state.glossary_text)
     anon.set_glossary(new_glossary)
 
@@ -328,7 +328,7 @@ threading.Thread(target=_warmup_background_thread, daemon=True).start()
 
 
 # Supported entity labels
-AVAILABLE_ENTITIES = [
+AVAILABLE_ENTITIES = sorted([
     "PERSON",
     "ORGANIZATION",
     "EMAIL_ADDRESS",
@@ -351,7 +351,7 @@ AVAILABLE_ENTITIES = [
     "AHV_NUMBER",
     "UID_NUMBER",
     "IT_SYSTEM",
-]
+])
 
 # Surface tag options as a clean dictionary
 SURFACE_TAG_OPTIONS: Dict[str, str] = {
@@ -1441,7 +1441,8 @@ def create_ui():
 
             ui.separator().classes("my-2")
 
-            ui.label("Zu anonymisierende Entitäten:").classes("text-xs font-semibold text-slate-700 mb-1")
+            ui.label("Allgemeine Erkennung aktivieren:").classes("text-xs font-semibold text-slate-700 mb-1")
+            ui.label("Steuert KI-, Bibliotheks- und Regex-Erkennung. Explizite Glossar- und manuelle Einträge bleiben unabhängig aktiv.").classes("text-[11px] text-slate-500 mb-1")
             for ent in AVAILABLE_ENTITIES:
                 def make_ent_toggle(e_name):
                     def toggle(val):

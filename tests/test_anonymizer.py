@@ -10,6 +10,52 @@ def test_enabled_entities_empty_list():
     assert "ZHAW" in res.anonymized_text
     assert len(res.entities) == 0
 
+
+def test_disabled_general_detection_keeps_glossary_terms(monkeypatch):
+    """An empty general-detection selection must still apply explicit glossary entries."""
+    anonymizer = LocalAnonymizer(glossary={"SAP": "IT_SYSTEM"}, enabled_entities=[])
+
+    def unexpected_general_detection(**kwargs):
+        pytest.fail("General recognizers must not run when enabled_entities is empty")
+
+    monkeypatch.setattr(anonymizer.analyzer, "analyze", unexpected_general_detection)
+    results = anonymizer.analyze("SAP")
+
+    assert len(results) == 1
+    assert results[0].entity_type == "IT_SYSTEM"
+    assert results[0].start == 0
+    assert results[0].end == 3
+
+
+def test_builtin_generic_terms_are_ignored_but_explicit_glossary_wins(monkeypatch):
+    """Generic labels such as E-Mail and App are suppressed unless explicitly configured."""
+    from presidio_analyzer import RecognizerResult
+
+    anonymizer = LocalAnonymizer(enabled_entities=["EMAIL_ADDRESS", "IT_SYSTEM"])
+
+    def fake_general_detection(**kwargs):
+        return [
+            RecognizerResult(entity_type="EMAIL_ADDRESS", start=0, end=6, score=1.0),
+            RecognizerResult(entity_type="IT_SYSTEM", start=7, end=10, score=1.0),
+        ]
+
+    monkeypatch.setattr(anonymizer.analyzer, "analyze", fake_general_detection)
+    assert anonymizer.analyze("E-Mail App") == []
+
+    glossary_anonymizer = LocalAnonymizer(
+        glossary={"App": "IT_SYSTEM"},
+        enabled_entities=[],
+    )
+
+    def unexpected_glossary_general_detection(**kwargs):
+        pytest.fail("General recognizers must not run when enabled_entities is empty")
+
+    monkeypatch.setattr(glossary_anonymizer.analyzer, "analyze", unexpected_glossary_general_detection)
+    glossary_results = glossary_anonymizer.analyze("App")
+
+    assert len(glossary_results) == 1
+    assert glossary_results[0].entity_type == "IT_SYSTEM"
+
 def test_enabled_entities_none_allows_all():
     anonymizer = LocalAnonymizer(enabled_entities=None)
     # Should redact both
@@ -450,8 +496,6 @@ def test_entity_source_overview_reflects_actual_recognizers():
     # No dead SpacyRecognizer contributing phantom sources
     for row in overview:
         assert all(s["recognizer"] != "SpacyRecognizer" for s in row["sources"])
-
-
 
 
 

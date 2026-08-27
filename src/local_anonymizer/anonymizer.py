@@ -46,8 +46,12 @@ DEFAULT_IGNORE_TERMS = [
     # Generic entity descriptors and field labels
     "Unternehmen", "Unternehmens", "Firma", "Organisation", "Hochschule", "Universität",
     "Prüfung", "Prüfungen", "Vorlesung", "Modul", "Lehrgang", "Weiterbildung",
-    "Telefon", "Tel", "Email", "E-Mail", "Mail", "Adresse", "Website", "Datum",
+    "Telefon", "Telefonnummer", "Tel", "Email", "E-Mail", "E-Mail-Adresse", "Emailadresse",
+    "E-Mailadresse", "Mail", "Mailadresse", "Adresse", "Website", "Datum",
     "Name", "Namen", "Vorname", "Vornamen", "Nachname", "Nachnamen", "Rolle", "Titel", "Status",
+    # Generic software terms (specific systems remain configurable through the glossary)
+    "App", "Apps", "Applikation", "Applikationen", "Anwendung", "Anwendungen",
+    "Software", "System", "Systeme", "Plattform", "Plattformen", "Datenbank", "Datenbanken",
 ]
 
 
@@ -366,6 +370,13 @@ class LocalAnonymizer:
         self.glossary = glossary or {}
         self.fuzzy_recognizer.set_glossary(self.glossary)
 
+    def set_ignore_terms(self, ignore_terms: Optional[Sequence[str]] = None) -> None:
+        """Replace user ignore terms while retaining the built-in generic-term safeguards."""
+        combined_ignore = set(DEFAULT_IGNORE_TERMS)
+        if ignore_terms:
+            combined_ignore.update(ignore_terms)
+        self.ignore_terms = list(combined_ignore)
+
     def add_ignore_term(self, term: str) -> None:
         """Add a term to the ignore list."""
         if term not in self.ignore_terms:
@@ -426,11 +437,12 @@ class LocalAnonymizer:
                     add_source(category, {"kind": "library", "recognizer": r.name})
 
         enabled = self.enabled_entities
+        glossary_categories = set(self.fuzzy_recognizer.supported_entities)
         overview: List[Dict[str, Any]] = []
         for category in sorted(category_sources.keys()):
             overview.append({
                 "category": category,
-                "active": (enabled is None) or (category in enabled),
+                "active": (enabled is None) or (category in enabled) or (category in glossary_categories),
                 "sources": category_sources[category],
             })
         return overview
@@ -447,8 +459,13 @@ class LocalAnonymizer:
         if on_progress:
             on_progress(0.10, "Ignore-Filterung und Vorverarbeitung...")
 
-        # If enabled_entities is explicitly empty [], return no entities
-        if self.enabled_entities is not None and len(self.enabled_entities) == 0:
+        # If enabled_entities is explicitly empty [], only configured glossary terms remain
+        # eligible; explicit user entries are intentionally independent from AI/regex toggles.
+        if (
+            self.enabled_entities is not None
+            and len(self.enabled_entities) == 0
+            and not self.fuzzy_recognizer.glossary
+        ):
             if on_progress:
                 on_progress(1.00, "Keine Entitäten aktiviert.")
             return []
@@ -465,13 +482,28 @@ class LocalAnonymizer:
         if on_progress:
             on_progress(0.25, "KI-Modell & Presidio Erkennung läuft...")
 
-        # Run Presidio analysis without hardcoded score_threshold overriding recognizer thresholds
-        results = self.analyzer.analyze(
-            text=text,
-            language=self.language,
-            entities=self.enabled_entities,
-            score_threshold=None,
-        )
+        # An empty list means that no model/library/regex category is active. Presidio treats
+        # entities=[] as "all entities" in some versions, so skip that pass explicitly.
+        if self.enabled_entities is not None and len(self.enabled_entities) == 0:
+            results = []
+        else:
+            # Run Presidio analysis without hardcoded score_threshold overriding recognizer thresholds
+            results = self.analyzer.analyze(
+                text=text,
+                language=self.language,
+                entities=self.enabled_entities,
+                score_threshold=None,
+            )
+
+        # Keep explicit glossary terms active even when their category is disabled for the
+        # model/library/regex pass. Categories already enabled are supplied by Presidio above;
+        # only disabled glossary categories need a direct second pass to avoid re-enabling GLiNER.
+        if self.enabled_entities is not None and self.fuzzy_recognizer.glossary:
+            disabled_glossary_types = set(self.fuzzy_recognizer.supported_entities).difference(self.enabled_entities)
+            if disabled_glossary_types:
+                results.extend(
+                    self.fuzzy_recognizer.analyze(text=text, entities=sorted(disabled_glossary_types))
+                )
 
         if on_progress:
             on_progress(0.65, "Filterung & Deduplizierung der Fundstellen...")
@@ -485,12 +517,19 @@ class LocalAnonymizer:
             r.start = clean_s
             r.end = clean_e
 
+            is_glossary_result = (r.recognition_metadata or {}).get("recognizer_name") == "FuzzyGlossaryRecognizer"
             is_ignored = any(
                 not (r.end <= ig_start or r.start >= ig_end)
                 for ig_start, ig_end in ignored_spans
             )
-            if not is_ignored:
-                if self.enabled_entities is None or r.entity_type in self.enabled_entities:
+            # An explicit glossary entry wins over a generic ignore term. This keeps built-in
+            # ignores useful for model noise without blocking deliberate user configuration.
+            if not is_ignored or is_glossary_result:
+                if (
+                    self.enabled_entities is None
+                    or r.entity_type in self.enabled_entities
+                    or is_glossary_result
+                ):
                     filtered_results.append(r)
 
         # 2. German gender suffix extension (e.g. "Veranlasser" + ":in" -> "Veranlasser:in", "Sachbearbeiter" + ":innen")
