@@ -117,3 +117,19 @@ def test_glossary_supported_entities_follow_configured_types():
 
     recognizer.set_glossary({"ZHAW": "ORGANIZATION", "SAP": "IT_SYSTEM"})
     assert recognizer.supported_entities == ["IT_SYSTEM", "ORGANIZATION"]
+
+
+def test_person_prompts_are_specific_and_role_prompts_are_available():
+    recognizer = GLiNERRecognizer()
+
+    assert recognizer.label_mapping["person"] == "PERSON"
+    assert recognizer.label_mapping["name"] == "PERSON"
+    assert recognizer.label_mapping["person name"] == "PERSON"
+    assert recognizer.label_mapping["first name"] == "PERSON"
+    assert recognizer.label_mapping["last name"] == "PERSON"
+    assert recognizer.label_mapping["person's proper name"] == "PERSON"
+    assert recognizer.label_mapping["named person"] == "PERSON"
+    assert recognizer.label_mapping["proper name"] == "PERSON"
+    assert recognizer.label_mapping["job title"] == "ROLE"
+    assert recognizer.label_mapping["professional role"] == "ROLE"
+    assert recognizer.label_mapping["position"] == "ROLE"

@@ -43,6 +43,10 @@ DEFAULT_IGNORE_TERMS = [
     "Patient", "Patienten", "Patientin", "Patientinnen",
     "Projektleiter", "Projektleiterin", "Consultant", "Berater", "Beraterin",
     "Aufgabensteller", "Aufgabenstellerin", "Experte", "Expertin", "Betreuer", "Betreuerin",
+    "Autor", "Autoren", "Autorin", "Autorinnen", "Vorgesetzter", "Vorgesetzte", "Vorgesetzten",
+    "Reisende", "Reisenden", "reisende Person", "reisenden Person", "Verantwortliche", "Verantwortlichen",
+    "Antragsteller", "Antragstellerin", "Antragstellende", "Teilnehmende", "Teilnehmer", "Teilnehmerin",
+    "Betroffene", "Betroffenen", "Leitung", "Führungskraft", "Führungskräfte", "Person", "Personen",
     # Generic entity descriptors and field labels
     "Unternehmen", "Unternehmens", "Firma", "Organisation", "Hochschule", "Universität",
     "Prüfung", "Prüfungen", "Vorlesung", "Modul", "Lehrgang", "Weiterbildung",

@@ -384,6 +384,7 @@ AVAILABLE_ENTITIES = sorted([
     "AHV_NUMBER",
     "UID_NUMBER",
     "IT_SYSTEM",
+    "ROLE",
 ])
 
 # Surface tag options as a clean dictionary
@@ -1641,7 +1642,12 @@ def create_ui():
             ui.label("Aus = Kategorie vollständig aus. Nur Glossar & manuell = keine automatische Erkennung. Alle Quellen = KI, Regex, Bibliothek und explizite Einträge.").classes("text-[11px] text-slate-500 mb-2")
             for ent in AVAILABLE_ENTITIES:
                 with ui.row().classes("w-full items-center justify-between gap-1"):
-                    ui.label(ent).classes("text-xs font-mono text-slate-700")
+                    entity_label = ui.label(ent).classes("text-xs font-mono text-slate-700")
+                    if ent == "ROLE":
+                        entity_label.tooltip(
+                            "Optionale Erkennung von Funktionsbezeichnungen wie CEO, CFO oder Leiter Prozessmanagement. "
+                            "Standardmässig aus, weil Rollen häufig fachlich erhalten bleiben sollen."
+                        )
 
                     def make_entity_mode_change(e_name):
                         selector_ref: List[Any] = []

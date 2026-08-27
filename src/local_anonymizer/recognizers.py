@@ -184,11 +184,18 @@ class GLiNERRecognizer(EntityRecognizer):
 
     DEFAULT_LABEL_MAPPING = {
         # Persons
+        # These prompts intentionally describe a proper/named individual rather than the broad
+        # concept of a person, which otherwise tends to match generic role nouns in German. The
+        # broad prompt remains as a compatibility fallback because this model's multi-label
+        # inference can otherwise miss real names in long, mixed documents.
         "person": "PERSON",
-        "person name": "PERSON",
         "name": "PERSON",
+        "person name": "PERSON",
         "first name": "PERSON",
         "last name": "PERSON",
+        "person's proper name": "PERSON",
+        "named person": "PERSON",
+        "proper name": "PERSON",
         # Organizations & Companies
         "organization": "ORGANIZATION",
         "company": "ORGANIZATION",
@@ -239,6 +246,10 @@ class GLiNERRecognizer(EntityRecognizer):
         "application": "IT_SYSTEM",
         "database": "IT_SYSTEM",
         "platform": "IT_SYSTEM",
+        # Roles are quasi-identifiers and therefore opt-in through the UI/configuration.
+        "job title": "ROLE",
+        "professional role": "ROLE",
+        "position": "ROLE",
     }
 
     def __init__(
@@ -317,14 +328,34 @@ class GLiNERRecognizer(EntityRecognizer):
         if not labels_to_query:
             return []
 
-        # IT_SYSTEM labels are deliberately queried in a separate pass. They are a safety net
-        # for unknown software, while the glossary remains authoritative for ambiguous names
-        # such as SAP. Keeping the labels separate prevents the additional semantic candidates
-        # from changing the confidence and span selection of the established PII labels.
+        # PERSON, IT_SYSTEM, and ROLE labels are deliberately queried in separate passes. They
+        # use semantically focused prompts / are opt-in quasi-identifiers, while the established
+        # PII labels should not lose confidence because these additional prompts compete for spans.
+        person_labels = [
+            label for label in labels_to_query if self.label_mapping.get(label) == "PERSON"
+        ]
+        legacy_person_labels = [
+            label for label in ("person", "name", "person name", "first name", "last name")
+            if label in person_labels
+        ]
+        refined_person_labels = [
+            label for label in ("person's proper name", "named person", "proper name")
+            if label in person_labels
+        ]
+        other_person_labels = [
+            label for label in person_labels
+            if label not in legacy_person_labels and label not in refined_person_labels
+        ]
         it_system_labels = [
             label for label in labels_to_query if self.label_mapping.get(label) == "IT_SYSTEM"
         ]
-        primary_labels = [label for label in labels_to_query if label not in it_system_labels]
+        role_labels = [
+            label for label in labels_to_query if self.label_mapping.get(label) == "ROLE"
+        ]
+        primary_labels = [
+            label for label in labels_to_query
+            if label not in person_labels and label not in it_system_labels and label not in role_labels
+        ]
 
         # Chunk the text to prevent the 384-token GLiNER truncation limit
         text_chunks = chunk_text_with_offsets(text, max_chars=700)
@@ -357,7 +388,13 @@ class GLiNERRecognizer(EntityRecognizer):
 
         for predicted_batches in (
             predict_for_labels(primary_labels),
+            # Keep the legacy prompts as a recall fallback and run the refined prompts
+            # separately so their semantic wording cannot suppress established name spans.
+            predict_for_labels(legacy_person_labels),
+            predict_for_labels(refined_person_labels),
+            predict_for_labels(other_person_labels),
             predict_for_labels(it_system_labels),
+            predict_for_labels(role_labels),
         ):
             for (chunk_start, chunk_end, chunk_text), predicted_entities in zip(valid_chunks, predicted_batches):
                 for pred in predicted_entities:
@@ -384,7 +421,26 @@ class GLiNERRecognizer(EntityRecognizer):
                         )
                     )
 
-        return results
+        # GLiNER can occasionally return adjacent name components as separate PERSON spans
+        # (e.g. "Julia" + "Meier") when several semantic prompts are active. Merge only
+        # directly whitespace-adjacent PERSON spans; punctuation or other words keep identities
+        # separate. The weakest component score represents the combined span conservatively.
+        results.sort(key=lambda result: (result.start, result.end))
+        merged_results: List[RecognizerResult] = []
+        for result in results:
+            if (
+                merged_results
+                and result.entity_type == "PERSON"
+                and merged_results[-1].entity_type == "PERSON"
+                and result.start >= merged_results[-1].end
+                and not text[merged_results[-1].end:result.start].strip()
+            ):
+                merged_results[-1].end = result.end
+                merged_results[-1].score = min(merged_results[-1].score, result.score)
+            else:
+                merged_results.append(result)
+
+        return merged_results
 
 
 class FuzzyGlossaryRecognizer(EntityRecognizer):

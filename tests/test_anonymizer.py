@@ -52,6 +52,31 @@ def test_glossary_can_be_disabled_independently_of_general_detection(monkeypatch
     assert anonymizer.analyze("SAP") == []
 
 
+def test_role_glossary_is_supported_when_role_is_opted_in():
+    anonymizer = LocalAnonymizer(
+        glossary={"CEO": "ROLE"},
+        enabled_entities=[],
+        enabled_glossary_entities=["ROLE"],
+    )
+
+    results = anonymizer.analyze("Der CEO genehmigt den Antrag.")
+
+    assert len(results) == 1
+    assert results[0].entity_type == "ROLE"
+    assert results[0].start == 4
+    assert results[0].end == 7
+
+
+def test_role_glossary_is_suppressed_when_role_is_off():
+    anonymizer = LocalAnonymizer(
+        glossary={"CEO": "ROLE"},
+        enabled_entities=[],
+        enabled_glossary_entities=[],
+    )
+
+    assert anonymizer.analyze("Der CEO genehmigt den Antrag.") == []
+
+
 def test_detection_method_is_annotated_from_recognizer(monkeypatch):
     """Review metadata distinguishes a deterministic regex result from generic automation."""
     from presidio_analyzer import RecognizerResult

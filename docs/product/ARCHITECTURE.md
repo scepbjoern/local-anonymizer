@@ -84,16 +84,19 @@
   - Kapselt `urchade/gliner_multi_pii-v1`.
   - Hält ein Singleton-Klassen-Cache `_MODEL_CACHE`, sodass das PyTorch-Modell nur ein einziges Mal in den RAM geladen wird.
   - Wendet `chunk_text_with_offsets` an, um das 384-Token-Limit von DeBERTa/GLiNER ohne Informationsverlust zu handhaben.
+  - Verwendet für `PERSON` präzisere Prompts wie `person's proper name`, `named person` und `proper name`, um generische Rollennomen weniger häufig zu erfassen. `ROLE`/`JOB_TITLE` nutzt die Prompts `job title`, `professional role` und `position` in einem getrennten Modellpass und ist standardmässig deaktiviert.
 - **`is_sentence_boundary`:**
   - Schützt deutsche und englische Standardabkürzungen (`Dr.`, `Prof.`, `Bahnhofstr.`, `Nr.`, `14. Juli`), damit Sätze nicht mitten im Eigennamen zerschnitten werden.
 - **`FuzzyGlossaryRecognizer`:**
   - Nutzt `rapidfuzz.fuzz.ratio` mit Schwellenwerten (High Confidence $\ge 90\%$, Review-Bedarf $\ge 75\%$).
   - Bevorzugt exakte Treffer (Score 1.0) vor Fuzzy-Treffern.
-  - Explizite Glossar-Treffer werden gemäss der Kategorie-Richtlinie separat zugelassen oder vollständig blockiert und überschreiben bei Zulassung generische Ignore-Begriffe bewusst.
+  - Explizite Glossar-Treffer werden gemäss der Kategorie-Richtlinie separat zugelassen oder vollständig blockiert. Sie können eingebaute generische Ignore-Begriffe bewusst überschreiben; persönliche Ignore-Einträge behalten immer Vorrang.
 - **Deterministische Phase-B-Recognizer:**
   - `AddressPatternRecognizer` erkennt zusammenhängende Schweizer und deutsche Adressen per Regex und weist die bekannte Kollision zwischen vierstelliger Schweizer PLZ und Jahreszahl konservativ zurück.
   - `AHVNumberRecognizer` validiert die AHV-Kontrollziffer; `UIDNumberRecognizer` validiert CHE/UID nach Modulo 11. Formal korrekte, aber prüfziffern-ungültige Nummern werden nicht als Entitäten ausgegeben.
   - `IT_SYSTEM` wird über das dynamisch aus dem Glossar abgeleitete Zieltypenset sowie separate GLiNER-Sicherheitsnetz-Prompts erkannt.
+
+Die optionale Kategorie `ROLE` wird wie andere Kategorien über die drei UI-Modi gesteuert und standardmässig nicht aktiviert. Dadurch bleiben fachlich wichtige Formulierungen wie „Der Sachbearbeiter prüft …“ standardmässig erhalten; bei erhöhtem Identifikationsrisiko können Funktionsbezeichnungen wie `CEO` oder `Leiter Prozessmanagement` gezielt anonymisiert werden. Generische Rollennomen werden zusätzlich über die eingebaute Ignore-Liste gegen typische PERSON-Falschpositive geschützt.
 
 Die UI-Schalter für Entitätstypen verwenden drei Modi: `Aus` blockiert alle Quellen, `Nur Glossar & manuell` deaktiviert KI-/Bibliotheks-/Regex-Erkennung und `Alle Quellen` aktiviert sämtliche Quellen. Glossar-Treffer werden in einem getrennten, direkten Pass geprüft; dadurch kann beispielsweise `IT_SYSTEM` auf „Nur Glossar & manuell“ stehen, während ein vollständiges „Aus“ auch `SAP` blockiert. Manuelle, dokumentbezogene Markierungen folgen derselben Kategorie-Richtlinie.
 
