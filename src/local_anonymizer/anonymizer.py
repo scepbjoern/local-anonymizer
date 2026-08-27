@@ -90,6 +90,7 @@ class DetectedEntity:
     needs_review: bool = False
     role: Optional[str] = None
     surface_tag: Optional[str] = None
+    residue_note: Optional[str] = None
 
 
 @dataclass
@@ -254,6 +255,7 @@ class AnonymizationResult:
                     "needs_review": e.needs_review,
                     "role": e.role,
                     "surface_tag": e.surface_tag,
+                    "residue_note": e.residue_note,
                 }
                 for e in self.entities
             ],
@@ -316,6 +318,18 @@ class LocalAnonymizer:
         self.analyzer.registry.add_recognizer(self.gliner_recognizer)
         self.analyzer.registry.add_recognizer(self.fuzzy_recognizer)
 
+        # Remove Presidio's default SpacyRecognizer: it requires a full spaCy NER model, but we
+        # intentionally use a blank (tokenizer-only) spaCy engine for fast startup and low
+        # footprint. Left registered, it silently detects nothing while still advertising support
+        # for PERSON/ORGANIZATION/LOCATION/... in get_supported_entities(), which would corrupt
+        # entity-source transparency and the enabled_entities validation warning. Not "fixed" by
+        # loading a real spaCy model -- that would reintroduce the footprint/startup cost this
+        # project deliberately avoided by choosing GLiNER.
+        try:
+            self.analyzer.registry.remove_recognizer("SpacyRecognizer")
+        except Exception:
+            pass
+
         # Validate enabled_entities against supported recognizer entities
         if self.enabled_entities is not None and len(self.enabled_entities) > 0:
             supported = set(self.analyzer.get_supported_entities(language=self.language))
@@ -338,6 +352,70 @@ class LocalAnonymizer:
         """Add a term to the ignore list."""
         if term not in self.ignore_terms:
             self.ignore_terms.append(term)
+
+    def get_entity_source_overview(self) -> List[Dict[str, Any]]:
+        """
+        Build a transparency overview of how each entity category is actually detected: per
+        category, which mechanism(s) contribute it (GLiNER zero-shot prompt, regex pattern,
+        external library, or user glossary) and whether it is currently enabled. Intended for a
+        read-only "how does detection actually work" view, so users aren't left guessing.
+        """
+        recognizers = self.analyzer.registry.get_recognizers(language=self.language, all_fields=True)
+        category_sources: Dict[str, List[Dict[str, Any]]] = {}
+
+        def add_source(category: str, source: Dict[str, Any]) -> None:
+            category_sources.setdefault(category, []).append(source)
+
+        # GLiNER: group its natural-language prompt labels by the output category they map to.
+        prompts_by_category: Dict[str, List[str]] = {}
+        for prompt, category in self.gliner_recognizer.label_mapping.items():
+            prompts_by_category.setdefault(category, []).append(prompt)
+        for category, prompts in prompts_by_category.items():
+            add_source(category, {
+                "kind": "prompt",
+                "recognizer": "GLiNERRecognizer",
+                "prompts": sorted(prompts),
+            })
+
+        # Glossary: count configured entries per category. A category with zero current entries
+        # still shows up (it's "supported", just empty) so users see it's glossary-driven.
+        glossary_counts: Dict[str, int] = {}
+        for term, category in self.fuzzy_recognizer.glossary.items():
+            glossary_counts[category] = glossary_counts.get(category, 0) + 1
+        for category in self.fuzzy_recognizer.supported_entities:
+            add_source(category, {
+                "kind": "glossary",
+                "recognizer": "FuzzyGlossaryRecognizer",
+                "entry_count": glossary_counts.get(category, 0),
+            })
+
+        # Everything else Presidio has registered: regex-based PatternRecognizers expose their
+        # patterns directly; library-backed ones (e.g. PhoneRecognizer via the `phonenumbers`
+        # package) expose none, so they're labelled as an external library instead of showing an
+        # empty regex field.
+        for r in recognizers:
+            if r.name in ("GLiNERRecognizer", "FuzzyGlossaryRecognizer"):
+                continue
+            patterns = getattr(r, "patterns", None)
+            for category in r.supported_entities:
+                if patterns:
+                    add_source(category, {
+                        "kind": "regex",
+                        "recognizer": r.name,
+                        "patterns": [{"name": p.name, "regex": p.regex} for p in patterns],
+                    })
+                else:
+                    add_source(category, {"kind": "library", "recognizer": r.name})
+
+        enabled = self.enabled_entities
+        overview: List[Dict[str, Any]] = []
+        for category in sorted(category_sources.keys()):
+            overview.append({
+                "category": category,
+                "active": (enabled is None) or (category in enabled),
+                "sources": category_sources[category],
+            })
+        return overview
 
     def analyze(
         self,
@@ -413,8 +491,51 @@ class LocalAnonymizer:
             )
         ]
 
-        # 3. Deduplicate / resolve overlapping results (prefer longer span, then higher score)
-        filtered_results.sort(key=lambda r: (r.end - r.start, r.score), reverse=True)
+        # 3. Resolve overlaps.
+        #    a) Absorption: a glossary hit strictly inside a longer model span keeps the model's
+        #       boundaries but the glossary's type/score (e.g. glossary "Remo" inside GLiNER's
+        #       "Remo Weiersmueller" -> one PERSON entity covering the full name, instead of
+        #       replacing only "Remo" and leaking the surname).
+        #    b) Identical spans: glossary-sourced hits win deterministically over model-sourced
+        #       hits (explicit user intent beats a probabilistic guess), not just incidentally
+        #       via score comparison.
+        #    c) Everything else: prefer the longer span, then higher score (unchanged fallback).
+        def _is_glossary_result(r: "RecognizerResult") -> bool:
+            return (r.recognition_metadata or {}).get("recognizer_name") == "FuzzyGlossaryRecognizer"
+
+        glossary_hits = [r for r in filtered_results if _is_glossary_result(r)]
+        other_hits = [r for r in filtered_results if not _is_glossary_result(r)]
+
+        absorbed_container_ids: Set[int] = set()
+        union_results: List[RecognizerResult] = []
+
+        for g in glossary_hits:
+            container = None
+            for m in other_hits:
+                is_strict_containment = (
+                    m.start <= g.start and g.end <= m.end and (m.start, m.end) != (g.start, g.end)
+                )
+                if is_strict_containment:
+                    if container is None or (m.end - m.start) < (container.end - container.start):
+                        container = m
+            if container is not None:
+                union_results.append(
+                    self._RecognizerResult(
+                        entity_type=g.entity_type,
+                        start=container.start,
+                        end=container.end,
+                        score=g.score,
+                        recognition_metadata=g.recognition_metadata,
+                    )
+                )
+                absorbed_container_ids.add(id(container))
+            else:
+                union_results.append(g)
+
+        union_results.extend(m for m in other_hits if id(m) not in absorbed_container_ids)
+        filtered_results = union_results
+
+        filtered_results.sort(key=lambda r: (r.end - r.start, _is_glossary_result(r), r.score), reverse=True)
         accepted: List[RecognizerResult] = []
         accepted_spans: List[Tuple[int, int]] = []
 
@@ -642,6 +763,30 @@ class LocalAnonymizer:
             anonymized_chars[entity.start:entity.end] = list(entity.placeholder)
 
         anonymized_text = "".join(anonymized_chars)
+
+        # 6. Residue warning: flag placeholders immediately followed by an unreplaced, capitalized
+        #    word -- a signal that a multi-word name may only have been partially anonymized (e.g.
+        #    a short glossary form matched only part of "Remo Weiersmueller" and the model missed
+        #    the surname entirely, so absorption in step 3 never had a container to merge into).
+        #    Heuristic, not proof: German capitalizes all nouns, so this can also fire on ordinary
+        #    sentence continuations. Surfaced as a review flag only, never auto-corrected.
+        residue_pattern = re.compile(r"(\[[A-Z0-9_]+\])\s+([A-ZÄÖÜ][a-zäöüßA-ZÄÖÜ\-]{2,})")
+        residue_by_placeholder: Dict[str, str] = {}
+        for m in residue_pattern.finditer(anonymized_text):
+            placeholder, trailing_word = m.group(1), m.group(2)
+            residue_by_placeholder.setdefault(placeholder, trailing_word)
+
+        if residue_by_placeholder:
+            for entity in detected_entities:
+                trailing_word = residue_by_placeholder.get(entity.placeholder)
+                if trailing_word:
+                    entity.residue_note = (
+                        f"Direkt gefolgt von unverändertem, grossgeschriebenem Wort "
+                        f"'{trailing_word}' – möglicherweise unvollständig anonymisiert."
+                    )
+                    if not entity.needs_review:
+                        entity.needs_review = True
+                        review_needed.append(entity)
 
         return AnonymizationResult(
             anonymized_text=anonymized_text,

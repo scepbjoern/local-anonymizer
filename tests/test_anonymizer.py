@@ -338,6 +338,120 @@ def test_gender_suffix_extension():
     assert ":in" not in detected_texts
 
 
+def test_spacy_recognizer_removed_from_registry():
+    """SpacyRecognizer runs on a blank (NER-less) spaCy engine and would otherwise silently
+    detect nothing while still advertising support for PERSON/ORGANIZATION/LOCATION/... --
+    corrupting entity-source transparency and the enabled_entities validation warning."""
+    anon = LocalAnonymizer()
+    names = [r.name for r in anon.analyzer.registry.get_recognizers(language="de", all_fields=True)]
+    assert "SpacyRecognizer" not in names
+
+
+def test_glossary_short_form_absorbed_into_model_span():
+    """A short glossary entry ("Remo") must not truncate a longer name the model already found
+    ("Remo Weiersmueller") -- the glossary hit is absorbed into the model's span (boundaries from
+    the model, type from the glossary), so the surname is never left leaking in the output."""
+    anon = LocalAnonymizer(glossary={"Remo": "PERSON"})
+    text = (
+        "Remo Weiersmueller leitet das Projekt. Remo war schon frueher hier. "
+        "Remo Weiersmueller ist zufrieden."
+    )
+    res = anon.anonymize(text)
+
+    assert "Weiersmueller" not in res.anonymized_text
+    # Both full-name occurrences resolve to the same placeholder
+    assert res.anonymized_text.count("Remo Weiersmueller") == 0
+    full_name_placeholder = next(
+        (ph for ph, val in res.mapping.items() if val == "Remo Weiersmueller"), None
+    )
+    assert full_name_placeholder is not None
+    assert res.anonymized_text.count(full_name_placeholder) == 2
+
+    # The standalone short mention is still detected as its own entity, not silently dropped
+    assert any(v == "Remo" for v in res.mapping.values())
+
+
+def test_glossary_type_wins_on_identical_span():
+    """When the glossary and the model agree on the exact same span but disagree on the type,
+    the glossary's explicit type wins deterministically -- not just incidentally because its
+    score happens to be higher."""
+    anon = LocalAnonymizer(glossary={"Julia": "ORGANIZATION"}, enabled_entities=["PERSON", "ORGANIZATION"])
+    res = anon.anonymize("Julia hat heute frei.")
+
+    assert len(res.entities) == 1
+    assert res.entities[0].entity_type == "ORGANIZATION"
+    assert res.entities[0].original_text == "Julia"
+
+
+def test_residue_warning_flags_unreplaced_adjacent_capitalized_token():
+    """If a detected entity is immediately followed by an unreplaced, capitalized word, that is
+    flagged for review (e.g. a short glossary match whose surname the model missed entirely, so
+    there was no longer span for it to be absorbed into). A lowercase follower must not trigger
+    the warning."""
+    anon = LocalAnonymizer(glossary={"Remo": "PERSON"})
+
+    from presidio_analyzer import RecognizerResult
+
+    def fake_analyze(text, on_progress=None):
+        start = text.index("Remo")
+        return [RecognizerResult(entity_type="PERSON", start=start, end=start + 4, score=1.0)]
+
+    anon.analyze = fake_analyze
+    res = anon.anonymize("Remo Weiersmueller kam vorbei.")
+
+    assert res.entities[0].needs_review is True
+    assert res.entities[0].residue_note is not None
+    assert "Weiersmueller" in res.entities[0].residue_note
+    assert res.entities[0] in res.review_needed
+
+    # Negative case: a lowercase follower must not trigger the residue warning
+    def fake_analyze_lowercase(text, on_progress=None):
+        start = text.index("Remo")
+        return [RecognizerResult(entity_type="PERSON", start=start, end=start + 4, score=1.0)]
+
+    anon2 = LocalAnonymizer(glossary={"Remo": "PERSON"})
+    anon2.analyze = fake_analyze_lowercase
+    res2 = anon2.anonymize("Remo kam vorbei.")
+    assert res2.entities[0].needs_review is False
+    assert res2.entities[0].residue_note is None
+
+
+def test_entity_source_overview_reflects_actual_recognizers():
+    """The transparency overview must reflect what actually detects each category: GLiNER
+    prompts, glossary entries, regex patterns, or library-backed recognizers -- with no phantom
+    categories left over from the removed SpacyRecognizer."""
+    anon = LocalAnonymizer(
+        glossary={"ZHAW": "ORGANIZATION"},
+        enabled_entities=["PERSON", "ORGANIZATION", "IBAN_CODE"],
+    )
+    overview = anon.get_entity_source_overview()
+    by_category = {row["category"]: row for row in overview}
+
+    # Active flag reflects enabled_entities
+    assert by_category["PERSON"]["active"] is True
+    assert by_category["EMAIL_ADDRESS"]["active"] is False
+
+    # ORGANIZATION is fed by both GLiNER prompts and the glossary
+    org_kinds = {s["kind"] for s in by_category["ORGANIZATION"]["sources"]}
+    assert org_kinds == {"prompt", "glossary"}
+    glossary_source = next(s for s in by_category["ORGANIZATION"]["sources"] if s["kind"] == "glossary")
+    assert glossary_source["entry_count"] == 1
+
+    # IBAN_CODE is fed by both a GLiNER prompt and a real regex pattern
+    iban_kinds = {s["kind"] for s in by_category["IBAN_CODE"]["sources"]}
+    assert "regex" in iban_kinds
+    regex_source = next(s for s in by_category["IBAN_CODE"]["sources"] if s["kind"] == "regex")
+    assert regex_source["patterns"], "regex source must expose the actual pattern(s)"
+
+    # PHONE_NUMBER is library-backed (phonenumbers), not an empty regex field
+    phone_kinds = {s["kind"] for s in by_category["PHONE_NUMBER"]["sources"]}
+    assert "library" in phone_kinds
+
+    # No dead SpacyRecognizer contributing phantom sources
+    for row in overview:
+        assert all(s["recognizer"] != "SpacyRecognizer" for s in row["sources"])
+
+
 
 
 

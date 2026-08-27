@@ -229,6 +229,87 @@ def build_anonymizer(app_state: Optional[AppState] = None):
         )
 
 
+def sync_cached_anonymizer_settings(anon, app_state: "AppState") -> None:
+    """
+    Push the current UI-configured settings (active entities, threshold, ignore terms, glossary)
+    onto an already-built LocalAnonymizer instance, so a cached instance stays in sync with
+    sidebar edits instead of only reflecting the settings it was first constructed with.
+
+    Single source of truth for this sync -- previously duplicated inline, which is how the
+    glossary update silently wrote to a dead `.terms` attribute instead of the real `.glossary`
+    for a while without anyone noticing.
+    """
+    anon.enabled_entities = app_state.active_entities if app_state.active_entities else None
+    anon.gliner_recognizer.threshold = app_state.gliner_threshold
+    anon.ignore_terms = parse_ignore_terms(app_state.ignore_terms_text)
+    new_glossary = parse_glossary(app_state.glossary_text)
+    anon.fuzzy_recognizer.glossary = new_glossary
+    anon.fuzzy_recognizer.supported_entities = (
+        list(set(new_glossary.values())) if new_glossary else ["ORGANIZATION", "PERSON", "CUSTOM_TERM"]
+    )
+
+
+def get_synced_cached_anonymizer(app_state: "AppState"):
+    """Return the shared cached LocalAnonymizer, building it if needed and syncing it to the
+    current UI settings. Must be called while holding `_model_lock`."""
+    global _cached_anonymizer
+    if _cached_anonymizer is None:
+        _cached_anonymizer = build_anonymizer(app_state)
+    else:
+        sync_cached_anonymizer_settings(_cached_anonymizer, app_state)
+    return _cached_anonymizer
+
+
+_SOURCE_KIND_LABELS: Dict[str, Tuple[str, str]] = {
+    "prompt": ("🤖 KI-Prompt", "blue"),
+    "regex": ("🔤 Regex", "purple"),
+    "library": ("📚 Bibliothek", "grey-7"),
+    "glossary": ("📖 Begriffsliste", "teal"),
+}
+
+
+def render_entity_source_overview(overview: List[Dict[str, Any]]) -> None:
+    """Render the entity-source transparency overview (see LocalAnonymizer.get_entity_source_overview)
+    as a read-only list: per category, whether it's active and exactly how it's detected."""
+    if not overview:
+        ui.label("Keine Kategorien gefunden.").classes("text-xs text-slate-400")
+        return
+
+    for row in overview:
+        active = row["active"]
+        with ui.card().classes("w-full p-2 " + ("bg-white" if active else "bg-slate-50 opacity-60")):
+            with ui.row().classes("items-center gap-2"):
+                ui.icon(
+                    "check_circle" if active else "radio_button_unchecked",
+                    color="positive" if active else "grey",
+                ).classes("text-sm")
+                ui.label(row["category"]).classes("text-sm font-mono font-bold text-slate-800")
+                if not active:
+                    ui.badge("inaktiv", color="grey-5").props("dense")
+
+            with ui.column().classes("w-full gap-1 mt-1 pl-6"):
+                for src in row["sources"]:
+                    kind_label, kind_color = _SOURCE_KIND_LABELS.get(src["kind"], (src["kind"], "grey"))
+                    with ui.row().classes("items-start gap-2 flex-wrap"):
+                        ui.badge(kind_label, color=kind_color).props("dense outline")
+                        if src["kind"] == "prompt":
+                            ui.label(", ".join(f'"{p}"' for p in src["prompts"])).classes(
+                                "text-xs text-slate-600 font-mono"
+                            )
+                        elif src["kind"] == "regex":
+                            with ui.column().classes("gap-0"):
+                                for p in src["patterns"]:
+                                    ui.label(f'{p["name"]}: {p["regex"]}').classes(
+                                        "text-xs text-slate-600 font-mono break-all"
+                                    )
+                        elif src["kind"] == "glossary":
+                            count = src["entry_count"]
+                            noun = "Eintrag" if count == 1 else "Einträge"
+                            ui.label(f"{count} {noun} in deiner Begriffsliste").classes("text-xs text-slate-600")
+                        elif src["kind"] == "library":
+                            ui.label(f'externe Bibliothek ({src["recognizer"]})').classes("text-xs text-slate-600")
+
+
 def _warmup_background_thread():
     """Worker to initialize GLiNER and Presidio in the background without blocking the UI."""
     global _cached_anonymizer, _model_ready
@@ -923,15 +1004,7 @@ def create_ui():
 
             def do_analysis(text):
                 with _model_lock:
-                    global _cached_anonymizer
-                    if _cached_anonymizer is None:
-                        _cached_anonymizer = build_anonymizer(state)
-                    else:
-                        _cached_anonymizer.enabled_entities = state.active_entities if state.active_entities else None
-                        _cached_anonymizer.gliner_recognizer.threshold = state.gliner_threshold
-                        _cached_anonymizer.ignore_terms = parse_ignore_terms(state.ignore_terms_text)
-                        _cached_anonymizer.fuzzy_recognizer.terms = parse_glossary(state.glossary_text)
-                    anon = _cached_anonymizer
+                    anon = get_synced_cached_anonymizer(state)
                 return anon.analyze(text)
 
             loop = asyncio.get_running_loop()
@@ -1409,15 +1482,26 @@ def create_ui():
             with ui.tabs().classes("w-full border-b") as tabs:
                 tab_anonymize = ui.tab("🔒 Anonymisieren & Review")
                 tab_restore = ui.tab("🔄 Wiederherstellen (De-Anonymize)")
+                tab_transparency = ui.tab("🔍 Erkennungslogik")
+
+            _transparency_loaded = []  # mutable one-shot flag: lazy-load once, not on every page build
 
             def on_tab_change(e):
-                """Auto-preload mapping into Tab 2 when user switches there after an analysis."""
+                """Auto-preload mapping into Tab 2 when user switches there after an analysis.
+                Also lazy-loads Tab 3's transparency view on first visit -- it isn't rendered at
+                page-build time to avoid ballooning the initial WebSocket payload for a view most
+                sessions never open."""
                 restore_tab_name = tab_restore._props.get("name", "")
                 if e.value == restore_tab_name and state.current_mapping:
                     if map_json_input is not None and not map_json_input.value.strip():
                         state.restore_mapping = dict(state.current_mapping)
                         map_json_input.value = json.dumps(state.current_mapping, indent=2, ensure_ascii=False)
                         ui.notify(f"Mapping mit {len(state.current_mapping)} Einträgen aus aktueller Analyse vorgeladen.", type="info", icon="auto_awesome")
+
+                transparency_tab_name = tab_transparency._props.get("name", "")
+                if e.value == transparency_tab_name and not _transparency_loaded:
+                    _transparency_loaded.append(True)
+                    load_transparency_view()
 
             tabs.on_value_change(on_tab_change)
 
@@ -2134,6 +2218,45 @@ def create_ui():
                             color="slate",
                             on_click=save_restored_md,
                         ).props("outline")
+
+                # TAB 3: Transparency -- how detection actually works
+                with ui.tab_panel(tab_transparency):
+                    ui.label("Wie werden Entitäten erkannt?").classes("text-base font-bold text-slate-800 mb-1")
+                    ui.label(
+                        "Pro Kategorie: ob sie aktuell aktiv ist, und über welchen Mechanismus sie erkannt wird -- "
+                        "ein KI-Prompt an das Zero-Shot-Modell, ein regulärer Ausdruck, eine externe Bibliothek, "
+                        "oder deine eigene Begriffsliste. Reine Anzeige, hier wird nichts verändert."
+                    ).classes("text-xs text-slate-500 mb-3")
+
+                    ui.button("🔄 Aktualisieren", on_click=lambda: load_transparency_view()).props("outline dense size=sm").classes("mb-2")
+                    transparency_container = ui.column().classes("w-full gap-1")
+                    with transparency_container:
+                        ui.label("Wird beim ersten Öffnen dieses Tabs geladen …").classes("text-xs text-slate-400")
+
+                    def load_transparency_view():
+                        transparency_container.clear()
+                        with transparency_container:
+                            ui.spinner(size="lg").classes("mx-auto my-6")
+                            ui.label("Lade Erkennungslogik...").classes("text-xs text-slate-400 text-center w-full")
+
+                        def fetch_overview():
+                            with _model_lock:
+                                anon = get_synced_cached_anonymizer(state)
+                                return anon.get_entity_source_overview()
+
+                        async def load_and_render():
+                            try:
+                                overview = await asyncio.to_thread(fetch_overview)
+                            except Exception as ex:
+                                transparency_container.clear()
+                                with transparency_container:
+                                    ui.label(f"Fehler beim Laden: {ex}").classes("text-xs text-rose-600")
+                                return
+                            transparency_container.clear()
+                            with transparency_container:
+                                render_entity_source_overview(overview)
+
+                        asyncio.create_task(load_and_render())
 
 
 def main():
