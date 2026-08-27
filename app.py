@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 # Ensure src is in python path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from fastapi import Request
 from nicegui import app, ui
 
 from local_anonymizer.anonymizer import (
@@ -411,6 +412,59 @@ def native_export_folder(stem: str, anon_text: str, mapping: dict, report: dict,
     return None
 
 
+# Global UI handles for direct reactive updates
+ui_handles: Dict[str, Any] = {
+    "raw_text_area": None,
+    "analyze_btn": None,
+    "reset_btn": None,
+    "file_badge_card": None,
+    "file_badge_label": None,
+    "upload_status_label": None,
+}
+
+
+def load_content_into_workspace(text: str, filename: str):
+    """Unified workspace loader with instant reactive updates."""
+    state.filename = filename
+    state.raw_text = text
+    if ui_handles["raw_text_area"] is not None:
+        ui_handles["raw_text_area"].value = text
+    if ui_handles["analyze_btn"] is not None:
+        ui_handles["analyze_btn"].set_enabled(bool(text and text.strip()))
+    if ui_handles["reset_btn"] is not None:
+        ui_handles["reset_btn"].set_visibility(bool(text and text.strip()))
+    if ui_handles["file_badge_card"] is not None and ui_handles["file_badge_label"] is not None:
+        if filename:
+            ui_handles["file_badge_label"].set_text(f"{filename} ({len(text)} Zeichen)")
+            ui_handles["file_badge_card"].set_visibility(True)
+        else:
+            ui_handles["file_badge_card"].set_visibility(False)
+    if ui_handles["upload_status_label"] is not None:
+        ui_handles["upload_status_label"].set_visibility(False)
+    ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.", type="positive")
+
+
+# Fast API endpoint for seamless HTML5 Drag-and-Drop
+@app.post("/api/upload_drop")
+async def handle_api_upload_drop(request: Request):
+    try:
+        body = await request.json()
+        filename = body.get("filename", "dokument")
+        base64_str = body.get("base64", "")
+        raw_bytes = base64.b64decode(base64_str)
+        text = read_document_from_bytes(raw_bytes, filename)
+        load_content_into_workspace(text, filename)
+        return {"status": "ok", "filename": filename, "chars": len(text)}
+    except Exception as ex:
+        err_msg = f"{type(ex).__name__}: {str(ex)}"
+        logging.error(f"Drop API error: {err_msg}", exc_info=True)
+        if ui_handles["upload_status_label"] is not None:
+            ui_handles["upload_status_label"].set_text(f"❌ Fehler beim Laden: {err_msg}")
+            ui_handles["upload_status_label"].classes("text-negative text-xs font-bold")
+            ui_handles["upload_status_label"].set_visibility(True)
+        return {"status": "error", "message": err_msg}
+
+
 # --- UI Building ---
 def create_ui():
     ui.colors(primary="#1976D2", secondary="#26A69A", accent="#9C27B0", positive="#2E7D32", warning="#F57C00", negative="#C62828")
@@ -427,26 +481,12 @@ def create_ui():
     preview_holder = None
     table_holder = None
     export_holder = None
-    raw_text_area = None
     progress_holder = None
-    upload_status_label = None
-    file_badge_card = None
-    file_badge_label = None
-    analyze_btn = None
-    reset_btn = None
     ignore_container = None
     glossary_container = None
     restore_anon_input = None
     map_json_input = None
     restored_preview = None
-
-    def update_file_badge_state():
-        if file_badge_card is not None and file_badge_label is not None:
-            if state.filename:
-                file_badge_label.set_text(f"{state.filename} ({len(state.raw_text)} Zeichen)")
-                file_badge_card.set_visibility(True)
-            else:
-                file_badge_card.set_visibility(False)
 
     def render_ignore_list_ui():
         if not ignore_container:
@@ -645,8 +685,8 @@ def create_ui():
             return
 
         # Show visual indicators immediately (< 20ms)
-        if analyze_btn:
-            analyze_btn.props("loading")
+        if ui_handles["analyze_btn"]:
+            ui_handles["analyze_btn"].props("loading")
         if progress_holder:
             progress_holder.clear()
             with progress_holder:
@@ -707,44 +747,10 @@ def create_ui():
             logging.error(f"Analysis error: {e}", exc_info=True)
             ui.notify(f"Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
         finally:
-            if analyze_btn:
-                analyze_btn.props(remove="loading")
+            if ui_handles["analyze_btn"]:
+                ui_handles["analyze_btn"].props(remove="loading")
             if progress_holder:
                 progress_holder.clear()
-
-    def load_content_into_workspace(text: str, filename: str):
-        """Unified workspace loader with instant reactive updates."""
-        state.filename = filename
-        state.raw_text = text
-        if raw_text_area is not None:
-            raw_text_area.value = text
-        if analyze_btn is not None:
-            analyze_btn.set_enabled(bool(text and text.strip()))
-        if reset_btn is not None:
-            reset_btn.set_visibility(bool(text and text.strip()))
-        update_file_badge_state()
-        if upload_status_label is not None:
-            upload_status_label.set_visibility(False)
-        ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.", type="positive")
-
-    def handle_dropped_file_event(e):
-        """Handle HTML5 drag-and-drop file event received from frontend."""
-        try:
-            filename = e.args.get("filename", "dokument")
-            base64_str = e.args.get("base64", "")
-            raw_bytes = base64.b64decode(base64_str)
-            text = read_document_from_bytes(raw_bytes, filename)
-            load_content_into_workspace(text, filename)
-        except Exception as ex:
-            err_msg = f"{type(ex).__name__}: {str(ex)}"
-            logging.error(f"Drop error: {err_msg}", exc_info=True)
-            ui.notify(f"Fehler beim Laden der abgelegten Datei: {err_msg}", type="negative", timeout=15000)
-            if upload_status_label is not None:
-                upload_status_label.set_text(f"❌ Fehler: {err_msg}")
-                upload_status_label.classes("text-negative text-xs font-bold")
-                upload_status_label.set_visibility(True)
-
-    ui.on("file_drop_event", handle_dropped_file_event)
 
     def open_native_file_dialog():
         """Open native OS file picker with full Win32 lock-sharing support."""
@@ -776,12 +782,10 @@ def create_ui():
             err_msg = f"{type(ex).__name__}: {str(ex)}"
             logging.error(f"Native file open error: {err_msg}", exc_info=True)
             ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
-            if upload_status_label is not None:
-                upload_status_label.set_text(f"❌ Fehler beim Laden: {err_msg}")
-                upload_status_label.classes("text-negative text-xs font-bold")
-                upload_status_label.set_visibility(True)
-
-    ui.on("request_native_dialog", lambda _: open_native_file_dialog())
+            if ui_handles["upload_status_label"] is not None:
+                ui_handles["upload_status_label"].set_text(f"❌ Fehler beim Laden: {err_msg}")
+                ui_handles["upload_status_label"].classes("text-negative text-xs font-bold")
+                ui_handles["upload_status_label"].set_visibility(True)
 
     def reset_workspace():
         """Reset raw text, filename, and analysis table."""
@@ -790,21 +794,22 @@ def create_ui():
         state.entity_groups = []
         state.current_mapping = {}
         state.current_anon_text = ""
-        if raw_text_area is not None:
-            raw_text_area.value = ""
+        if ui_handles["raw_text_area"] is not None:
+            ui_handles["raw_text_area"].value = ""
         if preview_holder is not None:
             preview_holder.clear()
         if export_holder is not None:
             export_holder.clear()
         if table_holder is not None:
             table_holder.clear()
-        if upload_status_label is not None:
-            upload_status_label.set_visibility(False)
-        update_file_badge_state()
-        if analyze_btn is not None:
-            analyze_btn.set_enabled(False)
-        if reset_btn is not None:
-            reset_btn.set_visibility(False)
+        if ui_handles["upload_status_label"] is not None:
+            ui_handles["upload_status_label"].set_visibility(False)
+        if ui_handles["file_badge_card"] is not None:
+            ui_handles["file_badge_card"].set_visibility(False)
+        if ui_handles["analyze_btn"] is not None:
+            ui_handles["analyze_btn"].set_enabled(False)
+        if ui_handles["reset_btn"] is not None:
+            ui_handles["reset_btn"].set_visibility(False)
         ui.notify("Workspace zurückgesetzt.", type="info", icon="delete_sweep")
 
     def get_sorted_groups() -> List[EntityGroup]:
@@ -1193,47 +1198,101 @@ def create_ui():
                 with ui.tab_panel(tab_anonymize):
                     ui.label("Stufe 1: Dokument laden & Text-Eingabe").classes("text-base font-bold text-slate-800 mb-1")
                     
-                    # 100% Unified HTML5 Drop-Zone (Click to pick OR drag-and-drop directly anywhere onto the box)
-                    ui.html("""
-                    <div id="unified_dropzone"
-                         onclick="emitEvent('request_native_dialog')"
-                         ondragover="event.preventDefault(); this.style.borderColor='#2563eb'; this.style.backgroundColor='#eff6ff';"
-                         ondragleave="this.style.borderColor='#93c5fd'; this.style.backgroundColor='#f8fafc';"
-                         ondrop="event.preventDefault(); this.style.borderColor='#93c5fd'; this.style.backgroundColor='#f8fafc'; if(event.dataTransfer.files.length > 0) { const f = event.dataTransfer.files[0]; const r = new FileReader(); r.onload = (e) => emitEvent('file_drop_event', { filename: f.name, base64: e.target.result.split(',')[1] }); r.readAsDataURL(f); }"
-                         style="width: 100%; padding: 1.5rem 1rem; background-color: #f8fafc; border: 2px dashed #93c5fd; border-radius: 0.75rem; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; cursor: pointer; transition: all 0.15s ease-in-out; margin-bottom: 0.75rem;">
-                        <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.25rem;">
-                            <span class="q-icon material-icons" style="font-size: 1.75rem; color: #1976d2;">cloud_upload</span>
-                            <span style="font-size: 0.95rem; font-weight: 700; color: #1e293b;">Datei hier ablegen oder zum Auswählen klicken</span>
-                        </div>
-                        <span style="font-size: 0.75rem; color: #64748b;">Unterstützt Word (.docx), PDF, Text (.txt, .md), CSV und JSON • Automatische Struktur-Erkennung</span>
-                    </div>
-                    """).classes("w-full")
+                    # 100% Unified Interactive Drop-Zone (Click to pick via Windows Explorer, OR Drag & Drop onto box)
+                    with ui.card().classes(
+                        "w-full p-6 bg-slate-50 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-2 select-none"
+                    ).props('id="unified_dropzone"').on("click", open_native_file_dialog):
+                        with ui.row().classes("items-center gap-2 mb-1 pointer-events-none"):
+                            ui.icon("cloud_upload", size="md").classes("text-primary")
+                            ui.label("Datei hier ablegen oder zum Auswählen klicken").classes("text-sm font-bold text-slate-800")
+                        ui.label("Unterstützt Word (.docx), PDF, Text (.txt, .md), CSV und JSON • Automatische Struktur-Erkennung").classes("text-xs text-slate-500 pointer-events-none")
+
+                    # Injected HTML5 Drag & Drop Script for the dropzone
+                    ui.add_body_html("""
+                    <script>
+                    (function() {
+                        function setupDropzone() {
+                            const el = document.getElementById('unified_dropzone');
+                            if (!el) return;
+                            if (el._dropzoneAttached) return;
+                            el._dropzoneAttached = true;
+
+                            window.addEventListener('dragover', function(e) { e.preventDefault(); }, false);
+                            window.addEventListener('drop', function(e) { e.preventDefault(); }, false);
+
+                            el.addEventListener('dragover', function(e) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                el.style.borderColor = '#2563eb';
+                                el.style.backgroundColor = '#eff6ff';
+                            }, false);
+
+                            el.addEventListener('dragleave', function(e) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                el.style.borderColor = '#93c5fd';
+                                el.style.backgroundColor = '#f8fafc';
+                            }, false);
+
+                            el.addEventListener('drop', function(e) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                el.style.borderColor = '#93c5fd';
+                                el.style.backgroundColor = '#f8fafc';
+                                const files = e.dataTransfer.files;
+                                if (!files || files.length === 0) return;
+                                const file = files[0];
+                                const reader = new FileReader();
+                                reader.onload = function(evt) {
+                                    const b64 = evt.target.result.split(',')[1];
+                                    fetch('/api/upload_drop', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ filename: file.name, base64: b64 })
+                                    });
+                                };
+                                reader.readAsDataURL(file);
+                            }, false);
+                        }
+                        if (document.readyState === 'loading') {
+                            document.addEventListener('DOMContentLoaded', setupDropzone);
+                        } else {
+                            setupDropzone();
+                        }
+                        setInterval(setupDropzone, 500);
+                    })();
+                    </script>
+                    """)
 
                     # Document info badge when loaded (with remove button)
                     with ui.row().classes("w-full mb-2 items-center gap-2") as file_badge_card:
                         file_badge_card.set_visibility(False)
+                        ui_handles["file_badge_card"] = file_badge_card
                         with ui.row().classes("items-center gap-2 bg-blue-100 border border-blue-300 rounded-lg px-3 py-1 text-xs text-blue-950"):
                             ui.icon("description", size="xs").classes("text-blue-700")
                             file_badge_label = ui.label("").classes("font-bold font-mono")
+                            ui_handles["file_badge_label"] = file_badge_label
                             ui.button(icon="close", on_click=reset_workspace).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-1").tooltip("Geladenes Dokument entfernen")
 
                     upload_status_label = ui.label("").classes("text-xs font-bold mb-2")
                     upload_status_label.set_visibility(False)
+                    ui_handles["upload_status_label"] = upload_status_label
 
                     with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note", value=True).classes("w-full mb-2"):
                         def on_raw_text_change(e):
                             state.raw_text = e.value or ""
                             has_content = bool(state.raw_text and state.raw_text.strip())
-                            if analyze_btn is not None:
-                                analyze_btn.set_enabled(has_content)
-                            if reset_btn is not None:
-                                reset_btn.set_visibility(has_content)
+                            if ui_handles["analyze_btn"] is not None:
+                                ui_handles["analyze_btn"].set_enabled(has_content)
+                            if ui_handles["reset_btn"] is not None:
+                                ui_handles["reset_btn"].set_visibility(has_content)
 
                         raw_text_area = ui.textarea(
                             value=state.raw_text,
                             placeholder="Text hier eingeben oder Dokument oben hineinziehen...",
                             on_change=on_raw_text_change,
                         ).props("outlined rows=6").classes("w-full font-mono text-sm")
+                        ui_handles["raw_text_area"] = raw_text_area
 
                     # Prominent Analysis & Workspace Reset Buttons in Action Row
                     with ui.row().classes("w-full items-center justify-between mt-1 mb-4 gap-3 flex-wrap"):
@@ -1244,6 +1303,7 @@ def create_ui():
                             on_click=run_analysis,
                         ).props("unelevated").classes("px-4 py-2 font-bold")
                         analyze_btn.set_enabled(bool(state.raw_text and state.raw_text.strip()))
+                        ui_handles["analyze_btn"] = analyze_btn
 
                         reset_btn = ui.button(
                             "🗑️ Workspace zurücksetzen",
@@ -1252,6 +1312,7 @@ def create_ui():
                             on_click=reset_workspace,
                         ).props("outline dense").tooltip("Workspace leeren (Text, Dokument, Tabelle und Vorschau)")
                         reset_btn.set_visibility(bool(state.raw_text and state.raw_text.strip()))
+                        ui_handles["reset_btn"] = reset_btn
 
                     progress_holder = ui.column().classes("w-full")
 
