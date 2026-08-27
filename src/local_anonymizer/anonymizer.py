@@ -59,6 +59,25 @@ def clean_tag(text: str) -> str:
     return cleaned.strip("_")
 
 
+def trim_entity_span(text: str, start: int, end: int) -> Tuple[int, int]:
+    """Trim leading/trailing HTML tags, whitespace, markdown syntax, and punctuation from entity bounds."""
+    s, e = start, end
+    tag_pattern = r"</?br\s*/?>|</?\w+\s*/?>|</?br|<|/?>|\s+|[*\-_`~,:;.!?()\[\]{}|]"
+    while s < e:
+        m = re.match(r"^(?:" + tag_pattern + r")+", text[s:e], flags=re.IGNORECASE)
+        if m:
+            s += m.end()
+        else:
+            break
+    while e > s:
+        m = re.search(r"(?:" + tag_pattern + r")+$", text[s:e], flags=re.IGNORECASE)
+        if m:
+            e -= (len(text[s:e]) - m.start())
+        else:
+            break
+    return s, e
+
+
 @dataclass
 class DetectedEntity:
     """Represents an entity detected in the text."""
@@ -349,9 +368,15 @@ class LocalAnonymizer:
         if on_progress:
             on_progress(0.65, "Filterung & Deduplizierung der Fundstellen...")
 
-        # 1. Filter out ignored spans
+        # 1. Trim entity spans and filter out ignored spans
         filtered_results: List[RecognizerResult] = []
         for r in results:
+            clean_s, clean_e = trim_entity_span(text, r.start, r.end)
+            if clean_e <= clean_s or not text[clean_s:clean_e].strip():
+                continue
+            r.start = clean_s
+            r.end = clean_e
+
             is_ignored = any(
                 not (r.end <= ig_start or r.start >= ig_end)
                 for ig_start, ig_end in ignored_spans

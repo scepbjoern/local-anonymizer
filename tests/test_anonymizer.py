@@ -308,6 +308,24 @@ def test_local_anonymizer_analyze_with_progress():
     assert any(r.entity_type == "PERSON" for r in results)
 
 
+def test_trim_entity_span():
+    from local_anonymizer.anonymizer import trim_entity_span
+
+    text = "Dies ist <br>Dr. Andreas Schönenberger<br> und **Julia Meier**."
+    # Case 1: Span includes <br> at start and end
+    s1 = text.find("<br>")
+    e1 = text.find("<br> und") + 4 # slice covering '<br>Dr. Andreas Schönenberger<br>'
+    clean_s1, clean_e1 = trim_entity_span(text, s1, e1)
+    assert text[clean_s1:clean_e1] == "Dr. Andreas Schönenberger"
+
+    # Case 2: Span includes markdown bold ** at start and end
+    s2 = text.find("**Julia")
+    e2 = text.find("Meier**.") + 7 # slice covering '**Julia Meier**'
+    clean_s2, clean_e2 = trim_entity_span(text, s2, e2)
+    assert text[clean_s2:clean_e2] == "Julia Meier"
+
+
+
 
 
 

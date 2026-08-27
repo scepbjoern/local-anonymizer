@@ -162,6 +162,22 @@ def chunk_text_with_offsets(text: str, max_chars: int = 800) -> List[Tuple[int, 
     return chunks
 
 
+def get_optimal_device() -> str:
+    """
+    Detect the optimal compute device for PyTorch / GLiNER inference.
+    Supports NVIDIA GPUs (cuda), Apple Silicon Macs (mps), and CPU fallback.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 class GLiNERRecognizer(EntityRecognizer):
     """Presidio EntityRecognizer that uses GLiNER for multilingual / zero-shot PII detection."""
 
@@ -244,7 +260,7 @@ class GLiNERRecognizer(EntityRecognizer):
     _MODEL_CACHE: Dict[str, GLiNER] = {}
 
     def load(self) -> None:
-        """Load GLiNER model silently (locally if cached, otherwise download without noise)."""
+        """Load GLiNER model silently and transfer to optimal compute device (CUDA / MPS / CPU)."""
         if self.model is None:
             if self.model_name in self._MODEL_CACHE:
                 self.model = self._MODEL_CACHE[self.model_name]
@@ -258,6 +274,13 @@ class GLiNERRecognizer(EntityRecognizer):
                 self.model = GLiNER.from_pretrained(self.model_name)
                 os.environ["HF_HUB_OFFLINE"] = "1"
 
+            device = get_optimal_device()
+            if device != "cpu":
+                try:
+                    self.model.to(device)
+                except Exception:
+                    pass
+
             self._MODEL_CACHE[self.model_name] = self.model
 
     def analyze(
@@ -266,7 +289,7 @@ class GLiNERRecognizer(EntityRecognizer):
         entities: Sequence[str],
         nlp_artifacts=None,
     ) -> List[RecognizerResult]:
-        """Analyze text with GLiNER using chunking to avoid token limit truncations."""
+        """Analyze text with GLiNER using batched multi-core/GPU chunk inference."""
         if not text:
             return []
 
@@ -288,18 +311,31 @@ class GLiNERRecognizer(EntityRecognizer):
 
         # Chunk the text to prevent the 384-token GLiNER truncation limit
         text_chunks = chunk_text_with_offsets(text, max_chars=700)
+        valid_chunks: List[Tuple[int, int, str]] = [
+            (s, e, t) for s, e, t in text_chunks if t.strip()
+        ]
+        if not valid_chunks:
+            return []
+
+        chunk_texts = [c[2] for c in valid_chunks]
         results: List[RecognizerResult] = []
 
-        for chunk_start, chunk_end, chunk_text in text_chunks:
-            if not chunk_text.strip():
-                continue
-
-            predicted_entities = self.model.predict_entities(
-                chunk_text,
+        try:
+            # High-performance batch inference (saturates multi-core CPU SIMD / GPU / Apple Silicon MPS)
+            batch_predictions = self.model.inference(
+                chunk_texts,
                 labels_to_query,
                 threshold=self.threshold,
+                batch_size=8,
             )
+        except Exception:
+            # Fallback to single chunk prediction if inference/batching is unavailable
+            batch_predictions = [
+                self.model.predict_entities(t, labels_to_query, threshold=self.threshold)
+                for t in chunk_texts
+            ]
 
+        for (chunk_start, chunk_end, chunk_text), predicted_entities in zip(valid_chunks, batch_predictions):
             for pred in predicted_entities:
                 gliner_label = pred["label"]
                 presidio_entity = self.label_mapping.get(gliner_label, gliner_label.upper())

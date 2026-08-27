@@ -408,6 +408,42 @@ def save_markdown_to_docx_bytes(md_text: str) -> bytes:
     return buf.getvalue()
 
 
+def clean_extracted_pdf_markdown(md_text: str) -> str:
+    """
+    Clean up artifact tags, picture text boxes, and HTML formatting from extracted PDF markdown.
+    - Normalizes <!-- Start/End of picture text --> into clean text sections.
+    - Converts <br> / <br/> tags into natural linebreaks / word spacing.
+    - Repairs glued PascalCase words (e.g. 'WandhovenWolfgang' -> 'Wandhoven Wolfgang').
+    - Removes zero-width spaces and normalizes excessive blank lines.
+    """
+    if not md_text:
+        return ""
+
+    text = md_text
+
+    # 1. Normalize picture text comment markers
+    text = re.sub(r"<!--\s*Start of picture text\s*-->", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<!--\s*End of picture text\s*-->", "\n\n", text, flags=re.IGNORECASE)
+
+    # 2. Replace HTML line breaks with clean linebreaks
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+
+    # 3. Separate glued PascalCase words in picture/table extractions (lowercase followed by uppercase, ignoring URLs)
+    def _separate_pascal_case(match: re.Match) -> str:
+        s = match.group(0)
+        if "http" in s or "www." in s or "/" in s:
+            return s
+        return re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", s)
+
+    text = re.sub(r"\b[A-Za-zÄÖÜäöüß]{4,}\b", _separate_pascal_case, text)
+
+    # 4. Normalize multiple whitespace and excessive newlines
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
 def extract_text_from_pdf_bytes(
     raw_bytes: bytes,
     filename: str = "document.pdf",
@@ -458,7 +494,7 @@ def extract_text_from_pdf_bytes(
     finally:
         doc.close()
 
-    return md_text.strip()
+    return clean_extracted_pdf_markdown(md_text)
 
 
 def extract_text_from_pdf(path: Path, progress_callback: Optional[Callable[[int, int, str], None]] = None) -> str:
@@ -492,7 +528,7 @@ def extract_text_from_pdf(path: Path, progress_callback: Optional[Callable[[int,
     finally:
         doc.close()
 
-    return md_text.strip()
+    return clean_extracted_pdf_markdown(md_text)
 
 
 def read_document_from_bytes(

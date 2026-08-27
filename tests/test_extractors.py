@@ -269,4 +269,25 @@ def test_read_document_from_bytes_with_progress():
     assert progress_calls[-1][1] == 2
 
 
+def test_clean_extracted_pdf_markdown():
+    from local_anonymizer.extractors import clean_extracted_pdf_markdown
+
+    sample = (
+        "<!-- Start of picture text -->\n"
+        "CEO<br>Dr. Andreas<br>Schönenberger<br>CMO / New<br>Corporate  CFO<br>\n"
+        "Elias Frühauf Jan Schultz Kaspar  WandhovenWolfgang  Tobias Caluori<br>Trachsel<br>\n"
+        "<!-- End of picture text -->"
+    )
+
+    cleaned = clean_extracted_pdf_markdown(sample)
+    # Check that comment markers and <br> are stripped
+    assert "<!-- Start of picture text -->" not in cleaned
+    assert "<!-- End of picture text -->" not in cleaned
+    assert "<br>" not in cleaned
+    # Check that glued PascalCase words are separated
+    assert "Wandhoven Wolfgang" in cleaned
+    assert "Elias Frühauf" in cleaned
+
+
+
 

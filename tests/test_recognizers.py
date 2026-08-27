@@ -29,3 +29,22 @@ def test_fuzzy_glossary_exact_match_priority():
     # Both should be found, but ZHAW should have score 1.0
     zhaw_match = next(r for r in results if r.start == 4)
     assert zhaw_match.score == 1.0
+
+
+def test_get_optimal_device():
+    from local_anonymizer.recognizers import get_optimal_device
+    device = get_optimal_device()
+    assert device in {"cuda", "mps", "cpu"}
+
+
+def test_gliner_batched_multi_chunk_analysis():
+    recognizer = GLiNERRecognizer()
+    long_text = (
+        "Dr. Andreas Schönenberger leitet das Team in Zürich. " * 10 +
+        "Frau Julia Meier arbeitet an der ETH Zürich in Basel. " * 10
+    )
+    results = recognizer.analyze(long_text, entities=["PERSON", "LOCATION", "ORGANIZATION"])
+    assert len(results) > 0
+    assert any(r.entity_type == "PERSON" for r in results)
+    assert any(r.entity_type == "LOCATION" for r in results)
+
