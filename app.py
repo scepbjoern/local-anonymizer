@@ -1232,7 +1232,7 @@ def create_ui():
                                 logging.error(f"Drop error: {err_msg}", exc_info=True)
                                 ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
 
-                        dropzone_card.on("file_dropped", on_file_dropped)
+                        ui.on("file_dropped", on_file_dropped)
 
                         # Hook HTML5 drag events to the card
                         ui.add_body_html(f"""
@@ -1279,22 +1279,14 @@ def create_ui():
                                     const file = files[0];
 
                                     if (file.path) {{
-                                        window.socket.emit('event', {{
-                                            id: cardId,
-                                            name: 'file_dropped',
-                                            args: {{ name: file.name, path: file.path }}
-                                        }});
+                                        emitEvent('file_dropped', {{ name: file.name, path: file.path }});
                                         return;
                                     }}
 
                                     const reader = new FileReader();
                                     reader.onload = function(evt) {{
                                         const b64 = evt.target.result.split(',')[1];
-                                        window.socket.emit('event', {{
-                                            id: cardId,
-                                            name: 'file_dropped',
-                                            args: {{ name: file.name, base64: b64 }}
-                                        }});
+                                        emitEvent('file_dropped', {{ name: file.name, base64: b64 }});
                                     }};
                                     reader.readAsDataURL(file);
                                 }}, false);
