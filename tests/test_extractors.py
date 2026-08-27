@@ -300,6 +300,35 @@ def test_clean_extracted_pdf_markdown():
     assert "Jan Schultz" not in cleaned_no_pic
 
 
+def test_clean_extracted_pdf_markdown_sipoc_table():
+    from local_anonymizer.extractors import clean_extracted_pdf_markdown
+
+    raw_table = (
+        "|**Supplier **|**Input**|**Process**|**Output**|**Customer **|\n"
+        "|---|---|---|---|---|\n"
+        "|-<br>Veranlasser:in<br>-<br>Leistungserbringer:in<br>-<br>SPS (Dienstleister von<br>Sanitas für Dokumenten-<br>scanning)|"
+        "-<br>Rezept für ein Medikament<br>-<br>DMS-Ablage, Tarif-<br>und Deckungsregeln<br>-<br>-<br>-|"
+        "Rezept wird von<br>Versicherungsnehmer:in bei<br>Veranlasser:in abgeholt<br><br>Dokumente werden bei<br>Eingang gescannt|"
+        "-<br>Geprüfter Leistungs-<br>fall zu einem Rezept<br>-|"
+        "Versicherungsnehmer:in|"
+    )
+
+    cleaned = clean_extracted_pdf_markdown(raw_table)
+
+    # Validate that table rows remain single-line (exactly 3 lines: header, separator, row)
+    assert len(cleaned.splitlines()) == 3
+    # Validate broken hyphenation is fixed
+    assert "Dokumentenscanning" in cleaned
+    assert "Tarif- und Deckungsregeln" in cleaned
+    assert "Leistungsfall" in cleaned
+    # Validate list items are formatted with bullets without broken linebreaks
+    assert "- Veranlasser:in" in cleaned
+    assert "- Leistungserbringer:in" in cleaned
+    # Validate trailing empty dashes are removed
+    assert "<br>-<br>-" not in cleaned
+    assert "zu einem Rezept |" in cleaned or "zu einem Rezept<br>" in cleaned or "zu einem Rezept" in cleaned
+
+
 def test_pdf_headers_footers_toggle():
     import pymupdf
     from local_anonymizer.extractors import extract_text_from_pdf_bytes

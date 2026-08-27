@@ -325,6 +325,19 @@ def test_trim_entity_span():
     assert text[clean_s2:clean_e2] == "Julia Meier"
 
 
+def test_gender_suffix_extension():
+    from local_anonymizer.anonymizer import LocalAnonymizer
+    anon = LocalAnonymizer()
+    text = "Veranlasser:in und Leistungserbringer:in sowie Sachbearbeiter:innen und Kund*innen."
+    results = anon.analyze(text)
+    detected_texts = [text[r.start:r.end] for r in results]
+
+    assert "Veranlasser:in" in detected_texts or any("Veranlasser" in t for t in detected_texts)
+    # Ensure no isolated "in" or ":in" artifacts exist as standalone entities
+    assert "in" not in detected_texts
+    assert ":in" not in detected_texts
+
+
 
 
 

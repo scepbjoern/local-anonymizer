@@ -385,7 +385,23 @@ class LocalAnonymizer:
                 if self.enabled_entities is None or r.entity_type in self.enabled_entities:
                     filtered_results.append(r)
 
-        # 2. Deduplicate / resolve overlapping results (prefer longer span, then higher score)
+        # 2. German gender suffix extension (e.g. "Veranlasser" + ":in" -> "Veranlasser:in", "Sachbearbeiter" + ":innen")
+        for r in filtered_results:
+            sub = text[r.end:r.end + 12]
+            m = re.match(r"^([:*_/]in|[:*_/]innen)\b", sub, flags=re.IGNORECASE)
+            if m:
+                r.end += m.end()
+
+        # Filter out standalone gender artifact entities (e.g. isolated "in" or ":in" after a colon/asterisk)
+        filtered_results = [
+            r for r in filtered_results
+            if not (
+                text[r.start:r.end].strip().lower() in ["in", "innen", ":in", ":innen", "*in", "*innen"]
+                and r.start > 0 and text[r.start - 1] in [":", "*", "_", "/", " "]
+            )
+        ]
+
+        # 3. Deduplicate / resolve overlapping results (prefer longer span, then higher score)
         filtered_results.sort(key=lambda r: (r.end - r.start, r.score), reverse=True)
         accepted: List[RecognizerResult] = []
         accepted_spans: List[Tuple[int, int]] = []
@@ -402,7 +418,7 @@ class LocalAnonymizer:
         if on_progress:
             on_progress(0.80, "Genitiv-Erweiterung und Namensanalyse...")
 
-        # 3. German/English genitive extension for recognized PERSON entities (e.g. "Julia" -> "Julias", "Julia's")
+        # 4. German/English genitive extension for recognized PERSON entities (e.g. "Julia" -> "Julias", "Julia's")
         person_results = [r for r in accepted if r.entity_type == "PERSON"]
         genitive_results: List[RecognizerResult] = []
         for r in person_results:

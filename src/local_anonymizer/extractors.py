@@ -450,12 +450,56 @@ def save_markdown_to_docx_bytes(md_text: str) -> bytes:
     return buf.getvalue()
 
 
+def clean_markdown_table_cell(cell: str) -> str:
+    """
+    Format and clean text inside Markdown table cells:
+    - Reconnects broken hyphenations ('Dokumenten-<br>scanning' -> 'Dokumentenscanning', 'Sach-<br>bearbeiter:in' -> 'Sachbearbeiter:in').
+    - Preserves hyphenated conjunctions ('Tarif-<br>und' -> 'Tarif- und').
+    - Fixes broken bullet lists ('-<br>Veranlasser:in' -> '- Veranlasser:in').
+    - Replaces soft intra-sentence linebreaks with a clean space while preserving paragraph breaks (<br><br>).
+    - Removes trailing orphan dashes or empty bullet points.
+    """
+    c = cell.strip()
+    if not c or c == "-":
+        return ""
+
+    # 1. Protect hyphenated conjunctions: 'Tarif- <br> und' -> 'Tarif- und'
+    c = re.sub(r"([A-Za-zÄÖÜäöüß]+-)\s*(?:<br\s*/?>|\n)\s*(und|oder|bzw|sowie)\b", r"\1 \2", c, flags=re.IGNORECASE)
+
+    # 2. Fix broken hyphenated word wraps: 'Dokumenten-<br>scanning' -> 'Dokumentenscanning'
+    c = re.sub(r"([A-Za-zÄÖÜäöüß]+)-\s*(?:<br\s*/?>|\n)\s*([a-zäöüß]+)", r"\1\2", c)
+    c = re.sub(r"([A-Za-zÄÖÜäöüß]+)-\s*(?:<br\s*/?>|\n)\s*([A-ZÄÖÜ][a-zäöüß]+)", r"\1-\2", c)
+
+    # 3. Normalize paragraph double linebreaks
+    c = re.sub(r"(?:<br\s*/?>\s*){2,}", " __PARAGRAPH_BREAK__ ", c)
+
+    # 4. Fix broken bullet points: '-<br>Text' -> '- Text'
+    c = re.sub(r"(?:^|<br\s*/?>|\n)\s*[-•–—]\s*(?:<br\s*/?>|\n)\s*", " __BULLET__ ", c)
+    c = re.sub(r"(?:^|<br\s*/?>|\n)\s*[-•–—]\s+", " __BULLET__ ", c)
+
+    # 5. Replace single soft linebreaks within flow text with a space
+    c = re.sub(r"<br\s*/?>|\n", " ", c)
+
+    # 6. Reconstruct bullets and paragraphs
+    c = c.replace("__BULLET__", "<br>- ")
+    c = c.replace("__PARAGRAPH_BREAK__", "<br><br>")
+
+    # 7. Strip trailing empty bullets / dashes (e.g. '<br>- <br>- ')
+    c = re.sub(r"(?:<br\s*/?>\s*[-•–—\s]*)+$", "", c, flags=re.IGNORECASE)
+    c = re.sub(r"[\s\-•–—]+$", "", c)
+    c = re.sub(r"^(?:<br\s*/?>|\s)*", "", c)
+    c = re.sub(r"[ \t]+", " ", c)
+
+    return c.strip()
+
+
 def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True) -> str:
     """
-    Clean up artifact tags, picture text boxes, and HTML formatting from extracted PDF markdown.
+    Clean up artifact tags, picture text boxes, table cells, and HTML formatting from extracted PDF markdown.
     - Removes inline HTML tags like <mark>, <u>, <ins>, <span>, <font>, <del>, <strike> while preserving their text.
     - If extract_picture_text is False: Completely strips <!-- Start/End of picture text --> blocks.
     - If extract_picture_text is True: Normalizes picture text blocks, breaks <br>, and repairs glued PascalCase words.
+    - Formats markdown tables so rows remain single-line, bullet items are cleanly formatted, and trailing dashes are stripped.
     """
     if not md_text:
         return ""
@@ -474,22 +518,38 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
         text = re.sub(r"<!--\s*Start of picture text\s*-->", "\n\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<!--\s*End of picture text\s*-->", "\n\n", text, flags=re.IGNORECASE)
 
-        # Replace HTML line breaks with clean linebreaks
-        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    # 3. Clean markdown tables specifically so cell linebreaks (<br>) and list bullets are preserved without breaking table rows
+    lines = text.splitlines()
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 3:
+            parts = stripped.split("|")
+            cells = parts[1:-1]
+            if all(re.match(r"^:?-+:?$", c.strip()) for c in cells if c.strip()):
+                cleaned_lines.append("| " + " | ".join(c.strip() for c in cells) + " |")
+                continue
+            cleaned_cells = [clean_markdown_table_cell(c) for c in cells]
+            cleaned_lines.append("| " + " | ".join(cleaned_cells) + " |")
+        else:
+            # Outside tables: replace <br> with newlines and separate PascalCase words
+            l = re.sub(r"<br\s*/?>", "\n", stripped, flags=re.IGNORECASE)
+            if extract_picture_text:
+                l = re.sub(
+                    r"\b[A-Za-zÄÖÜäöüß]{4,}\b",
+                    lambda m: re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", m.group(0))
+                    if "http" not in m.group(0) and "/" not in m.group(0)
+                    else m.group(0),
+                    l,
+                )
+            cleaned_lines.append(l)
 
-        # Separate glued PascalCase words in picture/table extractions (lowercase followed by uppercase, ignoring URLs)
-        def _separate_pascal_case(match: re.Match) -> str:
-            s = match.group(0)
-            if "http" in s or "www." in s or "/" in s:
-                return s
-            return re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", s)
+    text = "\n".join(cleaned_lines)
 
-        text = re.sub(r"\b[A-Za-zÄÖÜäöüß]{4,}\b", _separate_pascal_case, text)
-
-    # 3. Clean any remaining orphan comments or brackets
+    # 4. Clean any remaining orphan comments or brackets
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
 
-    # 4. Normalize multiple whitespace and excessive newlines
+    # 5. Normalize multiple whitespace and excessive newlines
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
