@@ -1,4 +1,4 @@
-' Privacy-First Local Anonymizer - Silent Windows Launcher
+' Privacy-First Local Anonymizer - Silent Direct Windows Launcher
 Set FSO = CreateObject("Scripting.FileSystemObject")
 Set WshShell = CreateObject("WScript.Shell")
 
@@ -7,9 +7,7 @@ WshShell.CurrentDirectory = scriptDir
 
 pyExe = scriptDir & "\.venv\Scripts\pythonw.exe"
 If FSO.FileExists(pyExe) Then
-    ' Launch splash screen using pythonw directly (instant < 50ms, 0 console, 0 uv lock collision)
-    WshShell.Run """" & pyExe & """ splash.py", 0, False
-    ' Launch main application
+    ' Launch main application directly (< 200ms instant UI, zero splash delay)
     WshShell.Run """" & pyExe & """ app.py", 0, False
 Else
     ' Fallback to uv

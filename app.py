@@ -1,6 +1,7 @@
 """
 Privacy-First Local Anonymizer - NiceGUI Interactive Review Application.
 Runs completely locally and offline with in-memory processing.
+Instant startup with asynchronous background model initialization.
 """
 
 import argparse
@@ -21,8 +22,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 # Ensure src is in python path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from fastapi import File, Form, Request, UploadFile
-from nicegui import Client, app, ui
+from nicegui import app, ui
 
 from local_anonymizer.anonymizer import (
     AnonymizationResult,
@@ -46,9 +46,6 @@ from local_anonymizer.extractors import (
 
 # Silence presidio analyzer language mismatch warnings
 logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
-
-# Signal file for splash screen coordination
-READY_FLAG = CONFIG_DIR / "splash_ready.tmp"
 
 
 # --- Data Models for Grouped Review ---
@@ -102,7 +99,6 @@ class AppState:
         self.config: AppConfig = AppConfig.load()
         self.filename: str = ""
         self.raw_text: str = ""
-        self.anonymizer: Optional[LocalAnonymizer] = None
         self.entity_groups: List[EntityGroup] = []
         self.active_entities: List[str] = list(self.config.active_entities)
         self.format_mode: str = self.config.format_mode  # "numbered", "numbered_role", "role_only"
@@ -125,6 +121,12 @@ class AppState:
 
 
 state = AppState()
+
+# Global background model warmup state
+_cached_anonymizer: Optional[LocalAnonymizer] = None
+_model_ready_event = asyncio.Event()
+_model_loading_started = False
+
 
 # Supported entity labels
 AVAILABLE_ENTITIES = [
@@ -224,6 +226,28 @@ def build_anonymizer() -> LocalAnonymizer:
         enabled_entities=state.active_entities if state.active_entities else None,
         gliner_threshold=state.gliner_threshold,
     )
+
+
+def _warmup_model_thread():
+    """Background worker to initialize GLiNER and Presidio."""
+    global _cached_anonymizer
+    try:
+        logging.info("Asynchronously pre-loading GLiNER AI model in background...")
+        _cached_anonymizer = build_anonymizer()
+        logging.info("GLiNER AI model pre-loaded successfully.")
+    except Exception as e:
+        logging.error(f"Error during model preloading: {e}", exc_info=True)
+
+
+async def ensure_model_loaded():
+    """Ensure the background model is fully loaded before analysis."""
+    global _model_loading_started
+    if not _model_loading_started:
+        _model_loading_started = True
+        await asyncio.to_thread(_warmup_model_thread)
+        _model_ready_event.set()
+    elif not _model_ready_event.is_set():
+        await _model_ready_event.wait()
 
 
 def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
@@ -412,94 +436,6 @@ def native_export_folder(stem: str, anon_text: str, mapping: dict, report: dict,
     return None
 
 
-# Global UI handles for direct reactive updates
-ui_handles: Dict[str, Any] = {
-    "raw_text_area": None,
-    "analyze_btn": None,
-    "reset_btn": None,
-    "file_badge_card": None,
-    "file_badge_label": None,
-    "upload_status_label": None,
-}
-
-
-def load_content_into_workspace(text: str, filename: str):
-    """Unified workspace loader with instant reactive updates across all client contexts."""
-    state.filename = filename
-    state.raw_text = text
-
-    if Client.instances:
-        for client in list(Client.instances.values()):
-            try:
-                with client:
-                    if ui_handles["raw_text_area"] is not None:
-                        ui_handles["raw_text_area"].value = text
-                    if ui_handles["analyze_btn"] is not None:
-                        ui_handles["analyze_btn"].set_enabled(bool(text and text.strip()))
-                    if ui_handles["reset_btn"] is not None:
-                        ui_handles["reset_btn"].set_visibility(bool(text and text.strip()))
-                    if ui_handles["file_badge_card"] is not None and ui_handles["file_badge_label"] is not None:
-                        if filename:
-                            ui_handles["file_badge_label"].set_text(f"{filename} ({len(text)} Zeichen)")
-                            ui_handles["file_badge_card"].set_visibility(True)
-                        else:
-                            ui_handles["file_badge_card"].set_visibility(False)
-                    if ui_handles["upload_status_label"] is not None:
-                        ui_handles["upload_status_label"].set_visibility(False)
-                    ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.", type="positive")
-            except Exception as e:
-                logging.debug(f"Client update error: {e}")
-    else:
-        if ui_handles["raw_text_area"] is not None:
-            ui_handles["raw_text_area"].value = text
-
-
-# Fast API endpoint for seamless HTML5 Drag-and-Drop (supports FormData and direct filepaths)
-@app.post("/api/upload_drop")
-async def handle_api_upload_drop(
-    file: Optional[UploadFile] = File(None),
-    filepath: Optional[str] = Form(None),
-    raw_body: Optional[Request] = None,
-):
-    try:
-        raw_bytes = b""
-        filename = "dokument"
-
-        if filepath and Path(filepath).exists():
-            raw_bytes = safe_read_bytes(filepath)
-            filename = Path(filepath).name
-        elif file is not None:
-            raw_bytes = await file.read()
-            filename = file.filename or "dokument"
-        elif raw_body is not None:
-            try:
-                data_json = await raw_body.json()
-                if "filepath" in data_json and Path(data_json["filepath"]).exists():
-                    raw_bytes = safe_read_bytes(data_json["filepath"])
-                    filename = Path(data_json["filepath"]).name
-                elif "base64" in data_json:
-                    raw_bytes = base64.b64decode(data_json["base64"])
-                    filename = data_json.get("filename", "dokument")
-            except Exception:
-                pass
-
-        if not raw_bytes:
-            raise ValueError("Keine Dateidaten empfangen")
-
-        text = read_document_from_bytes(raw_bytes, filename)
-        load_content_into_workspace(text, filename)
-        return {"status": "ok", "filename": filename, "chars": len(text)}
-
-    except Exception as ex:
-        err_msg = f"{type(ex).__name__}: {str(ex)}"
-        logging.error(f"Drop API error: {err_msg}", exc_info=True)
-        if ui_handles["upload_status_label"] is not None:
-            ui_handles["upload_status_label"].set_text(f"❌ Fehler beim Laden: {err_msg}")
-            ui_handles["upload_status_label"].classes("text-negative text-xs font-bold")
-            ui_handles["upload_status_label"].set_visibility(True)
-        return {"status": "error", "message": err_msg}
-
-
 # --- UI Building ---
 def create_ui():
     ui.colors(primary="#1976D2", secondary="#26A69A", accent="#9C27B0", positive="#2E7D32", warning="#F57C00", negative="#C62828")
@@ -510,18 +446,139 @@ def create_ui():
             ui.icon("lock", size="md").classes("text-teal-400")
             ui.label("Privacy-First Local Anonymizer").classes("text-xl font-bold")
             ui.badge("100% Lokal & Offline", color="teal").props("outline")
-        ui.label("Review & Korrektur Workspace").classes("text-sm text-slate-300")
+        
+        # Dynamic AI model warmup status indicator
+        with ui.row().classes("items-center gap-2"):
+            model_spinner = ui.spinner(size="xs", color="teal")
+            model_status_label = ui.label("KI-Modell lädt im Hintergrund...").classes("text-xs text-teal-200")
+
+            async def poll_model_status():
+                if not _model_ready_event.is_set():
+                    await _model_ready_event.wait()
+                model_spinner.set_visibility(False)
+                model_status_label.set_text("✅ KI-Modell bereit")
+                model_status_label.classes("text-teal-300 font-bold")
+
+            ui.timer(0.2, poll_model_status, once=True)
 
     # Reactive UI container holders
     preview_holder = None
     table_holder = None
     export_holder = None
+    raw_text_area = None
     progress_holder = None
+    upload_ui_elem = None
+    file_badge_card = None
+    file_badge_label = None
+    analyze_btn = None
+    reset_btn = None
     ignore_container = None
     glossary_container = None
     restore_anon_input = None
     map_json_input = None
     restored_preview = None
+
+    def load_content_into_workspace(text: str, filename: str):
+        """Unified workspace loader with instant reactive updates."""
+        state.filename = filename
+        state.raw_text = text
+        if raw_text_area is not None:
+            raw_text_area.value = text
+        if analyze_btn is not None:
+            analyze_btn.set_enabled(bool(text and text.strip()))
+        if reset_btn is not None:
+            reset_btn.set_visibility(bool(text and text.strip()))
+        if file_badge_card is not None and file_badge_label is not None:
+            if filename:
+                file_badge_label.set_text(f"{filename} ({len(text)} Zeichen)")
+                file_badge_card.set_visibility(True)
+            else:
+                file_badge_card.set_visibility(False)
+        if upload_ui_elem is not None:
+            upload_ui_elem.reset()
+        ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen).", type="positive")
+
+    async def handle_upload(e):
+        try:
+            if hasattr(e, "file") and e.file is not None:
+                data = await e.file.read()
+                filename = e.file.name
+            elif hasattr(e, "content") and e.content is not None:
+                data = e.content.read()
+                filename = getattr(e, "name", "document")
+            else:
+                raise ValueError("Unbekanntes Upload-Format")
+
+            text = read_document_from_bytes(data, filename)
+            load_content_into_workspace(text, filename)
+        except Exception as ex:
+            err_msg = f"{type(ex).__name__}: {str(ex)}"
+            logging.error(f"Upload error: {err_msg}", exc_info=True)
+            ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
+        finally:
+            if upload_ui_elem is not None:
+                upload_ui_elem.reset()
+
+    def handle_rejected(e):
+        ui.notify("Dateiformat nicht unterstützt.", type="negative", timeout=10000)
+        if upload_ui_elem is not None:
+            upload_ui_elem.reset()
+
+    def open_native_file_dialog():
+        """Open native OS file picker with full Win32 lock-sharing support."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            filepath = filedialog.askopenfilename(
+                title="Dokument zum Anonymisieren auswählen",
+                filetypes=[
+                    ("Unterstützte Dokumente (*.docx, *.pdf, *.txt, *.md, *.csv, *.json)", "*.docx;*.pdf;*.txt;*.md;*.csv;*.json"),
+                    ("Word-Dokumente (*.docx)", "*.docx"),
+                    ("PDF-Dokumente (*.pdf)", "*.pdf"),
+                    ("Text & Markdown (*.txt, *.md)", "*.txt;*.md"),
+                    ("Tabellen & Daten (*.csv, *.json)", "*.csv;*.json"),
+                    ("Alle Dateien (*.*)", "*.*"),
+                ]
+            )
+            root.destroy()
+            if filepath:
+                p = Path(filepath)
+                # safe_read_bytes opens with FILE_SHARE_READ | FILE_SHARE_WRITE so files open in Word/OneDrive load cleanly
+                data = safe_read_bytes(p)
+                text = read_document_from_bytes(data, p.name)
+                load_content_into_workspace(text, p.name)
+        except Exception as ex:
+            err_msg = f"{type(ex).__name__}: {str(ex)}"
+            logging.error(f"Native file open error: {err_msg}", exc_info=True)
+            ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
+
+    def reset_workspace():
+        """Reset raw text, filename, and analysis table."""
+        state.filename = ""
+        state.raw_text = ""
+        state.entity_groups = []
+        state.current_mapping = {}
+        state.current_anon_text = ""
+        if raw_text_area is not None:
+            raw_text_area.value = ""
+        if preview_holder is not None:
+            preview_holder.clear()
+        if export_holder is not None:
+            export_holder.clear()
+        if table_holder is not None:
+            table_holder.clear()
+        if file_badge_card is not None:
+            file_badge_card.set_visibility(False)
+        if upload_ui_elem is not None:
+            upload_ui_elem.reset()
+        if analyze_btn is not None:
+            analyze_btn.set_enabled(False)
+        if reset_btn is not None:
+            reset_btn.set_visibility(False)
+        ui.notify("Workspace zurückgesetzt.", type="info", icon="delete_sweep")
 
     def render_ignore_list_ui():
         if not ignore_container:
@@ -720,8 +777,8 @@ def create_ui():
             return
 
         # Show visual indicators immediately (< 20ms)
-        if ui_handles["analyze_btn"]:
-            ui_handles["analyze_btn"].props("loading")
+        if analyze_btn:
+            analyze_btn.props("loading")
         if progress_holder:
             progress_holder.clear()
             with progress_holder:
@@ -732,15 +789,21 @@ def create_ui():
             with table_holder:
                 with ui.row().classes("items-center gap-3 p-4 bg-blue-50 rounded border border-blue-200"):
                     ui.spinner(size="md", color="primary")
-                    ui.label("Dokument wird lokal analysiert (NER, Markdown, Genitiv- & Struktur-Erkennung)...").classes("text-slate-700 text-sm font-medium")
+                    msg = "KI-Modell wird vorbereitet..." if not _model_ready_event.is_set() else "Dokument wird lokal analysiert (NER, Markdown, Struktur)..."
+                    ui.label(msg).classes("text-slate-700 text-sm font-medium")
 
         # Yield to event loop so DOM updates render immediately in the browser
         await asyncio.sleep(0.02)
 
         try:
+            # Ensure model is ready
+            await ensure_model_loaded()
+
             def do_analysis(text):
-                anonymizer = build_anonymizer()
-                return anonymizer.analyze(text)
+                global _cached_anonymizer
+                if _cached_anonymizer is None:
+                    _cached_anonymizer = build_anonymizer()
+                return _cached_anonymizer.analyze(text)
 
             results = await asyncio.to_thread(do_analysis, state.raw_text)
 
@@ -782,70 +845,10 @@ def create_ui():
             logging.error(f"Analysis error: {e}", exc_info=True)
             ui.notify(f"Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
         finally:
-            if ui_handles["analyze_btn"]:
-                ui_handles["analyze_btn"].props(remove="loading")
+            if analyze_btn:
+                analyze_btn.props(remove="loading")
             if progress_holder:
                 progress_holder.clear()
-
-    def open_native_file_dialog():
-        """Open native OS file picker with full Win32 lock-sharing support."""
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            filepath = filedialog.askopenfilename(
-                title="Dokument zum Anonymisieren auswählen",
-                filetypes=[
-                    ("Unterstützte Dokumente (*.docx, *.pdf, *.txt, *.md, *.csv, *.json)", "*.docx;*.pdf;*.txt;*.md;*.csv;*.json"),
-                    ("Word-Dokumente (*.docx)", "*.docx"),
-                    ("PDF-Dokumente (*.pdf)", "*.pdf"),
-                    ("Text & Markdown (*.txt, *.md)", "*.txt;*.md"),
-                    ("Tabellen & Daten (*.csv, *.json)", "*.csv;*.json"),
-                    ("Alle Dateien (*.*)", "*.*"),
-                ]
-            )
-            root.destroy()
-            if filepath:
-                p = Path(filepath)
-                # safe_read_bytes opens with FILE_SHARE_READ | FILE_SHARE_WRITE so files open in Word/OneDrive load cleanly
-                data = safe_read_bytes(p)
-                text = read_document_from_bytes(data, p.name)
-                load_content_into_workspace(text, p.name)
-        except Exception as ex:
-            err_msg = f"{type(ex).__name__}: {str(ex)}"
-            logging.error(f"Native file open error: {err_msg}", exc_info=True)
-            ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
-            if ui_handles["upload_status_label"] is not None:
-                ui_handles["upload_status_label"].set_text(f"❌ Fehler beim Laden: {err_msg}")
-                ui_handles["upload_status_label"].classes("text-negative text-xs font-bold")
-                ui_handles["upload_status_label"].set_visibility(True)
-
-    def reset_workspace():
-        """Reset raw text, filename, and analysis table."""
-        state.filename = ""
-        state.raw_text = ""
-        state.entity_groups = []
-        state.current_mapping = {}
-        state.current_anon_text = ""
-        if ui_handles["raw_text_area"] is not None:
-            ui_handles["raw_text_area"].value = ""
-        if preview_holder is not None:
-            preview_holder.clear()
-        if export_holder is not None:
-            export_holder.clear()
-        if table_holder is not None:
-            table_holder.clear()
-        if ui_handles["upload_status_label"] is not None:
-            ui_handles["upload_status_label"].set_visibility(False)
-        if ui_handles["file_badge_card"] is not None:
-            ui_handles["file_badge_card"].set_visibility(False)
-        if ui_handles["analyze_btn"] is not None:
-            ui_handles["analyze_btn"].set_enabled(False)
-        if ui_handles["reset_btn"] is not None:
-            ui_handles["reset_btn"].set_visibility(False)
-        ui.notify("Workspace zurückgesetzt.", type="info", icon="delete_sweep")
 
     def get_sorted_groups() -> List[EntityGroup]:
         """Return entity groups sorted according to user selection."""
@@ -1233,122 +1236,42 @@ def create_ui():
                 with ui.tab_panel(tab_anonymize):
                     ui.label("Stufe 1: Dokument laden & Text-Eingabe").classes("text-base font-bold text-slate-800 mb-1")
                     
-                    # 100% Unified Interactive Drop-Zone (Click to pick via Windows Explorer, OR Drag & Drop onto box)
-                    with ui.card().classes(
-                        "w-full p-6 bg-slate-50 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-2 select-none"
-                    ).props('id="unified_dropzone"').on("click", open_native_file_dialog):
-                        with ui.row().classes("items-center gap-2 mb-1 pointer-events-none"):
-                            ui.icon("cloud_upload", size="md").classes("text-primary")
-                            ui.label("Datei hier ablegen oder zum Auswählen klicken").classes("text-sm font-bold text-slate-800")
-                        ui.label("Unterstützt Word (.docx), PDF, Text (.txt, .md), CSV und JSON • Automatische Struktur-Erkennung").classes("text-xs text-slate-500 pointer-events-none")
+                    # Single Modern Full-Width Drop-Zone Card
+                    with ui.card().classes("w-full p-4 bg-slate-50 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-xl mb-3 shadow-none transition-colors"):
+                        upload_ui_elem = ui.upload(
+                            label="Datei hier hineinziehen oder klicken (.docx, .pdf, .txt, .md, .csv, .json)",
+                            auto_upload=True,
+                            on_upload=handle_upload,
+                            on_rejected=handle_rejected,
+                            max_files=1,
+                        ).props("flat bordered color=primary").classes("w-full bg-white rounded-lg")
 
-                    # Injected HTML5 Drag & Drop Script with multi-channel fallback (FormData / Filepath / Base64)
-                    ui.add_body_html("""
-                    <script>
-                    (function() {
-                        function setupDropzone() {
-                            const el = document.getElementById('unified_dropzone');
-                            if (!el) return;
-                            if (el._dropzoneAttached) return;
-                            el._dropzoneAttached = true;
-
-                            window.addEventListener('dragover', function(e) { e.preventDefault(); }, false);
-                            window.addEventListener('drop', function(e) { e.preventDefault(); }, false);
-
-                            el.addEventListener('dragover', function(e) {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                el.style.borderColor = '#2563eb';
-                                el.style.backgroundColor = '#eff6ff';
-                            }, false);
-
-                            el.addEventListener('dragleave', function(e) {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                el.style.borderColor = '#93c5fd';
-                                el.style.backgroundColor = '#f8fafc';
-                            }, false);
-
-                            el.addEventListener('drop', async function(e) {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                el.style.borderColor = '#93c5fd';
-                                el.style.backgroundColor = '#f8fafc';
-
-                                const files = e.dataTransfer.files;
-                                if (!files || files.length === 0) return;
-                                const file = files[0];
-
-                                const formData = new FormData();
-                                formData.append('file', file);
-                                if (file.path) {
-                                    formData.append('filepath', file.path);
-                                }
-
-                                try {
-                                    const res = await fetch('/api/upload_drop', {
-                                        method: 'POST',
-                                        body: formData
-                                    });
-                                    const data = await res.json();
-                                    if (data.status !== 'ok') {
-                                        alert('Fehler beim Laden: ' + (data.message || 'Unbekannt'));
-                                    }
-                                } catch (err) {
-                                    console.error('Upload fetch error:', err);
-                                    // Fallback to FileReader
-                                    const reader = new FileReader();
-                                    reader.onload = async function(evt) {
-                                        const b64 = evt.target.result.split(',')[1];
-                                        await fetch('/api/upload_drop', {
-                                            method: 'POST',
-                                            headers: { 'Content-Type': 'application/json' },
-                                            body: JSON.stringify({ filename: file.name, base64: b64 })
-                                        });
-                                    };
-                                    reader.readAsDataURL(file);
-                                }
-                            }, false);
-                        }
-                        if (document.readyState === 'loading') {
-                            document.addEventListener('DOMContentLoaded', setupDropzone);
-                        } else {
-                            setupDropzone();
-                        }
-                        setInterval(setupDropzone, 500);
-                    })();
-                    </script>
-                    """)
+                        with ui.row().classes("w-full justify-between items-center mt-2 px-1 flex-wrap"):
+                            ui.button("📂 Datei über Windows-Explorer auswählen...", icon="folder_open", on_click=open_native_file_dialog, color="slate").props("flat dense size=xs").tooltip("Öffnet den Explorer (liest auch geöffnete Word-Dateien fehlerfrei)")
+                            ui.label("Automatische Struktur-, Überschriften- & Tabellenerkennung").classes("text-[11px] text-slate-400 italic")
 
                     # Document info badge when loaded (with remove button)
                     with ui.row().classes("w-full mb-2 items-center gap-2") as file_badge_card:
                         file_badge_card.set_visibility(False)
-                        ui_handles["file_badge_card"] = file_badge_card
                         with ui.row().classes("items-center gap-2 bg-blue-100 border border-blue-300 rounded-lg px-3 py-1 text-xs text-blue-950"):
                             ui.icon("description", size="xs").classes("text-blue-700")
                             file_badge_label = ui.label("").classes("font-bold font-mono")
-                            ui_handles["file_badge_label"] = file_badge_label
                             ui.button(icon="close", on_click=reset_workspace).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-1").tooltip("Geladenes Dokument entfernen")
-
-                    upload_status_label = ui.label("").classes("text-xs font-bold mb-2")
-                    upload_status_label.set_visibility(False)
-                    ui_handles["upload_status_label"] = upload_status_label
 
                     with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note", value=True).classes("w-full mb-2"):
                         def on_raw_text_change(e):
                             state.raw_text = e.value or ""
                             has_content = bool(state.raw_text and state.raw_text.strip())
-                            if ui_handles["analyze_btn"] is not None:
-                                ui_handles["analyze_btn"].set_enabled(has_content)
-                            if ui_handles["reset_btn"] is not None:
-                                ui_handles["reset_btn"].set_visibility(has_content)
+                            if analyze_btn is not None:
+                                analyze_btn.set_enabled(has_content)
+                            if reset_btn is not None:
+                                reset_btn.set_visibility(has_content)
 
                         raw_text_area = ui.textarea(
                             value=state.raw_text,
                             placeholder="Text hier eingeben oder Dokument oben hineinziehen...",
                             on_change=on_raw_text_change,
                         ).props("outlined rows=6").classes("w-full font-mono text-sm")
-                        ui_handles["raw_text_area"] = raw_text_area
 
                     # Prominent Analysis & Workspace Reset Buttons in Action Row
                     with ui.row().classes("w-full items-center justify-between mt-1 mb-4 gap-3 flex-wrap"):
@@ -1359,7 +1282,6 @@ def create_ui():
                             on_click=run_analysis,
                         ).props("unelevated").classes("px-4 py-2 font-bold")
                         analyze_btn.set_enabled(bool(state.raw_text and state.raw_text.strip()))
-                        ui_handles["analyze_btn"] = analyze_btn
 
                         reset_btn = ui.button(
                             "🗑️ Workspace zurücksetzen",
@@ -1368,7 +1290,6 @@ def create_ui():
                             on_click=reset_workspace,
                         ).props("outline dense").tooltip("Workspace leeren (Text, Dokument, Tabelle und Vorschau)")
                         reset_btn.set_visibility(bool(state.raw_text and state.raw_text.strip()))
-                        ui_handles["reset_btn"] = reset_btn
 
                     progress_holder = ui.column().classes("w-full")
 
@@ -1644,34 +1565,11 @@ def create_ui():
 
 
 def on_startup():
-    """Triggered when web server starts."""
-    try:
-        READY_FLAG.touch(exist_ok=True)
-    except Exception:
-        pass
-
-
-def on_client_connect():
-    """Ensure splash is dismissed and app window is brought to front on Windows."""
-    try:
-        READY_FLAG.touch(exist_ok=True)
-    except Exception:
-        pass
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            hwnd = user32.FindWindowW(None, "Privacy-First Local Anonymizer")
-            if hwnd:
-                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-                user32.SetForegroundWindow(hwnd)
-                user32.BringWindowToTop(hwnd)
-        except Exception:
-            pass
+    """Start asynchronous background preloading as soon as the app starts."""
+    asyncio.create_task(ensure_model_loaded())
 
 
 app.on_startup(on_startup)
-app.on_connect(on_client_connect)
 
 
 def main():
