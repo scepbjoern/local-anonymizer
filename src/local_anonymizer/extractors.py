@@ -5,12 +5,23 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import re
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+
+
 class UnsupportedFileFormatError(ValueError):
     """Raised when an unsupported file format is provided to the extractor."""
     pass
+
+
+def strip_html_markup(text: str) -> str:
+    """Strip formatting HTML tags (<mark>, <u>, <ins>, <span>, <font>, <del>, <strike>) while preserving the inner text."""
+    if not text:
+        return ""
+    return re.sub(r"</?(?:mark|ins|u|span|font|strike|del)(?:\s+[^>]*)?>", "", text, flags=re.IGNORECASE).strip()
 
 
 def extract_text_from_txt_bytes(raw_bytes: bytes) -> str:
@@ -26,10 +37,6 @@ def extract_text_from_txt_bytes(raw_bytes: bytes) -> str:
             continue
     # Ultimate fallback with character replacement
     return raw_bytes.decode("utf-8", errors="replace")
-
-
-import sys
-import logging
 
 
 def safe_read_bytes(file_path: Union[str, Path]) -> bytes:
@@ -97,15 +104,58 @@ def extract_text_from_json_bytes(data: bytes) -> str:
         return raw_str
 
 
+def clean_markdown_table_cell(cell: str) -> str:
+    """
+    Format and clean text inside Markdown table cells:
+    - Reconnects broken hyphenations ('Dokumenten-<br>scanning' -> 'Dokumentenscanning', 'Sach-<br>bearbeiter:in' -> 'Sachbearbeiter:in').
+    - Preserves hyphenated conjunctions ('Tarif-<br>und' -> 'Tarif- und').
+    - Fixes broken bullet lists ('-<br>Veranlasser:in' -> '- Veranlasser:in').
+    - Replaces soft intra-sentence linebreaks with a clean space while preserving paragraph breaks (<br><br>).
+    - Removes trailing orphan dashes or empty bullet points.
+    """
+    c = cell.strip()
+    if not c or c == "-":
+        return ""
+
+    # 1. Protect hyphenated conjunctions: 'Tarif- <br> und' -> 'Tarif- und'
+    c = re.sub(r"([A-Za-zÄÖÜäöüß]+-)\s*(?:<br\s*/?>|\n)\s*(und|oder|bzw|sowie)\b", r"\1 \2", c, flags=re.IGNORECASE)
+
+    # 2. Fix broken hyphenated word wraps: 'Dokumenten-<br>scanning' -> 'Dokumentenscanning'
+    c = re.sub(r"([A-Za-zÄÖÜäöüß]+)-\s*(?:<br\s*/?>|\n)\s*([a-zäöüß]+)", r"\1\2", c)
+    c = re.sub(r"([A-Za-zÄÖÜäöüß]+)-\s*(?:<br\s*/?>|\n)\s*([A-ZÄÖÜ][a-zäöüß]+)", r"\1-\2", c)
+
+    # 3. Normalize paragraph double linebreaks
+    c = re.sub(r"(?:<br\s*/?>\s*){2,}", " __PARAGRAPH_BREAK__ ", c)
+
+    # 4. Fix broken bullet points: '-<br>Text' -> '- Text'
+    c = re.sub(r"(?:^|<br\s*/?>|\n)\s*[-•–—]\s*(?:<br\s*/?>|\n)\s*", " __BULLET__ ", c)
+    c = re.sub(r"(?:^|<br\s*/?>|\n)\s*[-•–—]\s+", " __BULLET__ ", c)
+
+    # 5. Replace single soft linebreaks within flow text with a space
+    c = re.sub(r"<br\s*/?>|\n", " ", c)
+
+    # 6. Reconstruct bullets and paragraphs
+    c = c.replace("__BULLET__", "<br>- ")
+    c = c.replace("__PARAGRAPH_BREAK__", "<br><br>")
+
+    # 7. Strip trailing empty bullets / dashes (e.g. '<br>- <br>- ')
+    c = re.sub(r"(?:<br\s*/?>\s*[-•–—\s]*)+$", "", c, flags=re.IGNORECASE)
+    c = re.sub(r"[\s\-•–—]+$", "", c)
+    c = re.sub(r"^(?:<br\s*/?>|\s)*", "", c)
+    c = re.sub(r"[ \t]+", " ", c)
+
+    return c.strip()
+
+
 def extract_text_from_csv_bytes(data: bytes) -> str:
-    """Extract CSV bytes as a structured Markdown table."""
+    """Extract CSV bytes as a structured Markdown table, supporting multi-line quoted cells."""
     text_content = extract_text_from_txt_bytes(data)
-    lines = [l for l in text_content.splitlines() if l.strip()]
-    if not lines:
+    if not text_content.strip():
         return ""
 
     # Detect delimiter: try comma, semicolon, tab
-    sample = "\n".join(lines[:5])
+    sample_lines = [l for l in text_content.splitlines() if l.strip()][:5]
+    sample = "\n".join(sample_lines)
     delimiter = ","
     try:
         sniffer = csv.Sniffer()
@@ -117,8 +167,8 @@ def extract_text_from_csv_bytes(data: bytes) -> str:
         elif "\t" in sample:
             delimiter = "\t"
 
-    reader = csv.reader(lines, delimiter=delimiter)
-    rows = list(reader)
+    reader = csv.reader(io.StringIO(text_content), delimiter=delimiter)
+    rows = [r for r in reader if any(c.strip() for c in r)]
     if not rows:
         return text_content
 
@@ -126,10 +176,18 @@ def extract_text_from_csv_bytes(data: bytes) -> str:
     if max_cols == 0:
         return text_content
 
-    # Normalize row lengths
+    def format_csv_cell(cell: str) -> str:
+        c = cell.strip()
+        c = c.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.strip() for line in c.split("\n") if line.strip()]
+        c = "<br>".join(lines)
+        c = c.replace("|", r"\|")
+        return c
+
+    # Normalize row lengths and format cells
     norm_rows = []
     for r in rows:
-        padded = [c.strip().replace("\n", " ") for c in r]
+        padded = [format_csv_cell(c) for c in r]
         while len(padded) < max_cols:
             padded.append("")
         norm_rows.append(padded)
@@ -178,7 +236,7 @@ def _detect_docx_list_type(para, doc) -> Optional[str]:
                     fmt = fmt_nodes[0].lower()
                     if fmt == "bullet":
                         return "bullet"
-                    elif fmt in ["decimal", "lowerletter", "upperletter", "lowerroman", "upperroman", "ordinal"]:
+                    elif fmt in ["decimal", "decimalzero", "lowerletter", "upperletter", "lowerroman", "upperroman", "ordinal", "chinesecounting", "cardinaltext", "ordinaltext", "hex"]:
                         return "number"
     except Exception:
         pass
@@ -233,7 +291,7 @@ def _add_formatted_markdown_runs(para, text: str) -> None:
 def extract_text_from_docx_bytes(raw_bytes: bytes, include_headers_footers: bool = False) -> str:
     """
     Extract text from Microsoft Word .docx bytes with:
-    - Level 1: XML Outline Level (w:outlineLvl 0..3) for custom corporate heading templates
+    - Level 1: XML Outline Level (w:outlineLvl 0..5) for custom corporate heading templates
     - Level 2: Multilingual style names (Heading 1..4, Überschrift 1..4, Title, Subtitle)
     - Level 3: Bullet & numbered lists via XML numbering resolution (w:numFmt) and list styles
     - Level 4: Strict false-positive protection for bold text (only < 60 chars, no ending period, >= 16pt)
@@ -352,8 +410,7 @@ def extract_text_from_docx_bytes(raw_bytes: bytes, include_headers_footers: bool
                     full_text.append(p.text.strip())
 
     res_text = "\n\n".join(full_text)
-    # Strip HTML tags like <mark>, <u>, <ins>, <span>
-    return re.sub(r"</?(?:mark|ins|u|span|font|strike|del)(?:\s+[^>]*)?>", "", res_text, flags=re.IGNORECASE).strip()
+    return strip_html_markup(res_text)
 
 
 def extract_text_from_docx(path: Path, include_headers_footers: bool = False) -> str:
@@ -450,56 +507,14 @@ def save_markdown_to_docx_bytes(md_text: str) -> bytes:
     return buf.getvalue()
 
 
-def clean_markdown_table_cell(cell: str) -> str:
-    """
-    Format and clean text inside Markdown table cells:
-    - Reconnects broken hyphenations ('Dokumenten-<br>scanning' -> 'Dokumentenscanning', 'Sach-<br>bearbeiter:in' -> 'Sachbearbeiter:in').
-    - Preserves hyphenated conjunctions ('Tarif-<br>und' -> 'Tarif- und').
-    - Fixes broken bullet lists ('-<br>Veranlasser:in' -> '- Veranlasser:in').
-    - Replaces soft intra-sentence linebreaks with a clean space while preserving paragraph breaks (<br><br>).
-    - Removes trailing orphan dashes or empty bullet points.
-    """
-    c = cell.strip()
-    if not c or c == "-":
-        return ""
-
-    # 1. Protect hyphenated conjunctions: 'Tarif- <br> und' -> 'Tarif- und'
-    c = re.sub(r"([A-Za-zÄÖÜäöüß]+-)\s*(?:<br\s*/?>|\n)\s*(und|oder|bzw|sowie)\b", r"\1 \2", c, flags=re.IGNORECASE)
-
-    # 2. Fix broken hyphenated word wraps: 'Dokumenten-<br>scanning' -> 'Dokumentenscanning'
-    c = re.sub(r"([A-Za-zÄÖÜäöüß]+)-\s*(?:<br\s*/?>|\n)\s*([a-zäöüß]+)", r"\1\2", c)
-    c = re.sub(r"([A-Za-zÄÖÜäöüß]+)-\s*(?:<br\s*/?>|\n)\s*([A-ZÄÖÜ][a-zäöüß]+)", r"\1-\2", c)
-
-    # 3. Normalize paragraph double linebreaks
-    c = re.sub(r"(?:<br\s*/?>\s*){2,}", " __PARAGRAPH_BREAK__ ", c)
-
-    # 4. Fix broken bullet points: '-<br>Text' -> '- Text'
-    c = re.sub(r"(?:^|<br\s*/?>|\n)\s*[-•–—]\s*(?:<br\s*/?>|\n)\s*", " __BULLET__ ", c)
-    c = re.sub(r"(?:^|<br\s*/?>|\n)\s*[-•–—]\s+", " __BULLET__ ", c)
-
-    # 5. Replace single soft linebreaks within flow text with a space
-    c = re.sub(r"<br\s*/?>|\n", " ", c)
-
-    # 6. Reconstruct bullets and paragraphs
-    c = c.replace("__BULLET__", "<br>- ")
-    c = c.replace("__PARAGRAPH_BREAK__", "<br><br>")
-
-    # 7. Strip trailing empty bullets / dashes (e.g. '<br>- <br>- ')
-    c = re.sub(r"(?:<br\s*/?>\s*[-•–—\s]*)+$", "", c, flags=re.IGNORECASE)
-    c = re.sub(r"[\s\-•–—]+$", "", c)
-    c = re.sub(r"^(?:<br\s*/?>|\s)*", "", c)
-    c = re.sub(r"[ \t]+", " ", c)
-
-    return c.strip()
-
-
 def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True) -> str:
     """
     Clean up artifact tags, picture text boxes, table cells, and HTML formatting from extracted PDF markdown.
     - Removes inline HTML tags like <mark>, <u>, <ins>, <span>, <font>, <del>, <strike> while preserving their text.
     - If extract_picture_text is False: Completely strips <!-- Start/End of picture text --> blocks.
-    - If extract_picture_text is True: Normalizes picture text blocks, breaks <br>, and repairs glued PascalCase words.
+    - If extract_picture_text is True: Normalizes picture text blocks, breaks <br>, and repairs glued PascalCase words ONLY inside picture blocks.
     - Formats markdown tables so rows remain single-line, bullet items are cleanly formatted, and trailing dashes are stripped.
+    - Leaves normal body text (e.g. PowerPoint, LinkedIn, GmbH, ISO27001) 100% untouched.
     """
     if not md_text:
         return ""
@@ -507,16 +522,29 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
     text = md_text
 
     # 1. Remove inline HTML markup tags (e.g. <mark>, <u>, <ins>, <span>, etc.) preserving the text inside
-    text = re.sub(r"</?(?:mark|ins|u|span|font|strike|del)(?:\s+[^>]*)?>", "", text, flags=re.IGNORECASE)
+    text = strip_html_markup(text)
 
     # 2. Handle picture/graphics text blocks
     if not extract_picture_text:
         # Strip all picture text blocks entirely
         text = re.sub(r"<!--\s*Start of picture text\s*-->.*?<!--\s*End of picture text\s*-->", "", text, flags=re.DOTALL | re.IGNORECASE)
     else:
-        # Normalize picture text comment markers
-        text = re.sub(r"<!--\s*Start of picture text\s*-->", "\n\n", text, flags=re.IGNORECASE)
-        text = re.sub(r"<!--\s*End of picture text\s*-->", "\n\n", text, flags=re.IGNORECASE)
+        def _clean_picture_block(match: re.Match) -> str:
+            block = match.group(0)
+            # Remove comment markers
+            block = re.sub(r"<!--\s*(?:Start|End) of picture text\s*-->", "\n\n", block, flags=re.IGNORECASE)
+            # Convert <br> tags in picture block to clean newlines
+            block = re.sub(r"<br\s*/?>", "\n", block, flags=re.IGNORECASE)
+            # Separate glued PascalCase words ONLY inside picture blocks (e.g. WandhovenWolfgang -> Wandhoven Wolfgang)
+            def _separate_pascal_case(m: re.Match) -> str:
+                s = m.group(0)
+                if "http" in s or "www." in s or "/" in s:
+                    return s
+                return re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", s)
+            block = re.sub(r"\b[A-Za-zÄÖÜäöüß]{4,}\b", _separate_pascal_case, block)
+            return block
+
+        text = re.sub(r"<!--\s*Start of picture text\s*-->.*?<!--\s*End of picture text\s*-->", _clean_picture_block, text, flags=re.DOTALL | re.IGNORECASE)
 
     # 3. Clean markdown tables specifically so cell linebreaks (<br>) and list bullets are preserved without breaking table rows
     lines = text.splitlines()
@@ -532,16 +560,8 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
             cleaned_cells = [clean_markdown_table_cell(c) for c in cells]
             cleaned_lines.append("| " + " | ".join(cleaned_cells) + " |")
         else:
-            # Outside tables: replace <br> with newlines and separate PascalCase words
+            # Outside tables: convert any remaining <br> to newlines, but DO NOT run PascalCase separation on normal text!
             l = re.sub(r"<br\s*/?>", "\n", stripped, flags=re.IGNORECASE)
-            if extract_picture_text:
-                l = re.sub(
-                    r"\b[A-Za-zÄÖÜäöüß]{4,}\b",
-                    lambda m: re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", m.group(0))
-                    if "http" not in m.group(0) and "/" not in m.group(0)
-                    else m.group(0),
-                    l,
-                )
             cleaned_lines.append(l)
 
     text = "\n".join(cleaned_lines)
@@ -567,6 +587,7 @@ def extract_text_from_pdf_bytes(
     Extract structured Markdown text from PDF bytes using pymupdf4llm.
     Preserves headings, lists, tables, and bold/italic styles.
     Supports optional progress_callback(current_page, total_pages, status_text) for large PDFs.
+    Preserves document title on page 1 while suppressing running headers/footers on subsequent pages when include_headers_footers=False.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
     import pymupdf
@@ -583,24 +604,35 @@ def extract_text_from_pdf_bytes(
             f"The file appears to be a scanned/image-based PDF requiring OCR, or an empty document."
         )
 
-    # For 1-page documents, top text is usually document title; for multi-page, running headers/footers can be suppressed
-    use_headers_footers = include_headers_footers or (doc_pages <= 1)
-
     try:
-        if progress_callback and doc_pages > 1:
+        if doc_pages > 1:
             page_mds = []
             for page_idx in range(doc_pages):
-                progress_callback(
-                    page_idx + 1,
-                    doc_pages,
-                    f"PDF-Seite {page_idx + 1} von {doc_pages} wird extrahiert..."
-                )
+                if progress_callback:
+                    progress_callback(
+                        page_idx + 1,
+                        doc_pages,
+                        f"PDF-Seite {page_idx + 1} von {doc_pages} wird extrahiert..."
+                    )
+                if include_headers_footers:
+                    use_h, use_f = True, True
+                    margins = (0, 0, 0, 0)
+                else:
+                    if page_idx == 0:
+                        # Page 1: Keep top title, suppress bottom footer margin
+                        use_h, use_f = True, False
+                        margins = (0, 0, 0, 40)
+                    else:
+                        # Subsequent pages: Suppress running headers and footers
+                        use_h, use_f = False, False
+                        margins = (0, 40, 0, 40)
                 try:
                     p_md = pymupdf4llm.to_markdown(
                         doc,
                         pages=[page_idx],
-                        header=use_headers_footers,
-                        footer=use_headers_footers,
+                        header=use_h,
+                        footer=use_f,
+                        margins=margins,
                     )
                     page_mds.append(p_md.strip())
                 except Exception:
@@ -608,11 +640,15 @@ def extract_text_from_pdf_bytes(
             md_text = "\n\n".join(p for p in page_mds if p)
         else:
             if progress_callback:
-                progress_callback(1, max(1, doc_pages), "PDF-Inhalt wird extrahiert...")
+                progress_callback(1, 1, "PDF-Inhalt wird extrahiert...")
+            use_h = True
+            use_f = include_headers_footers
+            margins = (0, 0, 0, 0) if include_headers_footers else (0, 0, 0, 40)
             md_text = pymupdf4llm.to_markdown(
                 doc,
-                header=use_headers_footers,
-                footer=use_headers_footers,
+                header=use_h,
+                footer=use_f,
+                margins=margins,
             )
 
         if not md_text.strip() and has_text:
@@ -627,7 +663,7 @@ def extract_text_from_pdf_bytes(
 
 
 def extract_text_from_pdf(
-    path: Path,
+    path: Union[str, Path],
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     include_headers_footers: bool = False,
     extract_picture_text: bool = True,
@@ -636,47 +672,17 @@ def extract_text_from_pdf(
     Extract structured Markdown text from PDF files using pymupdf4llm.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
-    path = Path(path)
-    if path.exists():
-        raw_data = safe_read_bytes(path)
-        return extract_text_from_pdf_bytes(
-            raw_data,
-            filename=path.name,
-            progress_callback=progress_callback,
-            include_headers_footers=include_headers_footers,
-            extract_picture_text=extract_picture_text,
-        )
-
-    import pymupdf
-    import pymupdf4llm
-    doc = pymupdf.open(str(path))
-    doc_pages = doc.page_count
-
-    has_text = any(page.get_text().strip() for page in doc)
-    if doc_pages > 0 and not has_text:
-        doc.close()
-        raise ValueError(
-            f"No extractable text found in PDF '{path.name}' ({doc_pages} pages). "
-            f"The file appears to be a scanned/image-based PDF requiring OCR, or an empty document."
-        )
-
-    use_headers_footers = include_headers_footers or (doc_pages <= 1)
-
-    try:
-        md_text = pymupdf4llm.to_markdown(
-            doc,
-            header=use_headers_footers,
-            footer=use_headers_footers,
-        )
-        if not md_text.strip() and has_text:
-            md_text = pymupdf4llm.to_markdown(doc, header=True, footer=True)
-    except Exception:
-        pages_text = [page.get_text().strip() for page in doc if page.get_text().strip()]
-        md_text = "\n\n--- Page Break ---\n\n".join(pages_text)
-    finally:
-        doc.close()
-
-    return clean_extracted_pdf_markdown(md_text, extract_picture_text=extract_picture_text)
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+    raw_data = safe_read_bytes(p)
+    return extract_text_from_pdf_bytes(
+        raw_data,
+        filename=p.name,
+        progress_callback=progress_callback,
+        include_headers_footers=include_headers_footers,
+        extract_picture_text=extract_picture_text,
+    )
 
 
 def read_document_from_bytes(
@@ -692,7 +698,7 @@ def read_document_from_bytes(
         if progress_callback:
             progress_callback(1, 1, "Textdatei wird eingelesen...")
         text = extract_text_from_txt_bytes(data)
-        return re.sub(r"</?(?:mark|ins|u|span|font|strike|del)(?:\s+[^>]*)?>", "", text, flags=re.IGNORECASE).strip()
+        return strip_html_markup(text)
     elif ext == ".json":
         if progress_callback:
             progress_callback(1, 1, "JSON-Struktur wird eingelesen...")

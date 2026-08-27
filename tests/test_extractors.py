@@ -2,7 +2,7 @@ import pytest
 from local_anonymizer.extractors import read_document, extract_text_from_pdf, extract_text_from_txt, UnsupportedFileFormatError
 from pathlib import Path
 
-def test_scanned_pdf_error_handling(mocker):
+def test_scanned_pdf_error_handling(tmp_path, mocker):
     # Mock pymupdf to return empty text
     mock_doc = mocker.MagicMock()
     mock_doc.__enter__.return_value = mock_doc
@@ -12,9 +12,11 @@ def test_scanned_pdf_error_handling(mocker):
     mock_doc.page_count = 1
     
     mocker.patch("pymupdf.open", return_value=mock_doc)
+    dummy_pdf = tmp_path / "dummy.pdf"
+    dummy_pdf.write_bytes(b"%PDF-1.4 dummy")
     
     with pytest.raises(ValueError, match="scanned/image-based PDF requiring OCR"):
-        extract_text_from_pdf(Path("dummy.pdf"))
+        extract_text_from_pdf(dummy_pdf)
 
 def test_multi_encoding_txt(tmp_path):
     txt_file = tmp_path / "test.txt"
@@ -334,28 +336,37 @@ def test_pdf_headers_footers_toggle():
     from local_anonymizer.extractors import extract_text_from_pdf_bytes
 
     doc = pymupdf.open()
-    for i in range(1, 3):
-        page = doc.new_page(width=595, height=842)
-        # Header
-        page.insert_text((50, 30), "Vertrauliche Kopfzeile Sanitas", fontsize=9)
-        # Body
-        page.insert_text((50, 150), f"Haupttext des Dokuments auf Seite {i}.", fontsize=11)
-        # Footer
-        page.insert_text((50, 800), f"Seite {i} von 2 - Fußzeile", fontsize=9)
+    # Page 1: Has document title at top and body and footer
+    p1 = doc.new_page(width=595, height=842)
+    p1.insert_text((50, 30), "Dokumententitel auf Seite 1", fontsize=16)
+    p1.insert_text((50, 150), "Haupttext des Dokuments auf Seite 1.", fontsize=11)
+    p1.insert_text((50, 800), "Seite 1 von 2 - Fußzeile", fontsize=9)
+
+    # Page 2: Has running header at top, body and footer
+    p2 = doc.new_page(width=595, height=842)
+    p2.insert_text((50, 30), "Wiederkehrende Kopfzeile Sanitas", fontsize=9)
+    p2.insert_text((50, 150), "Haupttext des Dokuments auf Seite 2.", fontsize=11)
+    p2.insert_text((50, 800), "Seite 2 von 2 - Fußzeile", fontsize=9)
+
     pdf_bytes = doc.tobytes()
     doc.close()
 
-    # Default (include_headers_footers=False): Suppresses repeated running headers/footers
+    # Default (include_headers_footers=False):
+    # - Page 1 Title protected (not lost!)
+    # - Running header on Page 2 filtered out
+    # - Footers on all pages filtered out
     text_no_hf = extract_text_from_pdf_bytes(pdf_bytes, include_headers_footers=False)
+    assert "Dokumententitel auf Seite 1" in text_no_hf
     assert "Haupttext des Dokuments auf Seite 1." in text_no_hf
     assert "Haupttext des Dokuments auf Seite 2." in text_no_hf
-    assert "Vertrauliche Kopfzeile Sanitas" not in text_no_hf
+    assert "Wiederkehrende Kopfzeile Sanitas" not in text_no_hf
     assert "Fußzeile" not in text_no_hf
 
-    # With headers and footers (include_headers_footers=True)
+    # With headers and footers (include_headers_footers=True): Everything included
     text_with_hf = extract_text_from_pdf_bytes(pdf_bytes, include_headers_footers=True)
+    assert "Dokumententitel auf Seite 1" in text_with_hf
     assert "Haupttext des Dokuments auf Seite 1." in text_with_hf
-    assert "Vertrauliche Kopfzeile Sanitas" in text_with_hf
+    assert "Wiederkehrende Kopfzeile Sanitas" in text_with_hf
     assert "Fußzeile" in text_with_hf
 
 
@@ -385,6 +396,64 @@ def test_docx_headers_footers_toggle():
     assert "Body paragraph in Word." in text_with_hf
     assert "Header Text in Word" in text_with_hf
     assert "Footer Text in Word" in text_with_hf
+
+
+def test_clean_extracted_pdf_markdown_pascal_case_flow_text_preserved():
+    """Verify PascalCase regex ONLY splits picture text blocks and does NOT alter standard flow text."""
+    from local_anonymizer.extractors import clean_extracted_pdf_markdown
+
+    sample = (
+        "Hier ist ein normaler Fließtext mit PowerPoint, LinkedIn, GmbH, iPhone und Sanitas.\n\n"
+        "<!-- Start of picture text -->\n"
+        "Dr. Andreas Schönenberger CMO / New Corporate CFO Operation , IT Center Business Offering\n"
+        "Jan Schultz Kaspar WandhovenWolfgang Tobias Caluori Trachsel\n"
+        "<!-- End of picture text -->\n\n"
+        "Abschlussbericht von Sanitas GmbH mit PowerPoint Präsentation."
+    )
+
+    cleaned = clean_extracted_pdf_markdown(sample, extract_picture_text=True)
+
+    # Standard flow text must NOT be altered
+    assert "PowerPoint" in cleaned
+    assert "Power Point" not in cleaned
+    assert "LinkedIn" in cleaned
+    assert "Linked In" not in cleaned
+    assert "GmbH" in cleaned
+    assert "Gmb H" not in cleaned
+    assert "iPhone" in cleaned
+
+    # Picture text block MUST be properly split
+    assert "Wandhoven Wolfgang" in cleaned
+    assert "<!-- Start of picture text -->" not in cleaned
+
+
+def test_extract_text_from_csv_bytes_multiline():
+    """Verify quoted multiline CSV cells are correctly formatted into clean Markdown table cells."""
+    from local_anonymizer.extractors import extract_text_from_csv_bytes
+
+    csv_data = (
+        'Name,"Rolle & Beschreibung",Status\n'
+        'Julia Meier,"Projektleiterin\nZuständig für Release 1.0",Aktiv\n'
+        'Max Muster,"Dozent\nFachbereich Informatik",Inaktiv\n'
+    ).encode("utf-8")
+
+    extracted = extract_text_from_csv_bytes(csv_data)
+
+    # Must be valid Markdown table (Header, Separator, 2 Data Rows = 4 lines)
+    lines = [l for l in extracted.strip().splitlines() if l.strip()]
+    assert len(lines) == 4
+    assert "| Name | Rolle & Beschreibung | Status |" in lines[0]
+    assert "Projektleiterin<br>Zuständig für Release 1.0" in lines[2]
+    assert "Dozent<br>Fachbereich Informatik" in lines[3]
+
+
+def test_strip_html_markup():
+    """Verify strip_html_markup cleans annotations while preserving content."""
+    from local_anonymizer.extractors import strip_html_markup
+
+    text = "Hier ist <mark>wichtiger Text</mark> und <u>unterstrichenes Wort</u> sowie <span style='color:red;'>roter Text</span>."
+    cleaned = strip_html_markup(text)
+    assert cleaned == "Hier ist wichtiger Text und unterstrichenes Wort sowie roter Text."
 
 
 
