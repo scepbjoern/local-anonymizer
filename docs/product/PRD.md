@@ -11,7 +11,7 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 ## 2. Kernprinzipien & Design-Vorgaben
 
 1. **🛡️ 100% Lokal & Zero-Telemetry:** Weder Dokumenteninhalte, noch Metadaten oder Telemetrie verlassen das Gerät.
-2. **💾 Reine In-Memory-Verarbeitung:** Hochgeladene Dateien und extrahierte Klartexte werden ausschliesslich im RAM gehalten und niemals ungefragt in temporären Verzeichnissen auf der Festplatte abgelegt.
+2. **💾 RAM-zentrierte Verarbeitung & transparenter Streaming-Puffer:** Erkannte Entitäten, Mapping-Tabellen und Texttransformationen verbleiben ausschliesslich im RAM. Bei nativer Datei-Auswahl (`tkinter`) erfolgt das Einlesen direkt ohne temporäre Dateien. Beim Drag-and-Drop im GUI wird die Datei über einen lokalen HTTP-Streaming-Puffer (`~/.local-anonymizer/temp_uploads`, max. 50 MB) gestreamt und unmittelbar nach dem Einlesen in den RAM per `try...finally` sofort gelöscht sowie beim Beenden der Anwendung (`atexit`) automatisch bereinigt.
 3. **⚡ No-Admin / Geringer Footprint:** Installation ohne Administratorrechte (via `uv` oder `pip`), lauffähig auf Standard-Notebooks (CPU-only).
 4. **🔄 Deterministische Reversibilität:** Mathematisch exakte, kaskadenfreie Wiederherstellung (Single-Pass-Substitution).
 5. **🎯 High-Recall mit interaktiver Kontrolle:** Das Erkennungsmodell findet im Zweifel lieber zu viel als zu wenig; der Mensch behält im visuellen Review-Interface mühelos die Letztentscheidung.

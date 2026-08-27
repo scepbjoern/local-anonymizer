@@ -73,8 +73,8 @@
 ## 2. Kernkomponenten im Detail
 
 ### 2.1 Extraktoren (`extractors.py`)
-- **`extract_text_from_pdf_bytes`:** Nutzt `pymupdf4llm` zur Umwandlung von PDF-Seiten in semantisch strukturiertes Markdown.
-- **In-Memory-Support:** Sämtliche Extraktoren arbeiten nativ auf `bytes` (`read_document_from_bytes`), um das Schreiben temporärer Dateien auf Festplatte vollständig zu vermeiden.
+- **`extract_text_from_pdf_bytes`:** Nutzt `pymupdf4llm` zur Umwandlung von PDF-Seiten in semantisch strukturiertes Markdown (inklusive Tabellenbereinigung, Trennung von Bildtext und wiederkehrenden Kopf-/Fußzeilen-Filtern mit Seite-1-Titelschutz).
+- **In-Memory & Streaming-Puffer:** Sämtliche Extraktoren und NLP-Analysen arbeiten nativ auf `bytes` (`read_document_from_bytes`). Beim Drag-and-Drop im GUI wird zur zuverlässigen Übertragung großer Dokumente (bis 50 MB) ein temporärer HTTP-Streaming-Puffer (`~/.local-anonymizer/temp_uploads`) verwendet, der per `try...finally` sofort nach dem RAM-Ladevorgang sowie über `atexit` beim Session-Ende bereinigt wird.
 - **Fehlerbehandlung:** Bildbasierte PDFs ohne Textlayer werden über `doc.page_count > 0 and not pages_text` erkannt und werfen `ValueError` mit klarer OCR-Hinweismeldung.
 
 ### 2.2 Presidio Analyzer & Custom Recognizers (`recognizers.py`)
@@ -123,7 +123,7 @@
 | Aspekt | Garantie | Technische Umsetzung |
 | :--- | :--- | :--- |
 | **Datenabfluss** | 0% externe Datenübertragung | Offline-Modus für HuggingFace (`HF_HUB_OFFLINE=1`), kein Telemetrie-Code in NiceGUI/Presidio |
-| **Persistenz** | Keine PII auf temporären Datenträgern | Reine RAM-Objekte (`io.BytesIO`, Python-State), Speicherbereinigung nach Session-Ende |
+| **Persistenz** | Keine PII auf dauerhaften Datenträgern | Reine RAM-Verarbeitung für Entitäten & Mappings (`io.BytesIO`, Python-State). Temporärer Drag-and-Drop HTTP-Puffer (`temp_uploads`) wird per `try...finally` sofort nach RAM-Transfer und via `atexit` bereinigt. |
 | **Reversibilität** | 100% mathematische Wiederherstellbarkeit | Deterministische JSON-Mappingtabelle, Single-Pass-Regex |
 | **Admin-Rechte** | 0% Admin-Rechte erforderlich | Reine User-Space-Dependencies (`uv pip install`) |
 
