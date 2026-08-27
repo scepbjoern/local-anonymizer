@@ -1,6 +1,15 @@
 import re
 import pytest
-from local_anonymizer.recognizers import is_sentence_boundary, GLiNERRecognizer, FuzzyGlossaryRecognizer
+from local_anonymizer.recognizers import (
+    AHVNumberRecognizer,
+    AddressPatternRecognizer,
+    FuzzyGlossaryRecognizer,
+    GLiNERRecognizer,
+    UIDNumberRecognizer,
+    is_sentence_boundary,
+    is_valid_ahv_number,
+    is_valid_uid_number,
+)
 
 def test_abbreviation_aware_chunking():
     text = "Prof. Dr. Max wohnt in der Bahnhofstr. 12 am 14. Juli. Das ist super."
@@ -48,3 +57,50 @@ def test_gliner_batched_multi_chunk_analysis():
     assert any(r.entity_type == "PERSON" for r in results)
     assert any(r.entity_type == "LOCATION" for r in results)
 
+
+def test_address_recognizer_supports_swiss_and_german_formats():
+    recognizer = AddressPatternRecognizer()
+
+    swiss = recognizer.analyze("Besuch: Bahnhofstrasse 12a, 8001 Zürich", entities=["ADDRESS"])
+    german = recognizer.analyze("Büro: Hauptstraße 7, 10115 Berlin", entities=["ADDRESS"])
+
+    assert any(r.entity_type == "ADDRESS" and r.start == 8 and r.end == 39 for r in swiss)
+    assert any(r.entity_type == "ADDRESS" and r.start == 6 and r.end == 33 for r in german)
+
+
+def test_address_recognizer_rejects_year_plus_town_collision():
+    recognizer = AddressPatternRecognizer()
+    results = recognizer.analyze("Stand: 2026 Zürich", entities=["ADDRESS"])
+
+    assert results == []
+
+
+def test_ahv_checksum_validation_accepts_valid_and_rejects_invalid_numbers():
+    valid = "756.3047.5009.62"
+    invalid = "756.3047.5009.63"
+
+    assert is_valid_ahv_number(valid) is True
+    assert is_valid_ahv_number(invalid) is False
+    recognizer = AHVNumberRecognizer()
+    assert len(recognizer.analyze(valid, entities=["AHV_NUMBER"])) == 1
+    assert recognizer.analyze(invalid, entities=["AHV_NUMBER"]) == []
+
+
+def test_uid_checksum_validation_accepts_valid_and_rejects_invalid_numbers():
+    valid = "CHE-105.816.788"
+    invalid = "CHE-105.816.789"
+
+    assert is_valid_uid_number(valid) is True
+    assert is_valid_uid_number(invalid) is False
+    recognizer = UIDNumberRecognizer()
+    assert len(recognizer.analyze(valid, entities=["UID_NUMBER"])) == 1
+    assert recognizer.analyze(invalid, entities=["UID_NUMBER"]) == []
+
+
+def test_glossary_supported_entities_follow_configured_types():
+    recognizer = FuzzyGlossaryRecognizer(glossary={"SAP": "IT_SYSTEM"})
+    assert recognizer.supported_entities == ["IT_SYSTEM"]
+    assert recognizer.analyze("SAP", entities=["IT_SYSTEM"])[0].entity_type == "IT_SYSTEM"
+
+    recognizer.set_glossary({"ZHAW": "ORGANIZATION", "SAP": "IT_SYSTEM"})
+    assert recognizer.supported_entities == ["IT_SYSTEM", "ORGANIZATION"]

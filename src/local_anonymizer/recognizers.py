@@ -18,8 +18,8 @@ try:
 except ImportError:
     pass
 
-from typing import Dict, List, Optional, Sequence, Tuple
-from presidio_analyzer import EntityRecognizer, RecognizerResult
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from presidio_analyzer import EntityRecognizer, Pattern, PatternRecognizer, RecognizerResult
 from gliner import GLiNER
 from rapidfuzz import fuzz
 
@@ -208,7 +208,6 @@ class GLiNERRecognizer(EntityRecognizer):
         "passport number": "ID_NUMBER",
         "id": "ID_NUMBER",
         "social security number": "ID_NUMBER",
-        "ahv nummer": "ID_NUMBER",
         "tax number": "ID_NUMBER",
         # Locations & Addresses
         "address": "LOCATION",
@@ -231,6 +230,14 @@ class GLiNERRecognizer(EntityRecognizer):
         "health data": "HEALTH_DATA",
         "salary": "FINANCIAL_DATA",
         "amount of money": "FINANCIAL_DATA",
+        # Software and IT infrastructure (the glossary remains the authoritative source for
+        # ambiguous product names such as SAP; these prompts are a fallback for unknown systems).
+        "software": "IT_SYSTEM",
+        "software system": "IT_SYSTEM",
+        "IT system": "IT_SYSTEM",
+        "application": "IT_SYSTEM",
+        "database": "IT_SYSTEM",
+        "platform": "IT_SYSTEM",
     }
 
     def __init__(
@@ -309,6 +316,15 @@ class GLiNERRecognizer(EntityRecognizer):
         if not labels_to_query:
             return []
 
+        # IT_SYSTEM labels are deliberately queried in a separate pass. They are a safety net
+        # for unknown software, while the glossary remains authoritative for ambiguous names
+        # such as SAP. Keeping the labels separate prevents the additional semantic candidates
+        # from changing the confidence and span selection of the established PII labels.
+        it_system_labels = [
+            label for label in labels_to_query if self.label_mapping.get(label) == "IT_SYSTEM"
+        ]
+        primary_labels = [label for label in labels_to_query if label not in it_system_labels]
+
         # Chunk the text to prevent the 384-token GLiNER truncation limit
         text_chunks = chunk_text_with_offsets(text, max_chars=700)
         valid_chunks: List[Tuple[int, int, str]] = [
@@ -320,41 +336,48 @@ class GLiNERRecognizer(EntityRecognizer):
         chunk_texts = [c[2] for c in valid_chunks]
         results: List[RecognizerResult] = []
 
-        try:
-            # High-performance batch inference (saturates multi-core CPU SIMD / GPU / Apple Silicon MPS)
-            batch_predictions = self.model.inference(
-                chunk_texts,
-                labels_to_query,
-                threshold=self.threshold,
-                batch_size=8,
-            )
-        except Exception:
-            # Fallback to single chunk prediction if inference/batching is unavailable
-            batch_predictions = [
-                self.model.predict_entities(t, labels_to_query, threshold=self.threshold)
-                for t in chunk_texts
-            ]
-
-        for (chunk_start, chunk_end, chunk_text), predicted_entities in zip(valid_chunks, batch_predictions):
-            for pred in predicted_entities:
-                gliner_label = pred["label"]
-                presidio_entity = self.label_mapping.get(gliner_label, gliner_label.upper())
-
-                # Filter if specific entities were requested
-                if entities and presidio_entity not in entities:
-                    continue
-
-                global_start = chunk_start + pred["start"]
-                global_end = chunk_start + pred["end"]
-
-                results.append(
-                    RecognizerResult(
-                        entity_type=presidio_entity,
-                        start=global_start,
-                        end=global_end,
-                        score=float(pred["score"]),
-                    )
+        def predict_for_labels(labels: List[str]) -> List[List[dict]]:
+            if not labels:
+                return []
+            try:
+                # High-performance batch inference (saturates multi-core CPU SIMD / GPU / Apple Silicon MPS)
+                return self.model.inference(
+                    chunk_texts,
+                    labels,
+                    threshold=self.threshold,
+                    batch_size=8,
                 )
+            except Exception:
+                # Fallback to single chunk prediction if inference/batching is unavailable
+                return [
+                    self.model.predict_entities(t, labels, threshold=self.threshold)
+                    for t in chunk_texts
+                ]
+
+        for predicted_batches in (
+            predict_for_labels(primary_labels),
+            predict_for_labels(it_system_labels),
+        ):
+            for (chunk_start, chunk_end, chunk_text), predicted_entities in zip(valid_chunks, predicted_batches):
+                for pred in predicted_entities:
+                    gliner_label = pred["label"]
+                    presidio_entity = self.label_mapping.get(gliner_label, gliner_label.upper())
+
+                    # Filter if specific entities were requested
+                    if entities and presidio_entity not in entities:
+                        continue
+
+                    global_start = chunk_start + pred["start"]
+                    global_end = chunk_start + pred["end"]
+
+                    results.append(
+                        RecognizerResult(
+                            entity_type=presidio_entity,
+                            start=global_start,
+                            end=global_end,
+                            score=float(pred["score"]),
+                        )
+                    )
 
         return results
 
@@ -384,7 +407,7 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
         self.high_confidence_threshold = high_confidence_threshold
         self.review_threshold = review_threshold
 
-        supported_entities = list(set(self.glossary.values())) if self.glossary else ["ORGANIZATION", "PERSON", "CUSTOM_TERM"]
+        supported_entities = sorted(set(self.glossary.values()))
         super().__init__(
             supported_entities=supported_entities,
             supported_language=supported_language,
@@ -396,6 +419,11 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
         self.glossary[term] = entity_type
         if entity_type not in self.supported_entities:
             self.supported_entities.append(entity_type)
+
+    def set_glossary(self, glossary: Optional[Dict[str, str]] = None) -> None:
+        """Replace the glossary and derive supported entity types from its configured values."""
+        self.glossary = glossary or {}
+        self.supported_entities = sorted(set(self.glossary.values()))
 
     def load(self) -> None:
         """Nothing to load for fuzzy glossary."""
@@ -479,3 +507,131 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
                 )
 
         return results
+
+
+CH_POSTAL_TOWN_REGEX = r"\b\d{4}\s+[A-ZÄÖÜ][\wäöüéèàßÄÖÜÉÈÀ-]+\b"
+DE_POSTAL_TOWN_REGEX = r"\b\d{5}\s+[A-ZÄÖÜ][\wäöüßÄÖÜ-]+\b"
+STREET_REGEX = (
+    r"\b[A-ZÄÖÜ][\wäöüßÄÖÜéèàÉÈÀ-]*"
+    r"(?:strasse|straße|str\.|weg|gasse|platz|allee|ring)\s+\d+[a-z]?\b"
+)
+FULL_CH_ADDRESS_REGEX = (
+    rf"{STREET_REGEX}(?:\s*,\s*|\s+)\d{{4}}\s+"
+    rf"[A-ZÄÖÜ][\wäöüéèàßÄÖÜÉÈÀ-]+\b"
+)
+FULL_DE_ADDRESS_REGEX = (
+    rf"{STREET_REGEX}(?:\s*,\s*|\s+)\d{{5}}\s+"
+    rf"[A-ZÄÖÜ][\wäöüßÄÖÜ-]+\b"
+)
+
+
+class AddressPatternRecognizer(PatternRecognizer):
+    """Deterministic Swiss/German address recognizer with a conservative year guard."""
+
+    def __init__(self, supported_language: str = "de", name: str = "AddressPatternRecognizer"):
+        super().__init__(
+            supported_entity="ADDRESS",
+            name=name,
+            supported_language=supported_language,
+            patterns=[
+                Pattern("full_ch_address", FULL_CH_ADDRESS_REGEX, 0.99),
+                Pattern("full_de_address", FULL_DE_ADDRESS_REGEX, 0.99),
+                Pattern("street_with_house_number", STREET_REGEX, 0.97),
+                Pattern("ch_postal_code_and_town", CH_POSTAL_TOWN_REGEX, 0.95),
+                Pattern("de_postal_code_and_town", DE_POSTAL_TOWN_REGEX, 0.95),
+            ],
+        )
+
+    def validate_result(self, text: str) -> Optional[bool]:
+        """Reject bare year-plus-town strings while keeping street-based addresses intact.
+
+        A four-digit Swiss postal code and a year are structurally indistinguishable without
+        more context. Bare values in the common 1900-2099 year range are therefore rejected;
+        a complete street address still matches through its full-address pattern.
+        """
+        if re.fullmatch(CH_POSTAL_TOWN_REGEX, text, flags=re.IGNORECASE):
+            postal_code = int(text[:4])
+            if 1900 <= postal_code <= 2099:
+                return False
+        return True
+
+
+class ChecksumPatternRecognizer(PatternRecognizer):
+    """PatternRecognizer variant that keeps only matches passing a checksum validator."""
+
+    def __init__(
+        self,
+        supported_entity: str,
+        pattern: str,
+        validator: Callable[[str], bool],
+        name: str,
+        supported_language: str = "de",
+    ):
+        self._checksum_validator = validator
+        super().__init__(
+            supported_entity=supported_entity,
+            name=name,
+            supported_language=supported_language,
+            patterns=[Pattern(name.lower(), pattern, 0.99)],
+        )
+
+    def validate_result(self, text: str) -> Optional[bool]:
+        return self._checksum_validator(text)
+
+
+def is_valid_ahv_number(value: str) -> bool:
+    """Validate a Swiss AHV number using its EAN-13-style check digit."""
+    digits = re.sub(r"\D", "", value)
+    if len(digits) != 13 or not digits.startswith("756"):
+        return False
+
+    weighted_sum = sum(
+        int(digit) * (1 if index % 2 == 0 else 3)
+        for index, digit in enumerate(digits[:12])
+    )
+    expected_check_digit = (10 - weighted_sum % 10) % 10
+    return expected_check_digit == int(digits[-1])
+
+
+def is_valid_uid_number(value: str) -> bool:
+    """Validate a Swiss CHE/UID number using the official Modulo-11 algorithm."""
+    if not re.fullmatch(r"CHE-\d{3}\.\d{3}\.\d{3}", value, flags=re.IGNORECASE):
+        return False
+
+    digits = re.sub(r"\D", "", value)
+    weighted_sum = sum(
+        int(digit) * weight
+        for digit, weight in zip(digits[:8], (5, 4, 3, 2, 7, 6, 5, 4))
+    )
+    expected_check_digit = 11 - (weighted_sum % 11)
+    if expected_check_digit == 10:
+        return False
+    if expected_check_digit == 11:
+        expected_check_digit = 0
+    return expected_check_digit == int(digits[-1])
+
+
+class AHVNumberRecognizer(ChecksumPatternRecognizer):
+    """Recognizer for dotted Swiss AHV/AVS numbers with checksum validation."""
+
+    def __init__(self, supported_language: str = "de", name: str = "AHVNumberRecognizer"):
+        super().__init__(
+            supported_entity="AHV_NUMBER",
+            pattern=r"\b756\.\d{4}\.\d{4}\.\d{2}\b",
+            validator=is_valid_ahv_number,
+            name=name,
+            supported_language=supported_language,
+        )
+
+
+class UIDNumberRecognizer(ChecksumPatternRecognizer):
+    """Recognizer for Swiss CHE/UID numbers with checksum validation."""
+
+    def __init__(self, supported_language: str = "de", name: str = "UIDNumberRecognizer"):
+        super().__init__(
+            supported_entity="UID_NUMBER",
+            pattern=r"\bCHE-\d{3}\.\d{3}\.\d{3}\b",
+            validator=is_valid_uid_number,
+            name=name,
+            supported_language=supported_language,
+        )

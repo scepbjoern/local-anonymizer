@@ -292,7 +292,13 @@ class LocalAnonymizer:
 
         # Setup Presidio AnalyzerEngine with lightweight blank NLP engine
         from presidio_analyzer import AnalyzerEngine, RecognizerResult
-        from local_anonymizer.recognizers import FuzzyGlossaryRecognizer, GLiNERRecognizer
+        from local_anonymizer.recognizers import (
+            AHVNumberRecognizer,
+            AddressPatternRecognizer,
+            FuzzyGlossaryRecognizer,
+            GLiNERRecognizer,
+            UIDNumberRecognizer,
+        )
 
         self._RecognizerResult = RecognizerResult
         nlp_engine = _create_blank_spacy_engine(languages=["de", "en"])
@@ -314,7 +320,13 @@ class LocalAnonymizer:
             review_threshold=fuzzy_review_threshold,
             supported_language=language,
         )
+        self.address_recognizer = AddressPatternRecognizer(supported_language=language)
+        self.ahv_recognizer = AHVNumberRecognizer(supported_language=language)
+        self.uid_recognizer = UIDNumberRecognizer(supported_language=language)
 
+        self.analyzer.registry.add_recognizer(self.address_recognizer)
+        self.analyzer.registry.add_recognizer(self.ahv_recognizer)
+        self.analyzer.registry.add_recognizer(self.uid_recognizer)
         self.analyzer.registry.add_recognizer(self.gliner_recognizer)
         self.analyzer.registry.add_recognizer(self.fuzzy_recognizer)
 
@@ -347,6 +359,12 @@ class LocalAnonymizer:
     def add_glossary_term(self, term: str, entity_type: str = "PERSON") -> None:
         """Add a term to the fuzzy glossary dynamically."""
         self.fuzzy_recognizer.add_term(term, entity_type)
+        self.glossary[term] = entity_type
+
+    def set_glossary(self, glossary: Optional[Dict[str, str]] = None) -> None:
+        """Replace the glossary and keep the recognizer's supported types in sync."""
+        self.glossary = glossary or {}
+        self.fuzzy_recognizer.set_glossary(self.glossary)
 
     def add_ignore_term(self, term: str) -> None:
         """Add a term to the ignore list."""
