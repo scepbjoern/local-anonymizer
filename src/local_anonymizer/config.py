@@ -26,6 +26,10 @@ if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
+# Silence harmless language mismatch warnings from presidio's default recognizer loader
+logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
+
+
 
 class AppConfig:
     def __init__(self):

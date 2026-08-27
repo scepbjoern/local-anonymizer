@@ -26,9 +26,11 @@ from local_anonymizer.anonymizer import (
     AnonymizationResult,
     DetectedEntity,
     EntityTreeNode,
+    HONORIFICS,
     LocalAnonymizer,
     build_entity_tree,
     clean_tag,
+    compute_smart_link_proposals,
 )
 from local_anonymizer.config import AppConfig, LOG_FILE
 from local_anonymizer.extractors import (
@@ -38,6 +40,9 @@ from local_anonymizer.extractors import (
     read_document_from_bytes,
     save_markdown_to_docx_bytes,
 )
+
+# Silence presidio analyzer language mismatch warnings
+logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
 
 
 # --- Data Models for Grouped Review ---
@@ -131,7 +136,7 @@ AVAILABLE_ENTITIES = [
     "IP_ADDRESS",
 ]
 
-# Surface tag options as a clean dictionary (resolves ValueError: Invalid value)
+# Surface tag options as a clean dictionary
 SURFACE_TAG_OPTIONS: Dict[str, str] = {
     "VOLLNAME": "Vollname (z. B. Julia Meier)",
     "VORNAME": "Vorname (z. B. Julia)",
@@ -139,12 +144,6 @@ SURFACE_TAG_OPTIONS: Dict[str, str] = {
     "ANREDE": "Anrede / Titel (z. B. Frau Meier, Mr. Smith)",
     "GENITIV": "Genitiv (z. B. Julias)",
     "KURZFORM": "Kurzform / Kürzel (z. B. JM)",
-}
-
-# German and English honorifics / titles for smart-linking proposals
-HONORIFICS: Set[str] = {
-    "frau", "herr", "herrn", "dr", "dr.", "prof", "prof.", "prof. dr.", "dozent", "dozentin",
-    "mr", "mr.", "mrs", "mrs.", "ms", "ms.", "miss", "sir", "madam"
 }
 
 
@@ -219,69 +218,6 @@ def build_anonymizer() -> LocalAnonymizer:
         enabled_entities=state.active_entities if state.active_entities else None,
         gliner_threshold=state.gliner_threshold,
     )
-
-
-def compute_smart_link_proposals():
-    """
-    Compute smart linking suggestions as interactive proposals (NO auto-commit!).
-    All entities start as standalone unless the user explicitly adopts a suggestion.
-    """
-    for g in state.entity_groups:
-        g.suggested_parent = None
-        g.suggested_tag = None
-        g.suggested_candidates = []
-
-        if g.parent_group_text:
-            continue
-
-        if g.entity_type != "PERSON":
-            continue
-
-        orig_lower = g.original_text.lower().strip()
-        words = g.original_text.split()
-        potential_candidates: List[Tuple[str, str]] = []
-
-        # 1. Single word: Check genitive stem or first/last name
-        if len(words) == 1:
-            stem = re.sub(r"(s|'s|’s)$", "", g.original_text, flags=re.IGNORECASE).strip()
-            if stem and stem.lower() != orig_lower:
-                for other in state.entity_groups:
-                    if other.key != g.key and other.entity_type == "PERSON" and not other.parent_group_text:
-                        other_words = other.original_text.split()
-                        if any(stem.lower() == w.lower() for w in other_words):
-                            potential_candidates.append((other.original_text, "GENITIV"))
-
-            for other in state.entity_groups:
-                if other.key != g.key and other.entity_type == "PERSON" and not other.parent_group_text:
-                    other_words = other.original_text.split()
-                    if len(other_words) > 1:
-                        if orig_lower == other_words[0].lower():
-                            potential_candidates.append((other.original_text, "VORNAME"))
-                        elif orig_lower == other_words[-1].lower():
-                            potential_candidates.append((other.original_text, "NACHNAME"))
-
-        # 2. Multi-word: Check German/English honorifics (e.g. "Frau Meier", "Mr. Smith")
-        elif len(words) >= 2 and words[0].lower().rstrip(".") in HONORIFICS:
-            last_name = words[-1].lower()
-            for other in state.entity_groups:
-                if other.key != g.key and other.entity_type == "PERSON" and not other.parent_group_text:
-                    other_words = other.original_text.split()
-                    if len(other_words) > 1 and other_words[0].lower().rstrip(".") not in HONORIFICS:
-                        if last_name == other_words[-1].lower():
-                            potential_candidates.append((other.original_text, "ANREDE"))
-
-        # Deduplicate candidates
-        unique_cand_dict: Dict[str, str] = {}
-        for cand_name, tag in potential_candidates:
-            unique_cand_dict.setdefault(cand_name, tag)
-
-        if len(unique_cand_dict) == 1:
-            cand_name, tag = list(unique_cand_dict.items())[0]
-            g.suggested_parent = cand_name
-            g.suggested_tag = tag
-        elif len(unique_cand_dict) > 1:
-            g.suggested_candidates = list(unique_cand_dict.keys())
-            g.suggested_tag = list(unique_cand_dict.values())[0]
 
 
 def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
@@ -489,6 +425,8 @@ def create_ui():
     raw_text_area = None
     progress_holder = None
     upload_ui_elem = None
+    reset_btn = None
+    ignore_input = None
     restore_anon_input = None
     map_json_input = None
     restored_preview = None
@@ -636,7 +574,7 @@ def create_ui():
             state.entity_groups = list(groups_dict.values())
 
             # Compute interactive smart-linking suggestions (Proposal model, NO auto-commit)
-            compute_smart_link_proposals()
+            compute_smart_link_proposals(state.entity_groups)
 
             # Compute initial placeholders so badges exist immediately
             compute_reactive_preview()
@@ -670,8 +608,16 @@ def create_ui():
             state.raw_text = read_document_from_bytes(data, filename)
             if raw_text_area is not None:
                 raw_text_area.value = state.raw_text
-            ui.notify(f"Datei '{filename}' erfolgreich geladen ({len(state.raw_text)} Zeichen).", type="positive")
-            await run_analysis()
+            ui.notify(f"Datei '{filename}' geladen ({len(state.raw_text)} Zeichen).", type="positive")
+
+            # Cleanly reset uploader queue to avoid max-files lock
+            if upload_ui_elem is not None:
+                upload_ui_elem.reset()
+            if reset_btn is not None:
+                reset_btn.set_visibility(True)
+
+            # Run analysis asynchronously so HTTP upload request returns immediately to browser
+            asyncio.create_task(run_analysis())
         except UnsupportedFileFormatError as fe:
             ui.notify(f"Nicht unterstütztes Format: {str(fe)}", type="negative")
         except ValueError as ve:
@@ -679,6 +625,9 @@ def create_ui():
         except Exception as ex:
             logging.error(f"Upload error: {ex}", exc_info=True)
             ui.notify(f"Fehler beim Upload: {str(ex)}", type="negative")
+
+    def handle_rejected(e):
+        ui.notify("Datei wurde abgelehnt (Dateiformat oder Grösse ungültig).", type="negative")
 
     def reset_workspace():
         """Reset raw text, filename, and analysis table."""
@@ -695,6 +644,10 @@ def create_ui():
             export_holder.clear()
         if table_holder is not None:
             table_holder.clear()
+        if upload_ui_elem is not None:
+            upload_ui_elem.reset()
+        if reset_btn is not None:
+            reset_btn.set_visibility(False)
         ui.notify("Workspace und geladene Datei zurückgesetzt.", type="info", icon="delete_sweep")
 
     def get_sorted_groups() -> List[EntityGroup]:
@@ -773,6 +726,8 @@ def create_ui():
                 row_bg = "bg-amber-50" if master.needs_review else ("bg-white" if node_idx % 2 == 0 else "bg-slate-50")
 
                 with ui.column().classes("w-full mb-2"):
+                    child_badge_refs: List[Tuple[EntityGroup, Any]] = []
+
                     # Master Row
                     with ui.expansion().classes(f"w-full border rounded {row_bg}") as exp:
                         with exp.add_slot("header"):
@@ -790,8 +745,8 @@ def create_ui():
                                     ui.label(master.original_text).classes("font-mono text-sm font-bold text-slate-800")
                                     ui.badge(f"{master.count}x", color="primary" if master.count > 1 else "grey-6").props("dense")
 
-                                    # Assigned Placeholder Badge
-                                    ui.badge(master.placeholder, color="blue-9").props("outline dense").classes("text-xs font-mono font-bold")
+                                    # Master Placeholder Badge
+                                    master_badge = ui.badge(master.placeholder, color="blue-9").props("outline dense").classes("text-xs font-mono font-bold")
 
                                     if has_children:
                                         ui.badge(f"🔗 {len(root_node.children)} verknüpft", color="teal").props("dense").tooltip("Hauptperson mit verknüpften Schreibweisen")
@@ -811,25 +766,27 @@ def create_ui():
                                         on_change=make_group_select(master),
                                     ).props("dense outlined bg-white").classes("w-36 text-xs")
 
-                                # 3. Role Input Field
+                                # 3. Role Input Field (In-place badge update WITHOUT losing focus!)
                                 with ui.row().classes("items-center gap-1"):
-                                    def make_role_change(grp):
+                                    def make_role_change(grp, m_badge, c_badges):
                                         def on_change(e):
-                                            grp.role = e.value.strip()
+                                            grp.role = (e.value or "").strip()
+                                            compute_reactive_preview()
+                                            m_badge.set_text(grp.placeholder)
+                                            for c_grp, c_badge in c_badges:
+                                                c_badge.set_text(c_grp.placeholder)
                                             refresh_preview_and_exports()
-                                            build_review_table()
                                         return on_change
 
                                     ui.input(
                                         label="Rolle (optional)",
                                         value=master.role,
                                         placeholder="z.B. Student",
-                                        on_change=make_role_change(master),
-                                    ).props("dense outlined bg-white").classes("w-32 text-xs")
+                                        on_change=make_role_change(master, master_badge, child_badge_refs),
+                                    ).props("dense outlined bg-white debounce=300").classes("w-32 text-xs")
 
                                 # 4. Interactive Smart-Linking Proposal (Confirmation Model) or Link Dropdown
                                 if not has_children:
-                                    # If exactly 1 suggestion exists: Show 1-Click Proposal Button
                                     if master.suggested_parent and not master.parent_group_text:
                                         with ui.row().classes("items-center gap-1"):
                                             def make_apply_suggestion(grp, p_target, tag):
@@ -839,7 +796,6 @@ def create_ui():
                                                     grp.suggested_parent = None
                                                     grp.suggested_tag = None
                                                     grp.suggested_candidates = []
-                                                    # Ensure parent has VOLLNAME if not set
                                                     p_match = next((x for x in state.entity_groups if x.original_text == p_target), None)
                                                     if p_match and not p_match.surface_tag:
                                                         p_match.surface_tag = "VOLLNAME"
@@ -856,7 +812,6 @@ def create_ui():
                                                 on_click=make_apply_suggestion(master, master.suggested_parent, master.suggested_tag or "VORNAME"),
                                             ).props("outline dense size=sm").tooltip(f"Vorschlag übernehmen: Als {tag_label} verknüpfen")
 
-                                    # If multiple candidates exist: Show disambiguation info
                                     elif master.suggested_candidates:
                                         ui.badge(f"💡 {len(master.suggested_candidates)} Namenskandidaten", color="amber-8").props("outline dense").tooltip("Mehrere passende Personen gefunden. Bitte im Dropdown rechts auswählen.")
 
@@ -903,7 +858,8 @@ def create_ui():
                                             current_ignores = parse_ignore_terms(state.ignore_terms_text)
                                             if term not in current_ignores:
                                                 state.ignore_terms_text += f", {term}"
-                                                ignore_input.value = state.ignore_terms_text
+                                                if ignore_input is not None:
+                                                    ignore_input.value = state.ignore_terms_text
                                                 save_current_config()
                                             grp.enabled = False
                                             ui.notify(f"'{term}' zur Ignore-Liste hinzugefügt.", type="info")
@@ -937,9 +893,10 @@ def create_ui():
                                         ui.checkbox(value=child.enabled, on_change=make_group_check(child)).props("dense")
                                         ui.label(child.original_text).classes("font-mono text-sm font-bold text-teal-900")
                                         ui.badge(f"{child.count}x", color="teal-6").props("dense")
-                                        ui.badge(child.placeholder, color="teal-9").props("outline dense").classes("text-xs font-mono font-bold")
+                                        c_badge = ui.badge(child.placeholder, color="teal-9").props("outline dense").classes("text-xs font-mono font-bold")
+                                        child_badge_refs.append((child, c_badge))
 
-                                    # Surface Form Selector (using valid dictionary options)
+                                    # Surface Form Selector
                                     with ui.row().classes("items-center gap-1"):
                                         def make_surface_change(c_grp):
                                             def on_change(e):
@@ -988,7 +945,7 @@ def create_ui():
         with ui.card().classes("w-80 p-4 shrink-0 bg-slate-50 border shadow-sm"):
             ui.label("⚙️ Konfiguration").classes("text-base font-bold text-slate-800 mb-3")
 
-            # Format Mode Selector (Phase 3 Feature)
+            # Format Mode Selector
             ui.label("Platzhalter-Format:").classes("text-xs font-semibold text-slate-700 mb-1")
             def on_mode_change(e):
                 state.format_mode = e.value
@@ -1084,7 +1041,7 @@ def create_ui():
                 with ui.tab_panel(tab_anonymize):
                     ui.label("Stufe 1: Dokument laden & Text-Eingabe").classes("text-base font-bold text-slate-800 mb-1")
                     
-                    # Direct Document Upload in Main Workspace with Reset Button
+                    # Direct Document Upload in Main Workspace with Conditional Reset Button
                     with ui.card().classes("w-full p-3 bg-slate-50 border border-dashed border-slate-300 rounded-lg mb-3"):
                         with ui.row().classes("w-full items-center justify-between gap-4 flex-wrap"):
                             with ui.row().classes("items-center gap-2"):
@@ -1096,20 +1053,24 @@ def create_ui():
                             with ui.row().classes("items-center gap-2"):
                                 upload_ui_elem = ui.upload(
                                     on_upload=handle_upload,
+                                    on_rejected=handle_rejected,
                                     auto_upload=True,
                                     max_files=1,
-                                ).props("accept='.txt,.md,.docx,.pdf,.json,.csv' outlined dense flat").classes("w-72")
+                                ).props('accept=".txt,.md,.docx,.pdf,.json,.csv" outlined dense flat').classes("w-72")
                                 
-                                ui.button(
+                                reset_btn = ui.button(
                                     "🗑️ Zurücksetzen",
                                     icon="delete_sweep",
                                     color="slate",
                                     on_click=reset_workspace,
                                 ).props("outline dense size=sm").tooltip("Workspace leeren und Dokument entladen")
+                                reset_btn.set_visibility(bool(state.raw_text and state.raw_text.strip()))
 
                     with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note", value=True).classes("w-full mb-2"):
                         def on_raw_text_change(e):
                             state.raw_text = e.value
+                            if reset_btn is not None:
+                                reset_btn.set_visibility(bool(e.value and e.value.strip()))
                         raw_text_area = ui.textarea(
                             value=state.raw_text,
                             placeholder="Text hier eingeben oder Dokument oben hochladen...",
@@ -1166,13 +1127,6 @@ def create_ui():
 
                 # TAB 2: Restore
                 with ui.tab_panel(tab_restore):
-                    def on_tab_restore_opened():
-                        if not state.restore_mapping and state.current_mapping:
-                            state.restore_mapping = dict(state.current_mapping)
-                            if map_json_input is not None:
-                                map_json_input.value = json.dumps(state.restore_mapping, indent=2, ensure_ascii=False)
-                            ui.notify("Mapping aus aktuellem Anonymisierungs-Review automatisch übernommen.", type="info")
-
                     ui.label("De-Anonymisierung / Wiederherstellung").classes("text-base font-bold text-slate-800 mb-1")
                     ui.label("Laden Sie die vom Cloud-LLM beantwortete Datei (.docx, .md, .txt) oder fügen Sie den Text ein:").classes("text-sm text-slate-600 mb-4")
 
@@ -1202,7 +1156,7 @@ def create_ui():
                                 on_upload=handle_restore_file_upload,
                                 auto_upload=True,
                                 max_files=1,
-                            ).props("accept='.txt,.md,.docx,.pdf' outlined dense flat").classes("w-full mb-2")
+                            ).props('accept=".txt,.md,.docx,.pdf" outlined dense flat').classes("w-full mb-2")
 
                             def on_anon_change(e):
                                 state.restore_anon_text = e.value
@@ -1230,7 +1184,7 @@ def create_ui():
                                 except Exception as ex:
                                     ui.notify(f"Ungültige JSON-Mapping-Datei: {str(ex)}", type="negative")
 
-                            ui.upload(on_upload=on_map_upload, auto_upload=True, max_files=1).props("accept='.json' outlined dense flat").classes("w-full mb-2")
+                            ui.upload(on_upload=on_map_upload, auto_upload=True, max_files=1).props('accept=".json" outlined dense flat').classes("w-full mb-2")
 
                             def on_map_text_change(e):
                                 try:
