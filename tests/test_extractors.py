@@ -273,20 +273,89 @@ def test_clean_extracted_pdf_markdown():
     from local_anonymizer.extractors import clean_extracted_pdf_markdown
 
     sample = (
+        "## Dokumenttitel\n\n"
+        "<mark>Dr. Andreas Schönenberger</mark> leitet das Projekt.\n"
+        "Quelle: <u>www.sanitas.com</u>\n\n"
         "<!-- Start of picture text -->\n"
         "CEO<br>Dr. Andreas<br>Schönenberger<br>CMO / New<br>Corporate  CFO<br>\n"
         "Elias Frühauf Jan Schultz Kaspar  WandhovenWolfgang  Tobias Caluori<br>Trachsel<br>\n"
         "<!-- End of picture text -->"
     )
 
-    cleaned = clean_extracted_pdf_markdown(sample)
-    # Check that comment markers and <br> are stripped
+    # 1. With extract_picture_text=True
+    cleaned = clean_extracted_pdf_markdown(sample, extract_picture_text=True)
+    assert "<mark>" not in cleaned and "</mark>" not in cleaned
+    assert "<u>" not in cleaned and "</u>" not in cleaned
+    assert "Dr. Andreas Schönenberger leitet das Projekt." in cleaned
+    assert "Quelle: www.sanitas.com" in cleaned
     assert "<!-- Start of picture text -->" not in cleaned
-    assert "<!-- End of picture text -->" not in cleaned
     assert "<br>" not in cleaned
-    # Check that glued PascalCase words are separated
     assert "Wandhoven Wolfgang" in cleaned
-    assert "Elias Frühauf" in cleaned
+
+    # 2. With extract_picture_text=False (picture text completely omitted)
+    cleaned_no_pic = clean_extracted_pdf_markdown(sample, extract_picture_text=False)
+    assert "Dr. Andreas Schönenberger leitet das Projekt." in cleaned_no_pic
+    assert "Quelle: www.sanitas.com" in cleaned_no_pic
+    assert "Wandhoven" not in cleaned_no_pic
+    assert "Jan Schultz" not in cleaned_no_pic
+
+
+def test_pdf_headers_footers_toggle():
+    import pymupdf
+    from local_anonymizer.extractors import extract_text_from_pdf_bytes
+
+    doc = pymupdf.open()
+    for i in range(1, 3):
+        page = doc.new_page(width=595, height=842)
+        # Header
+        page.insert_text((50, 30), "Vertrauliche Kopfzeile Sanitas", fontsize=9)
+        # Body
+        page.insert_text((50, 150), f"Haupttext des Dokuments auf Seite {i}.", fontsize=11)
+        # Footer
+        page.insert_text((50, 800), f"Seite {i} von 2 - Fußzeile", fontsize=9)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    # Default (include_headers_footers=False): Suppresses repeated running headers/footers
+    text_no_hf = extract_text_from_pdf_bytes(pdf_bytes, include_headers_footers=False)
+    assert "Haupttext des Dokuments auf Seite 1." in text_no_hf
+    assert "Haupttext des Dokuments auf Seite 2." in text_no_hf
+    assert "Vertrauliche Kopfzeile Sanitas" not in text_no_hf
+    assert "Fußzeile" not in text_no_hf
+
+    # With headers and footers (include_headers_footers=True)
+    text_with_hf = extract_text_from_pdf_bytes(pdf_bytes, include_headers_footers=True)
+    assert "Haupttext des Dokuments auf Seite 1." in text_with_hf
+    assert "Vertrauliche Kopfzeile Sanitas" in text_with_hf
+    assert "Fußzeile" in text_with_hf
+
+
+def test_docx_headers_footers_toggle():
+    import io
+    import docx
+    from local_anonymizer.extractors import extract_text_from_docx_bytes
+
+    doc = docx.Document()
+    sec = doc.sections[0]
+    sec.header.paragraphs[0].text = "Header Text in Word"
+    doc.add_paragraph("Body paragraph in Word.")
+    sec.footer.paragraphs[0].text = "Footer Text in Word"
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    docx_bytes = buf.getvalue()
+
+    # Default (include_headers_footers=False)
+    text_no_hf = extract_text_from_docx_bytes(docx_bytes, include_headers_footers=False)
+    assert "Body paragraph in Word." in text_no_hf
+    assert "Header Text in Word" not in text_no_hf
+    assert "Footer Text in Word" not in text_no_hf
+
+    # With headers and footers (include_headers_footers=True)
+    text_with_hf = extract_text_from_docx_bytes(docx_bytes, include_headers_footers=True)
+    assert "Body paragraph in Word." in text_with_hf
+    assert "Header Text in Word" in text_with_hf
+    assert "Footer Text in Word" in text_with_hf
 
 
 

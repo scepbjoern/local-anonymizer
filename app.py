@@ -149,6 +149,11 @@ class AppState:
         self.restore_mapping: Dict[str, str] = {}
         self.restored_text: str = ""
 
+        # Document extraction settings
+        self.include_headers_footers: bool = False
+        self.extract_picture_text: bool = True
+        self.last_raw_bytes: Optional[bytes] = None
+
 
 state = AppState()
 
@@ -533,6 +538,7 @@ def create_ui():
 
     async def extract_and_load_file_bytes(raw_bytes: bytes, filename: str):
         """Asynchronously extract structured text from document bytes with live UI progress."""
+        state.last_raw_bytes = raw_bytes
         if extraction_progress_card is not None and extraction_progress_bar is not None and extraction_progress_label is not None:
             extraction_progress_card.set_visibility(True)
             extraction_progress_bar.set_value(0.0)
@@ -548,7 +554,14 @@ def create_ui():
                 loop.call_soon_threadsafe(extraction_progress_label.set_text, f"{msg} ({int(val * 100)}%)")
 
         try:
-            text = await asyncio.to_thread(read_document_from_bytes, raw_bytes, filename, progress_cb)
+            text = await asyncio.to_thread(
+                read_document_from_bytes,
+                raw_bytes,
+                filename,
+                progress_cb,
+                state.include_headers_footers,
+                state.extract_picture_text,
+            )
             load_content_into_workspace(text, filename)
         except Exception as ex:
             err_msg = f"{type(ex).__name__}: {str(ex)}"
@@ -591,6 +604,7 @@ def create_ui():
         """Reset raw text, filename, and analysis table."""
         state.filename = ""
         state.raw_text = ""
+        state.last_raw_bytes = None
         state.entity_groups = []
         state.current_mapping = {}
         state.current_anon_text = ""
@@ -1524,9 +1538,49 @@ def create_ui():
                         """)
 
                     # Info badge explaining digital text & image/OCR scope
-                    with ui.row().classes("w-full items-center gap-1.5 px-3 py-2 bg-blue-50/70 border border-blue-200/80 rounded-lg text-xs text-slate-700 mb-3"):
+                    with ui.row().classes("w-full items-center gap-1.5 px-3 py-2 bg-blue-50/70 border border-blue-200/80 rounded-lg text-xs text-slate-700 mb-2"):
                         ui.icon("info", size="xs").classes("text-blue-600 shrink-0")
                         ui.label("Hinweis: Extrahiert digitalen Text, Formatierungen, Listen & Tabellen aus Word (.docx), PDF, Text (.txt, .md), CSV und JSON. Bei PDFs werden auch Vektordiagramme, Formularfelder und bestehende PDF-Textschichten erfasst (daher oft mehr Text als in Word). Reine Screenshots/Bilder ohne Textschicht erfordern OCR (für eine spätere Phase geplant).").classes("flex-1 text-[11px] leading-relaxed")
+
+                    # Extraction settings row with detailed rationale tooltip
+                    async def on_extraction_opt_change():
+                        if state.last_raw_bytes and state.filename:
+                            await extract_and_load_file_bytes(state.last_raw_bytes, state.filename)
+
+                    with ui.row().classes("w-full items-center justify-between gap-3 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg mb-3 flex-wrap text-xs text-slate-700"):
+                        with ui.row().classes("items-center gap-1.5"):
+                            ui.icon("tune", size="xs").classes("text-slate-500")
+                            ui.label("Erweiterte Extraktions-Optionen:").classes("font-semibold text-slate-700")
+
+                        with ui.row().classes("items-center gap-4 flex-wrap"):
+                            async def on_toggle_headers_footers(e):
+                                state.include_headers_footers = bool(e.value)
+                                await on_extraction_opt_change()
+
+                            async def on_toggle_picture_text(e):
+                                state.extract_picture_text = bool(e.value)
+                                await on_extraction_opt_change()
+
+                            ui.checkbox(
+                                "Kopf- und Fußzeilen einbeziehen",
+                                value=state.include_headers_footers,
+                                on_change=on_toggle_headers_footers,
+                            ).props("dense size=sm").tooltip("Laufende Kopf- und Fußzeilen (z. B. Seitenzahlen, Dokumenttitel) mit einlesen. Standard: Aus.")
+
+                            with ui.row().classes("items-center gap-1"):
+                                ui.checkbox(
+                                    "Text aus PDF-Bildern & Grafiken extrahieren",
+                                    value=state.extract_picture_text,
+                                    on_change=on_toggle_picture_text,
+                                ).props("dense size=sm").tooltip("Liest Textboxen in Diagrammen & Vektorgrafiken aus.")
+                                with ui.button(icon="help_outline").props("flat round dense size=xs color=grey").classes("p-0 min-h-0 min-w-0"):
+                                    with ui.tooltip().classes("bg-slate-900 text-white text-xs max-w-md p-2.5 leading-relaxed shadow-lg rounded-lg"):
+                                        ui.markdown(
+                                            "**Warum teilweise ausschalten?**\n\n"
+                                            "Lineare PDF-Parser lesen Text zeilenweise von links nach rechts über die gesamte Seite. "
+                                            "Bei mehrspaltigen **2D-Organigrammen, Stammbäumen oder Flussdiagrammen** werden dadurch Boxen quer durcheinandergewürfelt und Vor- bzw. Nachnamen verschiedener Personen vertauscht. "
+                                            "Deaktivieren Sie diese Option, um solche Diagramme sauber zu überspringen."
+                                        )
 
                     # Live extraction progress card (for large PDF/Docx files)
                     with ui.card().classes("w-full p-3 bg-blue-50 border border-blue-200 rounded-xl mb-3 flex-col gap-1") as extraction_progress_card:

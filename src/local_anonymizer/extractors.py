@@ -230,7 +230,7 @@ def _add_formatted_markdown_runs(para, text: str) -> None:
             para.add_run(part)
 
 
-def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
+def extract_text_from_docx_bytes(raw_bytes: bytes, include_headers_footers: bool = False) -> str:
     """
     Extract text from Microsoft Word .docx bytes with:
     - Level 1: XML Outline Level (w:outlineLvl 0..3) for custom corporate heading templates
@@ -238,10 +238,19 @@ def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
     - Level 3: Bullet & numbered lists via XML numbering resolution (w:numFmt) and list styles
     - Level 4: Strict false-positive protection for bold text (only < 60 chars, no ending period, >= 16pt)
     - Level 5: Markdown tables
+    - Optional: Header & footer extraction (include_headers_footers=True)
     """
     import docx
     doc = docx.Document(io.BytesIO(raw_bytes))
     full_text = []
+
+    # Optional headers extraction
+    if include_headers_footers and doc.sections:
+        for sec in doc.sections:
+            for p in sec.header.paragraphs:
+                if p.text and p.text.strip():
+                    full_text.append(p.text.strip())
+
     for para in doc.paragraphs:
         if not para.text or not para.text.strip():
             continue
@@ -278,30 +287,54 @@ def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
         elif "quote" in style_name or "zitat" in style_name:
             text = f"> {text}"
         else:
-            # Stufe 4: Direktauszeichnungs-Heuristik mit striktem Falsch-Positiv-Schutz:
-            # Nur kurze Absätze (< 60 Zeichen), ohne Schlusspunkt, mindestens 16pt groß und ganz fett.
-            is_bold_title = False
-            try:
-                runs = [r for r in para.runs if r.text and r.text.strip()]
-                if runs and all(r.bold for r in runs) and len(text) < 60 and not text.endswith("."):
-                    sizes = [r.font.size.pt for r in runs if r.font and r.font.size and r.font.size.pt]
-                    if sizes and min(sizes) >= 16:
-                        is_bold_title = True
-            except Exception:
-                pass
+            # Stufe 4: Strict bold-as-heading detection
+            # Only treat as heading if:
+            # a) All runs are bold
+            # b) Total length is short (< 60 chars)
+            # c) Does NOT end with punctuation (., !, ?)
+            # d) Font size is larger than standard body text (>= 16pt / 32 half-points)
+            is_all_bold = (
+                len(para.runs) > 0
+                and all(r.bold for r in para.runs if r.text and r.text.strip())
+            )
+            has_no_sentence_end = not text.endswith((".", "!", "?"))
+            is_short = len(text) < 60
 
-            if is_bold_title:
-                text = f"# {text}"
+            is_large_font = False
+            for r in para.runs:
+                if r.font and r.font.size and r.font.size.pt >= 16:
+                    is_large_font = True
+                    break
+
+            if is_all_bold and is_short and has_no_sentence_end and is_large_font:
+                text = f"## {text}"
+            else:
+                # Retain inline bold, italic, code for body text
+                formatted_runs = []
+                for r in para.runs:
+                    r_text = r.text
+                    if not r_text:
+                        continue
+                    if r.bold and r.italic:
+                        formatted_runs.append(f"***{r_text.strip()}***" if r_text.strip() else r_text)
+                    elif r.bold:
+                        formatted_runs.append(f"**{r_text.strip()}**" if r_text.strip() else r_text)
+                    elif r.italic:
+                        formatted_runs.append(f"*{r_text.strip()}*" if r_text.strip() else r_text)
+                    else:
+                        formatted_runs.append(r_text)
+                if formatted_runs:
+                    text = "".join(formatted_runs).strip()
 
         full_text.append(text)
 
-    # Also extract text from tables as structured Markdown tables
+    # Stufe 5: Tabellen als Markdown
     for table in doc.tables:
         rows_text = []
         for row in table.rows:
-            row_cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
-            if any(row_cells):
-                rows_text.append(row_cells)
+            cell_texts = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            if any(cell_texts):
+                rows_text.append(cell_texts)
         if rows_text:
             header = rows_text[0]
             table_md = ["| " + " | ".join(header) + " |", "| " + " | ".join([":---"] * len(header)) + " |"]
@@ -311,12 +344,21 @@ def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
                 table_md.append("| " + " | ".join(r[:len(header)]) + " |")
             full_text.append("\n".join(table_md))
 
-    return "\n\n".join(full_text)
+    # Optional footers extraction
+    if include_headers_footers and doc.sections:
+        for sec in doc.sections:
+            for p in sec.footer.paragraphs:
+                if p.text and p.text.strip():
+                    full_text.append(p.text.strip())
+
+    res_text = "\n\n".join(full_text)
+    # Strip HTML tags like <mark>, <u>, <ins>, <span>
+    return re.sub(r"</?(?:mark|ins|u|span|font|strike|del)(?:\s+[^>]*)?>", "", res_text, flags=re.IGNORECASE).strip()
 
 
-def extract_text_from_docx(path: Path) -> str:
+def extract_text_from_docx(path: Path, include_headers_footers: bool = False) -> str:
     """Extract text from Microsoft Word .docx files."""
-    return extract_text_from_docx_bytes(safe_read_bytes(path))
+    return extract_text_from_docx_bytes(safe_read_bytes(path), include_headers_footers=include_headers_footers)
 
 
 def create_docx_from_markdown(md_text: str):
@@ -408,34 +450,44 @@ def save_markdown_to_docx_bytes(md_text: str) -> bytes:
     return buf.getvalue()
 
 
-def clean_extracted_pdf_markdown(md_text: str) -> str:
+def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True) -> str:
     """
     Clean up artifact tags, picture text boxes, and HTML formatting from extracted PDF markdown.
-    - Normalizes <!-- Start/End of picture text --> into clean text sections.
-    - Converts <br> / <br/> tags into natural linebreaks / word spacing.
-    - Repairs glued PascalCase words (e.g. 'WandhovenWolfgang' -> 'Wandhoven Wolfgang').
-    - Removes zero-width spaces and normalizes excessive blank lines.
+    - Removes inline HTML tags like <mark>, <u>, <ins>, <span>, <font>, <del>, <strike> while preserving their text.
+    - If extract_picture_text is False: Completely strips <!-- Start/End of picture text --> blocks.
+    - If extract_picture_text is True: Normalizes picture text blocks, breaks <br>, and repairs glued PascalCase words.
     """
     if not md_text:
         return ""
 
     text = md_text
 
-    # 1. Normalize picture text comment markers
-    text = re.sub(r"<!--\s*Start of picture text\s*-->", "\n\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<!--\s*End of picture text\s*-->", "\n\n", text, flags=re.IGNORECASE)
+    # 1. Remove inline HTML markup tags (e.g. <mark>, <u>, <ins>, <span>, etc.) preserving the text inside
+    text = re.sub(r"</?(?:mark|ins|u|span|font|strike|del)(?:\s+[^>]*)?>", "", text, flags=re.IGNORECASE)
 
-    # 2. Replace HTML line breaks with clean linebreaks
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    # 2. Handle picture/graphics text blocks
+    if not extract_picture_text:
+        # Strip all picture text blocks entirely
+        text = re.sub(r"<!--\s*Start of picture text\s*-->.*?<!--\s*End of picture text\s*-->", "", text, flags=re.DOTALL | re.IGNORECASE)
+    else:
+        # Normalize picture text comment markers
+        text = re.sub(r"<!--\s*Start of picture text\s*-->", "\n\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"<!--\s*End of picture text\s*-->", "\n\n", text, flags=re.IGNORECASE)
 
-    # 3. Separate glued PascalCase words in picture/table extractions (lowercase followed by uppercase, ignoring URLs)
-    def _separate_pascal_case(match: re.Match) -> str:
-        s = match.group(0)
-        if "http" in s or "www." in s or "/" in s:
-            return s
-        return re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", s)
+        # Replace HTML line breaks with clean linebreaks
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
 
-    text = re.sub(r"\b[A-Za-zÄÖÜäöüß]{4,}\b", _separate_pascal_case, text)
+        # Separate glued PascalCase words in picture/table extractions (lowercase followed by uppercase, ignoring URLs)
+        def _separate_pascal_case(match: re.Match) -> str:
+            s = match.group(0)
+            if "http" in s or "www." in s or "/" in s:
+                return s
+            return re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", s)
+
+        text = re.sub(r"\b[A-Za-zÄÖÜäöüß]{4,}\b", _separate_pascal_case, text)
+
+    # 3. Clean any remaining orphan comments or brackets
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
 
     # 4. Normalize multiple whitespace and excessive newlines
     text = re.sub(r"[ \t]+", " ", text)
@@ -448,6 +500,8 @@ def extract_text_from_pdf_bytes(
     raw_bytes: bytes,
     filename: str = "document.pdf",
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    include_headers_footers: bool = False,
+    extract_picture_text: bool = True,
 ) -> str:
     """
     Extract structured Markdown text from PDF bytes using pymupdf4llm.
@@ -469,6 +523,9 @@ def extract_text_from_pdf_bytes(
             f"The file appears to be a scanned/image-based PDF requiring OCR, or an empty document."
         )
 
+    # For 1-page documents, top text is usually document title; for multi-page, running headers/footers can be suppressed
+    use_headers_footers = include_headers_footers or (doc_pages <= 1)
+
     try:
         if progress_callback and doc_pages > 1:
             page_mds = []
@@ -479,7 +536,12 @@ def extract_text_from_pdf_bytes(
                     f"PDF-Seite {page_idx + 1} von {doc_pages} wird extrahiert..."
                 )
                 try:
-                    p_md = pymupdf4llm.to_markdown(doc, pages=[page_idx])
+                    p_md = pymupdf4llm.to_markdown(
+                        doc,
+                        pages=[page_idx],
+                        header=use_headers_footers,
+                        footer=use_headers_footers,
+                    )
                     page_mds.append(p_md.strip())
                 except Exception:
                     page_mds.append(doc[page_idx].get_text().strip())
@@ -487,17 +549,29 @@ def extract_text_from_pdf_bytes(
         else:
             if progress_callback:
                 progress_callback(1, max(1, doc_pages), "PDF-Inhalt wird extrahiert...")
-            md_text = pymupdf4llm.to_markdown(doc)
+            md_text = pymupdf4llm.to_markdown(
+                doc,
+                header=use_headers_footers,
+                footer=use_headers_footers,
+            )
+
+        if not md_text.strip() and has_text:
+            md_text = pymupdf4llm.to_markdown(doc, header=True, footer=True)
     except Exception:
         pages_text = [page.get_text().strip() for page in doc if page.get_text().strip()]
         md_text = "\n\n--- Page Break ---\n\n".join(pages_text)
     finally:
         doc.close()
 
-    return clean_extracted_pdf_markdown(md_text)
+    return clean_extracted_pdf_markdown(md_text, extract_picture_text=extract_picture_text)
 
 
-def extract_text_from_pdf(path: Path, progress_callback: Optional[Callable[[int, int, str], None]] = None) -> str:
+def extract_text_from_pdf(
+    path: Path,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    include_headers_footers: bool = False,
+    extract_picture_text: bool = True,
+) -> str:
     """
     Extract structured Markdown text from PDF files using pymupdf4llm.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
@@ -505,7 +579,13 @@ def extract_text_from_pdf(path: Path, progress_callback: Optional[Callable[[int,
     path = Path(path)
     if path.exists():
         raw_data = safe_read_bytes(path)
-        return extract_text_from_pdf_bytes(raw_data, filename=path.name, progress_callback=progress_callback)
+        return extract_text_from_pdf_bytes(
+            raw_data,
+            filename=path.name,
+            progress_callback=progress_callback,
+            include_headers_footers=include_headers_footers,
+            extract_picture_text=extract_picture_text,
+        )
 
     import pymupdf
     import pymupdf4llm
@@ -520,28 +600,39 @@ def extract_text_from_pdf(path: Path, progress_callback: Optional[Callable[[int,
             f"The file appears to be a scanned/image-based PDF requiring OCR, or an empty document."
         )
 
+    use_headers_footers = include_headers_footers or (doc_pages <= 1)
+
     try:
-        md_text = pymupdf4llm.to_markdown(doc)
+        md_text = pymupdf4llm.to_markdown(
+            doc,
+            header=use_headers_footers,
+            footer=use_headers_footers,
+        )
+        if not md_text.strip() and has_text:
+            md_text = pymupdf4llm.to_markdown(doc, header=True, footer=True)
     except Exception:
         pages_text = [page.get_text().strip() for page in doc if page.get_text().strip()]
         md_text = "\n\n--- Page Break ---\n\n".join(pages_text)
     finally:
         doc.close()
 
-    return clean_extracted_pdf_markdown(md_text)
+    return clean_extracted_pdf_markdown(md_text, extract_picture_text=extract_picture_text)
 
 
 def read_document_from_bytes(
     data: bytes,
     filename: str,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    include_headers_footers: bool = False,
+    extract_picture_text: bool = True,
 ) -> str:
-    """Unified document reader from in-memory bytes with optional progress callback."""
+    """Unified document reader from in-memory bytes with optional progress callback and extraction options."""
     ext = Path(filename).suffix.lower()
     if ext in [".txt", ".md"]:
         if progress_callback:
             progress_callback(1, 1, "Textdatei wird eingelesen...")
-        return extract_text_from_txt_bytes(data)
+        text = extract_text_from_txt_bytes(data)
+        return re.sub(r"</?(?:mark|ins|u|span|font|strike|del)(?:\s+[^>]*)?>", "", text, flags=re.IGNORECASE).strip()
     elif ext == ".json":
         if progress_callback:
             progress_callback(1, 1, "JSON-Struktur wird eingelesen...")
@@ -553,9 +644,15 @@ def read_document_from_bytes(
     elif ext == ".docx":
         if progress_callback:
             progress_callback(1, 1, "Word-Dokumentstruktur wird analysiert...")
-        return extract_text_from_docx_bytes(data)
+        return extract_text_from_docx_bytes(data, include_headers_footers=include_headers_footers)
     elif ext == ".pdf":
-        return extract_text_from_pdf_bytes(data, filename=filename, progress_callback=progress_callback)
+        return extract_text_from_pdf_bytes(
+            data,
+            filename=filename,
+            progress_callback=progress_callback,
+            include_headers_footers=include_headers_footers,
+            extract_picture_text=extract_picture_text,
+        )
     else:
         raise UnsupportedFileFormatError(
             f"Unsupported file format: '{ext}'. Supported formats: .txt, .md, .json, .csv, .docx, .pdf"
@@ -565,6 +662,8 @@ def read_document_from_bytes(
 def read_document(
     file_path: Union[str, Path],
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    include_headers_footers: bool = False,
+    extract_picture_text: bool = True,
 ) -> str:
     """Unified document reader supporting .txt, .md, .json, .csv, .docx, and .pdf."""
     path = Path(file_path)
@@ -572,4 +671,10 @@ def read_document(
         raise FileNotFoundError(f"File not found: {path}")
 
     raw_data = safe_read_bytes(path)
-    return read_document_from_bytes(raw_data, path.name, progress_callback=progress_callback)
+    return read_document_from_bytes(
+        raw_data,
+        path.name,
+        progress_callback=progress_callback,
+        include_headers_footers=include_headers_footers,
+        extract_picture_text=extract_picture_text,
+    )
