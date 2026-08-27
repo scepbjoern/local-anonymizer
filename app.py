@@ -1235,68 +1235,78 @@ def create_ui():
                         dropzone_card.on("file_dropped", on_file_dropped)
 
                         # Hook HTML5 drag events to the card
-                        ui.run_javascript(f"""
+                        ui.add_body_html(f"""
+                        <script>
                         (function() {{
-                            const cardId = {drop_card_id};
-                            const el = document.getElementById('custom_dropzone_' + cardId);
-                            if (!el || el._dropAttached) return;
-                            el._dropAttached = true;
+                            function setupDropzone() {{
+                                const cardId = {drop_card_id};
+                                const el = document.getElementById('custom_dropzone_' + cardId);
+                                if (!el || el._dropAttached) return;
+                                el._dropAttached = true;
 
-                            window.addEventListener('dragover', function(e) {{ e.preventDefault(); }}, false);
-                            window.addEventListener('drop', function(e) {{ e.preventDefault(); }}, false);
+                                window.addEventListener('dragover', function(e) {{ e.preventDefault(); }}, false);
+                                window.addEventListener('drop', function(e) {{ e.preventDefault(); }}, false);
 
-                            el.addEventListener('dragenter', function(e) {{
-                                e.preventDefault();
-                                e.stopPropagation();
-                                el.style.borderColor = '#1d4ed8';
-                                el.style.backgroundColor = '#dbeafe';
-                            }}, false);
+                                el.addEventListener('dragenter', function(e) {{
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    el.style.borderColor = '#1d4ed8';
+                                    el.style.backgroundColor = '#dbeafe';
+                                }}, false);
 
-                            el.addEventListener('dragover', function(e) {{
-                                e.preventDefault();
-                                e.stopPropagation();
-                                el.style.borderColor = '#1d4ed8';
-                                el.style.backgroundColor = '#dbeafe';
-                            }}, false);
+                                el.addEventListener('dragover', function(e) {{
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    el.style.borderColor = '#1d4ed8';
+                                    el.style.backgroundColor = '#dbeafe';
+                                }}, false);
 
-                            el.addEventListener('dragleave', function(e) {{
-                                e.preventDefault();
-                                e.stopPropagation();
-                                el.style.borderColor = '#60a5fa';
-                                el.style.backgroundColor = '#f8fafc';
-                            }}, false);
+                                el.addEventListener('dragleave', function(e) {{
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    el.style.borderColor = '#60a5fa';
+                                    el.style.backgroundColor = '#f8fafc';
+                                }}, false);
 
-                            el.addEventListener('drop', function(e) {{
-                                e.preventDefault();
-                                e.stopPropagation();
-                                el.style.borderColor = '#60a5fa';
-                                el.style.backgroundColor = '#f8fafc';
+                                el.addEventListener('drop', function(e) {{
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    el.style.borderColor = '#60a5fa';
+                                    el.style.backgroundColor = '#f8fafc';
 
-                                const files = e.dataTransfer.files;
-                                if (!files || files.length === 0) return;
-                                const file = files[0];
+                                    const files = e.dataTransfer.files;
+                                    if (!files || files.length === 0) return;
+                                    const file = files[0];
 
-                                if (file.path) {{
-                                    window.socket.emit('event', {{
-                                        id: cardId,
-                                        name: 'file_dropped',
-                                        args: {{ name: file.name, path: file.path }}
-                                    }});
-                                    return;
-                                }}
+                                    if (file.path) {{
+                                        window.socket.emit('event', {{
+                                            id: cardId,
+                                            name: 'file_dropped',
+                                            args: {{ name: file.name, path: file.path }}
+                                        }});
+                                        return;
+                                    }}
 
-                                const reader = new FileReader();
-                                reader.onload = function(evt) {{
-                                    const b64 = evt.target.result.split(',')[1];
-                                    window.socket.emit('event', {{
-                                        id: cardId,
-                                        name: 'file_dropped',
-                                        args: {{ name: file.name, base64: b64 }}
-                                    }});
-                                }};
-                                reader.readAsDataURL(file);
-                            }}, false);
+                                    const reader = new FileReader();
+                                    reader.onload = function(evt) {{
+                                        const b64 = evt.target.result.split(',')[1];
+                                        window.socket.emit('event', {{
+                                            id: cardId,
+                                            name: 'file_dropped',
+                                            args: {{ name: file.name, base64: b64 }}
+                                        }});
+                                    }};
+                                    reader.readAsDataURL(file);
+                                }}, false);
+                            }}
+                            if (document.readyState === 'loading') {{
+                                document.addEventListener('DOMContentLoaded', setupDropzone);
+                            }} else {{
+                                setupDropzone();
+                            }}
+                            setInterval(setupDropzone, 500);
                         }})();
+                        </script>
                         """)
 
                     # Document info badge when loaded (with remove button)
