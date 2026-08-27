@@ -340,8 +340,8 @@ class LocalAnonymizer:
                 if self.enabled_entities is None or r.entity_type in self.enabled_entities:
                     filtered_results.append(r)
 
-        # 2. Deduplicate / resolve overlapping results (prefer higher score, then longer span)
-        filtered_results.sort(key=lambda r: (r.score, r.end - r.start), reverse=True)
+        # 2. Deduplicate / resolve overlapping results (prefer longer span, then higher score)
+        filtered_results.sort(key=lambda r: (r.end - r.start, r.score), reverse=True)
         accepted: List[RecognizerResult] = []
         accepted_spans: List[Tuple[int, int]] = []
 

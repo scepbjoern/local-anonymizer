@@ -1,6 +1,16 @@
 """Lightweight splash screen for instant visual feedback on app launch."""
 import sys
 import tkinter as tk
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".local-anonymizer"
+READY_FLAG = CONFIG_DIR / "splash_ready.tmp"
+
+# Clear any leftover flag
+try:
+    READY_FLAG.unlink(missing_ok=True)
+except Exception:
+    pass
 
 try:
     root = tk.Tk()
@@ -22,8 +32,19 @@ try:
     badge = tk.Label(frame, text="100% Lokal & Offline • Keine Cloud", font=("Segoe UI", 8, "italic"), fg="#94a3b8", bg="#0f172a")
     badge.pack(pady=(10, 0))
 
-    # Auto-destroy after 7 seconds (when app window is loaded)
-    root.after(7000, root.destroy)
+    def check_ready():
+        if READY_FLAG.exists():
+            try:
+                READY_FLAG.unlink(missing_ok=True)
+            except Exception:
+                pass
+            root.destroy()
+        else:
+            root.after(100, check_ready)
+
+    # Check every 100ms if main app is ready; max fallback timeout 20s
+    root.after(100, check_ready)
+    root.after(20000, root.destroy)
     root.mainloop()
 except Exception:
     pass

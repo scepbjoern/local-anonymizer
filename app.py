@@ -32,7 +32,7 @@ from local_anonymizer.anonymizer import (
     clean_tag,
     compute_smart_link_proposals,
 )
-from local_anonymizer.config import AppConfig, LOG_FILE
+from local_anonymizer.config import AppConfig, CONFIG_DIR, LOG_FILE
 from local_anonymizer.extractors import (
     UnsupportedFileFormatError,
     create_docx_from_markdown,
@@ -43,6 +43,9 @@ from local_anonymizer.extractors import (
 
 # Silence presidio analyzer language mismatch warnings
 logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
+
+# Signal file for splash screen coordination
+READY_FLAG = CONFIG_DIR / "splash_ready.tmp"
 
 
 # --- Data Models for Grouped Review ---
@@ -427,6 +430,7 @@ def create_ui():
     upload_ui_elem = None
     reset_btn = None
     ignore_input = None
+    glossary_textarea = None
     restore_anon_input = None
     map_json_input = None
     restored_preview = None
@@ -648,7 +652,7 @@ def create_ui():
             upload_ui_elem.reset()
         if reset_btn is not None:
             reset_btn.set_visibility(False)
-        ui.notify("Workspace und geladene Datei zurückgesetzt.", type="info", icon="delete_sweep")
+        ui.notify("Workspace zurückgesetzt.", type="info", icon="delete_sweep")
 
     def get_sorted_groups() -> List[EntityGroup]:
         """Return entity groups sorted according to user selection."""
@@ -1025,7 +1029,7 @@ def create_ui():
                 def on_glossary_change(e):
                     state.glossary_text = e.value
                     save_current_config()
-                ui.textarea(
+                glossary_textarea = ui.textarea(
                     value=state.glossary_text,
                     on_change=on_glossary_change,
                 ).props("outlined dense rows=4").classes("w-full font-mono text-xs")
@@ -1041,13 +1045,13 @@ def create_ui():
                 with ui.tab_panel(tab_anonymize):
                     ui.label("Stufe 1: Dokument laden & Text-Eingabe").classes("text-base font-bold text-slate-800 mb-1")
                     
-                    # Direct Document Upload in Main Workspace with Conditional Reset Button
+                    # Direct Document Upload in Main Workspace
                     with ui.card().classes("w-full p-3 bg-slate-50 border border-dashed border-slate-300 rounded-lg mb-3"):
                         with ui.row().classes("w-full items-center justify-between gap-4 flex-wrap"):
                             with ui.row().classes("items-center gap-2"):
                                 ui.icon("cloud_upload", size="md").classes("text-primary")
                                 with ui.column().classes("gap-0"):
-                                    ui.label("Dokument hier hochladen (.pdf, .docx, .txt, .md, .csv, .json):").classes("text-xs font-bold text-slate-700")
+                                    ui.label("Dokument hier hochladen (.docx, .pdf, .txt, .md, .csv, .json):").classes("text-xs font-bold text-slate-700")
                                     ui.label("Struktur (Überschriften, Listen & Tabellen) wird automatisch als Markdown extrahiert").classes("text-[11px] text-slate-500")
 
                             with ui.row().classes("items-center gap-2"):
@@ -1056,15 +1060,7 @@ def create_ui():
                                     on_rejected=handle_rejected,
                                     auto_upload=True,
                                     max_files=1,
-                                ).props('accept=".txt,.md,.docx,.pdf,.json,.csv" outlined dense flat').classes("w-72")
-                                
-                                reset_btn = ui.button(
-                                    "🗑️ Zurücksetzen",
-                                    icon="delete_sweep",
-                                    color="slate",
-                                    on_click=reset_workspace,
-                                ).props("outline dense size=sm").tooltip("Workspace leeren und Dokument entladen")
-                                reset_btn.set_visibility(bool(state.raw_text and state.raw_text.strip()))
+                                ).props("outlined dense flat").classes("w-72")
 
                     with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note", value=True).classes("w-full mb-2"):
                         def on_raw_text_change(e):
@@ -1077,14 +1073,22 @@ def create_ui():
                             on_change=on_raw_text_change,
                         ).props("outlined rows=6").classes("w-full font-mono text-sm")
 
-                    # Prominent Analysis Button directly below text area
-                    with ui.row().classes("w-full items-center justify-between mt-1 mb-4 gap-3"):
+                    # Prominent Analysis & Workspace Reset Buttons in Action Row
+                    with ui.row().classes("w-full items-center justify-between mt-1 mb-4 gap-3 flex-wrap"):
                         ui.button(
                             "🔍 Text & Dokument analysieren",
                             icon="psychology",
                             color="primary",
                             on_click=run_analysis,
                         ).props("unelevated").classes("px-4 py-2 font-bold")
+
+                        reset_btn = ui.button(
+                            "🗑️ Workspace zurücksetzen",
+                            icon="delete_sweep",
+                            color="slate",
+                            on_click=reset_workspace,
+                        ).props("outline dense").tooltip("Workspace leeren (Text, Dokument, Tabelle und Vorschau)")
+                        reset_btn.set_visibility(bool(state.raw_text and state.raw_text.strip()))
 
                     progress_holder = ui.column().classes("w-full")
 
@@ -1110,8 +1114,10 @@ def create_ui():
                                     new_line = f"{term}: {manual_type.value}"
                                     if new_line not in current_lines:
                                         state.glossary_text += f"\n{new_line}"
+                                        if glossary_textarea is not None:
+                                            glossary_textarea.value = state.glossary_text
                                         save_current_config()
-                                    ui.notify(f"Begriff '{term}' als {manual_type.value} erfasst.", type="positive", icon="check")
+                                    ui.notify(f"Begriff '{term}' als {manual_type.value} erfasst und zum Glossar hinzugefügt.", type="positive", icon="check")
                                     manual_input.value = ""
                                     await run_analysis()
 
@@ -1156,7 +1162,7 @@ def create_ui():
                                 on_upload=handle_restore_file_upload,
                                 auto_upload=True,
                                 max_files=1,
-                            ).props('accept=".txt,.md,.docx,.pdf" outlined dense flat').classes("w-full mb-2")
+                            ).props("outlined dense flat").classes("w-full mb-2")
 
                             def on_anon_change(e):
                                 state.restore_anon_text = e.value
@@ -1184,7 +1190,7 @@ def create_ui():
                                 except Exception as ex:
                                     ui.notify(f"Ungültige JSON-Mapping-Datei: {str(ex)}", type="negative")
 
-                            ui.upload(on_upload=on_map_upload, auto_upload=True, max_files=1).props('accept=".json" outlined dense flat').classes("w-full mb-2")
+                            ui.upload(on_upload=on_map_upload, auto_upload=True, max_files=1).props("outlined dense flat").classes("w-full mb-2")
 
                             def on_map_text_change(e):
                                 try:
@@ -1281,6 +1287,12 @@ def create_ui():
                             color="slate",
                             on_click=save_restored_md,
                         ).props("outline")
+
+    # Signal that UI is constructed and ready to dismiss splash screen
+    try:
+        READY_FLAG.touch(exist_ok=True)
+    except Exception:
+        pass
 
 
 def main():

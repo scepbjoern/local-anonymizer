@@ -277,4 +277,21 @@ def test_smart_linking_proposal_logic():
     assert set(g2.suggested_candidates) == {"Julia Meier", "Hans Meier"}
 
 
+def test_full_name_precedence_over_subword_glossary():
+    from local_anonymizer.anonymizer import LocalAnonymizer
+
+    text = (
+        "Für den Herbst ist vorgesehen, dass Remo Weiersmüller übernimmt. "
+        "Remo wird im Frühjahr wieder da sein."
+    )
+    # Even if single first name 'Remo' is in the glossary:
+    anonymizer = LocalAnonymizer(glossary={"Remo": "PERSON"})
+    result = anonymizer.anonymize(text, format_mode="numbered_role", roles={"remo weiersmüller": "LEHRPERSON", "remo": "LEHRPERSON"})
+
+    # Full name must be replaced completely; 'Weiersmüller' must NOT remain unmasked!
+    assert "Weiersmüller" not in result.anonymized_text
+    assert "[PERSON_1_LEHRPERSON]" in result.anonymized_text or "[PERSON_2_LEHRPERSON]" in result.anonymized_text
+
+
+
 
