@@ -1,6 +1,8 @@
 """Document extraction utilities for various file formats."""
 
+import csv
 import io
+import json
 import re
 from pathlib import Path
 from typing import Union
@@ -34,30 +36,150 @@ def extract_text_from_txt(path: Path) -> str:
     return extract_text_from_txt_bytes(path.read_bytes())
 
 
+def extract_text_from_json_bytes(data: bytes) -> str:
+    """Extract JSON bytes as cleanly formatted JSON text."""
+    raw_str = extract_text_from_txt_bytes(data)
+    try:
+        parsed = json.loads(raw_str)
+        return json.dumps(parsed, indent=2, ensure_ascii=False)
+    except Exception:
+        return raw_str
+
+
+def extract_text_from_csv_bytes(data: bytes) -> str:
+    """Extract CSV bytes as a structured Markdown table."""
+    text_content = extract_text_from_txt_bytes(data)
+    lines = [l for l in text_content.splitlines() if l.strip()]
+    if not lines:
+        return ""
+
+    # Detect delimiter: try comma, semicolon, tab
+    sample = "\n".join(lines[:5])
+    delimiter = ","
+    try:
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(sample, delimiters=";,|\t")
+        delimiter = dialect.delimiter
+    except Exception:
+        if ";" in sample and "," not in sample:
+            delimiter = ";"
+        elif "\t" in sample:
+            delimiter = "\t"
+
+    reader = csv.reader(lines, delimiter=delimiter)
+    rows = list(reader)
+    if not rows:
+        return text_content
+
+    max_cols = max(len(r) for r in rows)
+    if max_cols == 0:
+        return text_content
+
+    # Normalize row lengths
+    norm_rows = []
+    for r in rows:
+        padded = [c.strip().replace("\n", " ") for c in r]
+        while len(padded) < max_cols:
+            padded.append("")
+        norm_rows.append(padded)
+
+    header = norm_rows[0]
+    md_lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join([":---"] * max_cols) + " |",
+    ]
+    for r in norm_rows[1:]:
+        md_lines.append("| " + " | ".join(r) + " |")
+
+    return "\n".join(md_lines)
+
+
 def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
-    """Extract text from Microsoft Word .docx bytes."""
+    """
+    Extract text from Microsoft Word .docx bytes with:
+    - Level 1: XML Outline Level (w:outlineLvl 0..3) for custom corporate heading templates
+    - Level 2: Multilingual style names (Heading 1..4, Überschrift 1..4, Title, Subtitle)
+    - Level 3: Bullet & numbered lists via w:numPr and list styles
+    - Level 4: Strict false-positive protection for bold text (only < 60 chars, no ending period, >= 16pt)
+    - Level 5: Markdown tables
+    """
     doc = docx.Document(io.BytesIO(raw_bytes))
     full_text = []
     for para in doc.paragraphs:
-        if para.text:
-            text = para.text
-            style_name = para.style.name.lower() if para.style and para.style.name else ""
-            if "heading 1" in style_name:
-                text = f"# {text}"
-            elif "heading 2" in style_name:
-                text = f"## {text}"
-            elif "heading 3" in style_name:
-                text = f"### {text}"
-            elif "heading 4" in style_name:
-                text = f"#### {text}"
-            full_text.append(text)
+        if not para.text or not para.text.strip():
+            continue
+        text = para.text.strip()
+        style_name = para.style.name.lower() if para.style and para.style.name else ""
 
-    # Also extract text from tables
+        # Stufe 1: XML Gliederungsebene w:outlineLvl
+        outline_val = None
+        try:
+            outline_nodes = para._element.xpath("./w:pPr/w:outlineLvl/@w:val")
+            if outline_nodes:
+                outline_val = int(outline_nodes[0])
+        except Exception:
+            pass
+
+        # Stufe 2: Listen über XML (w:numPr) oder Style-Namen
+        has_num_pr = False
+        try:
+            has_num_pr = bool(para._element.xpath("./w:pPr/w:numPr"))
+        except Exception:
+            pass
+
+        is_bullet = "bullet" in style_name or "listenpunkt" in style_name or "aufzählung" in style_name
+        is_number = "number" in style_name or "nummerierung" in style_name or "list 2" in style_name or "list 3" in style_name
+
+        if outline_val is not None and 0 <= outline_val <= 5:
+            prefix = "#" * (outline_val + 1)
+            text = f"{prefix} {text}"
+        elif "heading 1" in style_name or "überschrift 1" in style_name or style_name in ["title", "titel"]:
+            text = f"# {text}"
+        elif "heading 2" in style_name or "überschrift 2" in style_name or style_name in ["subtitle", "untertitel"]:
+            text = f"## {text}"
+        elif "heading 3" in style_name or "überschrift 3" in style_name:
+            text = f"### {text}"
+        elif "heading 4" in style_name or "überschrift 4" in style_name:
+            text = f"#### {text}"
+        elif is_bullet:
+            text = f"- {text}"
+        elif is_number or has_num_pr:
+            text = f"1. {text}"
+        elif "quote" in style_name or "zitat" in style_name:
+            text = f"> {text}"
+        else:
+            # Stufe 4: Direktauszeichnungs-Heuristik mit striktem Falsch-Positiv-Schutz:
+            # Nur kurze Absätze (< 60 Zeichen), ohne Schlusspunkt, mindestens 16pt groß und ganz fett.
+            is_bold_title = False
+            try:
+                runs = [r for r in para.runs if r.text and r.text.strip()]
+                if runs and all(r.bold for r in runs) and len(text) < 60 and not text.endswith("."):
+                    sizes = [r.font.size.pt for r in runs if r.font and r.font.size and r.font.size.pt]
+                    if sizes and min(sizes) >= 16:
+                        is_bold_title = True
+            except Exception:
+                pass
+
+            if is_bold_title:
+                text = f"# {text}"
+
+        full_text.append(text)
+
+    # Also extract text from tables as structured Markdown tables
     for table in doc.tables:
+        rows_text = []
         for row in table.rows:
-            row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-            if row_text:
-                full_text.append(" | ".join(row_text))
+            row_cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            if any(row_cells):
+                rows_text.append(row_cells)
+        if rows_text:
+            header = rows_text[0]
+            table_md = ["| " + " | ".join(header) + " |", "| " + " | ".join([":---"] * len(header)) + " |"]
+            for r in rows_text[1:]:
+                while len(r) < len(header):
+                    r.append("")
+                table_md.append("| " + " | ".join(r[:len(header)]) + " |")
+            full_text.append("\n".join(table_md))
 
     return "\n\n".join(full_text)
 
@@ -99,6 +221,9 @@ def create_docx_from_markdown(md_text: str) -> docx.Document:
         elif re.match(r"^\d+\.\s+", trimmed):
             text_part = re.sub(r"^\d+\.\s+", "", trimmed)
             doc.add_paragraph(text_part.strip(), style="List Number")
+        # Blockquotes
+        elif trimmed.startswith("> "):
+            doc.add_paragraph(trimmed[2:].strip(), style="Quote" if "Quote" in doc.styles else "Normal")
         # Tables (Markdown | col1 | col2 |)
         elif trimmed.startswith("|") and trimmed.endswith("|"):
             table_lines = []
@@ -161,7 +286,6 @@ def extract_text_from_pdf_bytes(raw_bytes: bytes, filename: str = "document.pdf"
     try:
         md_text = pymupdf4llm.to_markdown(doc)
     except Exception:
-        # Fallback to plain get_text if markdown conversion fails
         pages_text = [page.get_text().strip() for page in doc if page.get_text().strip()]
         md_text = "\n\n--- Page Break ---\n\n".join(pages_text)
     finally:
@@ -178,7 +302,6 @@ def extract_text_from_pdf(path: Path) -> str:
     doc = pymupdf.open(str(path))
     doc_pages = doc.page_count
 
-    # Check if there is any extractable text across pages
     has_text = any(page.get_text().strip() for page in doc)
     if doc_pages > 0 and not has_text:
         doc.close()
@@ -190,7 +313,6 @@ def extract_text_from_pdf(path: Path) -> str:
     try:
         md_text = pymupdf4llm.to_markdown(doc)
     except Exception:
-        # Fallback to plain get_text if markdown conversion fails
         pages_text = [page.get_text().strip() for page in doc if page.get_text().strip()]
         md_text = "\n\n--- Page Break ---\n\n".join(pages_text)
     finally:
@@ -202,8 +324,12 @@ def extract_text_from_pdf(path: Path) -> str:
 def read_document_from_bytes(data: bytes, filename: str) -> str:
     """Unified document reader from in-memory bytes."""
     ext = Path(filename).suffix.lower()
-    if ext in [".txt", ".md", ".json", ".csv"]:
+    if ext in [".txt", ".md"]:
         return extract_text_from_txt_bytes(data)
+    elif ext == ".json":
+        return extract_text_from_json_bytes(data)
+    elif ext == ".csv":
+        return extract_text_from_csv_bytes(data)
     elif ext == ".docx":
         return extract_text_from_docx_bytes(data)
     elif ext == ".pdf":
@@ -221,8 +347,12 @@ def read_document(file_path: Union[str, Path]) -> str:
         raise FileNotFoundError(f"File not found: {path}")
 
     ext = path.suffix.lower()
-    if ext in [".txt", ".md", ".json", ".csv"]:
+    if ext in [".txt", ".md"]:
         return extract_text_from_txt(path)
+    elif ext == ".json":
+        return extract_text_from_json_bytes(path.read_bytes())
+    elif ext == ".csv":
+        return extract_text_from_csv_bytes(path.read_bytes())
     elif ext == ".docx":
         return extract_text_from_docx(path)
     elif ext == ".pdf":
@@ -231,4 +361,3 @@ def read_document(file_path: Union[str, Path]) -> str:
         raise UnsupportedFileFormatError(
             f"Unsupported file format: '{ext}'. Supported formats: .txt, .md, .json, .csv, .docx, .pdf"
         )
-

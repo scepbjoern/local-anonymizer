@@ -59,6 +59,9 @@ class EntityGroup:
         self.parent_group_text: Optional[str] = None
         self.surface_tag: str = ""
         self.placeholder: str = ""
+        self.suggested_parent: Optional[str] = None
+        self.suggested_tag: Optional[str] = None
+        self.suggested_candidates: List[str] = []
         self.occurrences: List[EntityOccurrence] = []
 
     @property
@@ -128,13 +131,21 @@ AVAILABLE_ENTITIES = [
     "IP_ADDRESS",
 ]
 
-SURFACE_TAG_OPTIONS = [
-    ("VOLLNAME", "Vollname (z. B. Julia Meier)"),
-    ("VORNAME", "Vorname (z. B. Julia)"),
-    ("NACHNAME", "Nachname (z. B. Meier)"),
-    ("ANREDE", "Anrede / Titel (z. B. Frau Meier)"),
-    ("KURZFORM", "Kurzform / Kürzel (z. B. JM)"),
-]
+# Surface tag options as a clean dictionary (resolves ValueError: Invalid value)
+SURFACE_TAG_OPTIONS: Dict[str, str] = {
+    "VOLLNAME": "Vollname (z. B. Julia Meier)",
+    "VORNAME": "Vorname (z. B. Julia)",
+    "NACHNAME": "Nachname (z. B. Meier)",
+    "ANREDE": "Anrede / Titel (z. B. Frau Meier, Mr. Smith)",
+    "GENITIV": "Genitiv (z. B. Julias)",
+    "KURZFORM": "Kurzform / Kürzel (z. B. JM)",
+}
+
+# German and English honorifics / titles for smart-linking proposals
+HONORIFICS: Set[str] = {
+    "frau", "herr", "herrn", "dr", "dr.", "prof", "prof.", "prof. dr.", "dozent", "dozentin",
+    "mr", "mr.", "mrs", "mrs.", "ms", "ms.", "miss", "sir", "madam"
+}
 
 
 def save_current_config():
@@ -208,6 +219,69 @@ def build_anonymizer() -> LocalAnonymizer:
         enabled_entities=state.active_entities if state.active_entities else None,
         gliner_threshold=state.gliner_threshold,
     )
+
+
+def compute_smart_link_proposals():
+    """
+    Compute smart linking suggestions as interactive proposals (NO auto-commit!).
+    All entities start as standalone unless the user explicitly adopts a suggestion.
+    """
+    for g in state.entity_groups:
+        g.suggested_parent = None
+        g.suggested_tag = None
+        g.suggested_candidates = []
+
+        if g.parent_group_text:
+            continue
+
+        if g.entity_type != "PERSON":
+            continue
+
+        orig_lower = g.original_text.lower().strip()
+        words = g.original_text.split()
+        potential_candidates: List[Tuple[str, str]] = []
+
+        # 1. Single word: Check genitive stem or first/last name
+        if len(words) == 1:
+            stem = re.sub(r"(s|'s|’s)$", "", g.original_text, flags=re.IGNORECASE).strip()
+            if stem and stem.lower() != orig_lower:
+                for other in state.entity_groups:
+                    if other.key != g.key and other.entity_type == "PERSON" and not other.parent_group_text:
+                        other_words = other.original_text.split()
+                        if any(stem.lower() == w.lower() for w in other_words):
+                            potential_candidates.append((other.original_text, "GENITIV"))
+
+            for other in state.entity_groups:
+                if other.key != g.key and other.entity_type == "PERSON" and not other.parent_group_text:
+                    other_words = other.original_text.split()
+                    if len(other_words) > 1:
+                        if orig_lower == other_words[0].lower():
+                            potential_candidates.append((other.original_text, "VORNAME"))
+                        elif orig_lower == other_words[-1].lower():
+                            potential_candidates.append((other.original_text, "NACHNAME"))
+
+        # 2. Multi-word: Check German/English honorifics (e.g. "Frau Meier", "Mr. Smith")
+        elif len(words) >= 2 and words[0].lower().rstrip(".") in HONORIFICS:
+            last_name = words[-1].lower()
+            for other in state.entity_groups:
+                if other.key != g.key and other.entity_type == "PERSON" and not other.parent_group_text:
+                    other_words = other.original_text.split()
+                    if len(other_words) > 1 and other_words[0].lower().rstrip(".") not in HONORIFICS:
+                        if last_name == other_words[-1].lower():
+                            potential_candidates.append((other.original_text, "ANREDE"))
+
+        # Deduplicate candidates
+        unique_cand_dict: Dict[str, str] = {}
+        for cand_name, tag in potential_candidates:
+            unique_cand_dict.setdefault(cand_name, tag)
+
+        if len(unique_cand_dict) == 1:
+            cand_name, tag = list(unique_cand_dict.items())[0]
+            g.suggested_parent = cand_name
+            g.suggested_tag = tag
+        elif len(unique_cand_dict) > 1:
+            g.suggested_candidates = list(unique_cand_dict.keys())
+            g.suggested_tag = list(unique_cand_dict.values())[0]
 
 
 def compute_reactive_preview() -> Tuple[str, Dict[str, str], Dict]:
@@ -413,6 +487,8 @@ def create_ui():
     table_holder = None
     export_holder = None
     raw_text_area = None
+    progress_holder = None
+    upload_ui_elem = None
     restore_anon_input = None
     map_json_input = None
     restored_preview = None
@@ -522,12 +598,17 @@ def create_ui():
             ui.notify("Bitte laden Sie zuerst ein Dokument hoch oder fügen Sie Text ein.", type="warning")
             return
 
+        if progress_holder:
+            progress_holder.clear()
+            with progress_holder:
+                ui.linear_progress().props("indeterminate color=primary").classes("w-full mb-2")
+
         if table_holder:
             table_holder.clear()
             with table_holder:
                 with ui.row().classes("items-center gap-3 p-4 bg-blue-50 rounded border border-blue-200"):
                     ui.spinner(size="md", color="primary")
-                    ui.label("Dokument wird lokal analysiert (NER, Markdown, Genitiv-Erkennung)...").classes("text-slate-700 text-sm font-medium")
+                    ui.label("Dokument wird lokal analysiert (NER, Markdown, Genitiv- & Struktur-Erkennung)...").classes("text-slate-700 text-sm font-medium")
 
         try:
             anonymizer = build_anonymizer()
@@ -554,26 +635,8 @@ def create_ui():
 
             state.entity_groups = list(groups_dict.values())
 
-            # Automatic Smart Linking Detection
-            for g in state.entity_groups:
-                g_words = g.original_text.split()
-                if len(g_words) == 1:
-                    for other in state.entity_groups:
-                        if other.key != g.key and other.entity_type == g.entity_type:
-                            other_words = other.original_text.split()
-                            if len(other_words) > 1:
-                                if g.original_text.lower() == other_words[0].lower():
-                                    g.parent_group_text = other.original_text
-                                    g.surface_tag = "VORNAME"
-                                    if not other.surface_tag:
-                                        other.surface_tag = "VOLLNAME"
-                                    break
-                                elif g.original_text.lower() == other_words[-1].lower():
-                                    g.parent_group_text = other.original_text
-                                    g.surface_tag = "NACHNAME"
-                                    if not other.surface_tag:
-                                        other.surface_tag = "VOLLNAME"
-                                    break
+            # Compute interactive smart-linking suggestions (Proposal model, NO auto-commit)
+            compute_smart_link_proposals()
 
             # Compute initial placeholders so badges exist immediately
             compute_reactive_preview()
@@ -583,15 +646,14 @@ def create_ui():
             build_review_table()
             refresh_preview_and_exports()
 
-        except ValueError as ve:
-            if table_holder:
-                table_holder.clear()
-            ui.notify(f"Verarbeitungsfehler: {str(ve)}", type="negative", close_button=True, timeout=10000)
         except Exception as e:
             if table_holder:
                 table_holder.clear()
             logging.error(f"Analysis error: {e}", exc_info=True)
-            ui.notify(f"Unerwarteter Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
+            ui.notify(f"Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
+        finally:
+            if progress_holder:
+                progress_holder.clear()
 
     async def handle_upload(e):
         try:
@@ -617,6 +679,23 @@ def create_ui():
         except Exception as ex:
             logging.error(f"Upload error: {ex}", exc_info=True)
             ui.notify(f"Fehler beim Upload: {str(ex)}", type="negative")
+
+    def reset_workspace():
+        """Reset raw text, filename, and analysis table."""
+        state.filename = ""
+        state.raw_text = ""
+        state.entity_groups = []
+        state.current_mapping = {}
+        state.current_anon_text = ""
+        if raw_text_area is not None:
+            raw_text_area.value = ""
+        if preview_holder is not None:
+            preview_holder.clear()
+        if export_holder is not None:
+            export_holder.clear()
+        if table_holder is not None:
+            table_holder.clear()
+        ui.notify("Workspace und geladene Datei zurückgesetzt.", type="info", icon="delete_sweep")
 
     def get_sorted_groups() -> List[EntityGroup]:
         """Return entity groups sorted according to user selection."""
@@ -644,7 +723,7 @@ def create_ui():
             unique_count = len(state.entity_groups)
 
             ui.label(f"Erkannte Entitäten ({unique_count} Begriffe, {total_hits} Fundstellen gesamt)").classes("text-lg font-bold text-slate-800 mb-1")
-            ui.label("Vergeben Sie optionale Rollen oder verknüpfen Sie Schreibweisen. Jede Zeile zeigt den zugeordneten Platzhalter und klappt Fundstellen auf:").classes("text-sm text-slate-600 mb-3")
+            ui.label("Vergeben Sie optionale Rollen oder übernehmen Sie Verknüpfungsvorschläge. Jede Zeile zeigt den zugeordneten Platzhalter und klappt Fundstellen auf:").classes("text-sm text-slate-600 mb-3")
 
             # Toolbar: Sorting & Bulk actions
             with ui.row().classes("w-full items-center justify-between bg-slate-100 p-2.5 rounded-lg border mb-3 flex-wrap gap-2"):
@@ -748,8 +827,40 @@ def create_ui():
                                         on_change=make_role_change(master),
                                     ).props("dense outlined bg-white").classes("w-32 text-xs")
 
-                                # 4. Link to another master (if not already master with children)
+                                # 4. Interactive Smart-Linking Proposal (Confirmation Model) or Link Dropdown
                                 if not has_children:
+                                    # If exactly 1 suggestion exists: Show 1-Click Proposal Button
+                                    if master.suggested_parent and not master.parent_group_text:
+                                        with ui.row().classes("items-center gap-1"):
+                                            def make_apply_suggestion(grp, p_target, tag):
+                                                def on_click():
+                                                    grp.parent_group_text = p_target
+                                                    grp.surface_tag = tag
+                                                    grp.suggested_parent = None
+                                                    grp.suggested_tag = None
+                                                    grp.suggested_candidates = []
+                                                    # Ensure parent has VOLLNAME if not set
+                                                    p_match = next((x for x in state.entity_groups if x.original_text == p_target), None)
+                                                    if p_match and not p_match.surface_tag:
+                                                        p_match.surface_tag = "VOLLNAME"
+                                                    ui.notify(f"'{grp.original_text}' mit '{p_target}' ({tag}) verknüpft.", type="positive", icon="link")
+                                                    refresh_preview_and_exports()
+                                                    build_review_table()
+                                                return on_click
+
+                                            tag_label = SURFACE_TAG_OPTIONS.get(master.suggested_tag, master.suggested_tag or "Vorname")
+                                            ui.button(
+                                                f"💡 Mit '{master.suggested_parent}' verknüpfen",
+                                                icon="auto_awesome",
+                                                color="teal-8",
+                                                on_click=make_apply_suggestion(master, master.suggested_parent, master.suggested_tag or "VORNAME"),
+                                            ).props("outline dense size=sm").tooltip(f"Vorschlag übernehmen: Als {tag_label} verknüpfen")
+
+                                    # If multiple candidates exist: Show disambiguation info
+                                    elif master.suggested_candidates:
+                                        ui.badge(f"💡 {len(master.suggested_candidates)} Namenskandidaten", color="amber-8").props("outline dense").tooltip("Mehrere passende Personen gefunden. Bitte im Dropdown rechts auswählen.")
+
+                                    # Manual Link Dropdown
                                     other_masters = [
                                         g.original_text for g in state.entity_groups
                                         if g.key != master.key and g.entity_type == master.entity_type and not g.parent_group_text
@@ -762,6 +873,11 @@ def create_ui():
                                                         grp.parent_group_text = e.value
                                                         if not grp.surface_tag:
                                                             grp.surface_tag = "VORNAME"
+                                                        grp.suggested_parent = None
+                                                        grp.suggested_candidates = []
+                                                        p_match = next((x for x in state.entity_groups if x.original_text == e.value), None)
+                                                        if p_match and not p_match.surface_tag:
+                                                            p_match.surface_tag = "VOLLNAME"
                                                         ui.notify(f"'{grp.original_text}' verknüpft mit '{e.value}'.", type="info")
                                                         refresh_preview_and_exports()
                                                         build_review_table()
@@ -823,7 +939,7 @@ def create_ui():
                                         ui.badge(f"{child.count}x", color="teal-6").props("dense")
                                         ui.badge(child.placeholder, color="teal-9").props("outline dense").classes("text-xs font-mono font-bold")
 
-                                    # Surface Form Selector
+                                    # Surface Form Selector (using valid dictionary options)
                                     with ui.row().classes("items-center gap-1"):
                                         def make_surface_change(c_grp):
                                             def on_change(e):
@@ -855,7 +971,7 @@ def create_ui():
                                             icon="link_off",
                                             color="negative",
                                             on_click=make_unlink_action(child),
-                                        ).props("flat dense size=sm").tooltip("Verknüpfung aufheben und als separate Entität mit eigener Nummer führen")
+                                        ).props("flat dense size=sm").tooltip("Verknüpfung aufheben und als separate Entität führen")
 
                             # Child Occurrences
                             with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
@@ -882,7 +998,7 @@ def create_ui():
 
             ui.radio(
                 {
-                    "numbered": "Modus 1: [TYP_NR] (Standard)",
+                    "numbered": "Modus 1: [TYP_NR] (Klassisch)",
                     "numbered_role": "Modus 2: [TYP_NR_ROLLE] (Empfohlen)",
                     "role_only": "Modus 3: [TYP_ROLLE] (Kompakt)",
                 },
@@ -957,8 +1073,6 @@ def create_ui():
                     on_change=on_glossary_change,
                 ).props("outlined dense rows=4").classes("w-full font-mono text-xs")
 
-            ui.button("Neu analysieren", icon="refresh", on_click=run_analysis, color="primary").classes("w-full mt-4").props("unelevated")
-
         # Main Workspace
         with ui.column().classes("flex-grow"):
             with ui.tabs().classes("w-full border-b") as tabs:
@@ -970,7 +1084,7 @@ def create_ui():
                 with ui.tab_panel(tab_anonymize):
                     ui.label("Stufe 1: Dokument laden & Text-Eingabe").classes("text-base font-bold text-slate-800 mb-1")
                     
-                    # Direct Document Upload in Main Workspace
+                    # Direct Document Upload in Main Workspace with Reset Button
                     with ui.card().classes("w-full p-3 bg-slate-50 border border-dashed border-slate-300 rounded-lg mb-3"):
                         with ui.row().classes("w-full items-center justify-between gap-4 flex-wrap"):
                             with ui.row().classes("items-center gap-2"):
@@ -979,13 +1093,21 @@ def create_ui():
                                     ui.label("Dokument hier hochladen (.pdf, .docx, .txt, .md, .csv, .json):").classes("text-xs font-bold text-slate-700")
                                     ui.label("Struktur (Überschriften, Listen & Tabellen) wird automatisch als Markdown extrahiert").classes("text-[11px] text-slate-500")
 
-                            ui.upload(
-                                on_upload=handle_upload,
-                                auto_upload=True,
-                                max_files=1,
-                            ).props("accept='.txt,.md,.docx,.pdf,.json,.csv' outlined dense flat").classes("w-80")
+                            with ui.row().classes("items-center gap-2"):
+                                upload_ui_elem = ui.upload(
+                                    on_upload=handle_upload,
+                                    auto_upload=True,
+                                    max_files=1,
+                                ).props("accept='.txt,.md,.docx,.pdf,.json,.csv' outlined dense flat").classes("w-72")
+                                
+                                ui.button(
+                                    "🗑️ Zurücksetzen",
+                                    icon="delete_sweep",
+                                    color="slate",
+                                    on_click=reset_workspace,
+                                ).props("outline dense size=sm").tooltip("Workspace leeren und Dokument entladen")
 
-                    with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note").classes("w-full mb-4"):
+                    with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note", value=True).classes("w-full mb-2"):
                         def on_raw_text_change(e):
                             state.raw_text = e.value
                         raw_text_area = ui.textarea(
@@ -994,9 +1116,20 @@ def create_ui():
                             on_change=on_raw_text_change,
                         ).props("outlined rows=6").classes("w-full font-mono text-sm")
 
-                    ui.separator().classes("my-4")
+                    # Prominent Analysis Button directly below text area
+                    with ui.row().classes("w-full items-center justify-between mt-1 mb-4 gap-3"):
+                        ui.button(
+                            "🔍 Text & Dokument analysieren",
+                            icon="psychology",
+                            color="primary",
+                            on_click=run_analysis,
+                        ).props("unelevated").classes("px-4 py-2 font-bold")
 
-                    # Step 2: Manual Entity Marking (Bug 3b - High Priority)
+                    progress_holder = ui.column().classes("w-full")
+
+                    ui.separator().classes("my-3")
+
+                    # Step 2: Manual Entity Marking
                     ui.label("Stufe 2: Review-Tabelle & Manuelles Markieren").classes("text-base font-bold text-slate-800 mb-1")
                     
                     with ui.card().classes("w-full p-3 bg-blue-50/70 border border-blue-200 rounded-lg mb-3"):
@@ -1033,7 +1166,6 @@ def create_ui():
 
                 # TAB 2: Restore
                 with ui.tab_panel(tab_restore):
-                    # Auto-prepopulate mapping from Tab 1 if available
                     def on_tab_restore_opened():
                         if not state.restore_mapping and state.current_mapping:
                             state.restore_mapping = dict(state.current_mapping)

@@ -1,5 +1,6 @@
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import List
 
@@ -7,13 +8,23 @@ CONFIG_DIR = Path.home() / ".local-anonymizer"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "app.log"
 
-# Set up global logging fallback
+# Set up global logging fallback with rotation (1MB max, 2 backups, WARNING level)
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logger = logging.getLogger()
+logger.setLevel(logging.WARNING)
+
+# Only add handler if not already present
+if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+    file_handler = RotatingFileHandler(
+        str(LOG_FILE),
+        maxBytes=1_000_000,
+        backupCount=2,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.WARNING)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
 
 class AppConfig:
@@ -57,7 +68,6 @@ class AppConfig:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
-            logging.info("Configuration saved successfully.")
         except Exception as e:
             logging.error(f"Failed to save config: {e}")
 

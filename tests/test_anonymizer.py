@@ -229,3 +229,52 @@ def test_config_persistence(tmp_path, monkeypatch):
     assert cfg2.format_mode == "role_only"
     assert cfg2.export_format == "md"
 
+
+def test_smart_linking_proposal_logic():
+    from local_anonymizer.anonymizer import compute_smart_link_proposals
+
+    class DummyGroup:
+        def __init__(self, text: str, entity_type: str = "PERSON", parent: Optional[str] = None):
+            self.original_text = text
+            self.entity_type = entity_type
+            self.parent_group_text = parent
+            self.suggested_parent: Optional[str] = None
+            self.suggested_tag: Optional[str] = None
+            self.suggested_candidates: List[str] = []
+
+    # Test single candidate proposal (German honorific, English honorific, genitive)
+    g1 = DummyGroup("Julia Meier", "PERSON")
+    g2 = DummyGroup("Frau Meier", "PERSON")
+    g3 = DummyGroup("Julias", "PERSON")
+    g4 = DummyGroup("John Smith", "PERSON")
+    g5 = DummyGroup("Mr. Smith", "PERSON")
+
+    groups = [g1, g2, g3, g4, g5]
+    compute_smart_link_proposals(groups)
+
+    # Verify no auto-commit: parent_group_text must still be None
+    assert g2.parent_group_text is None
+    assert g3.parent_group_text is None
+    assert g5.parent_group_text is None
+
+    # Verify proposal generation
+    assert g2.suggested_parent == "Julia Meier"
+    assert g2.suggested_tag == "ANREDE"
+
+    assert g3.suggested_parent == "Julia Meier"
+    assert g3.suggested_tag == "GENITIV"
+
+    assert g5.suggested_parent == "John Smith"
+    assert g5.suggested_tag == "ANREDE"
+
+    # Test multiple candidates ambiguity (e.g. two Meiers)
+    g6 = DummyGroup("Hans Meier", "PERSON")
+    multi_groups = [g1, g6, g2]
+    compute_smart_link_proposals(multi_groups)
+
+    # When multiple Meiers exist, single auto-link must be suppressed in favor of candidate list
+    assert g2.suggested_parent is None
+    assert set(g2.suggested_candidates) == {"Julia Meier", "Hans Meier"}
+
+
+

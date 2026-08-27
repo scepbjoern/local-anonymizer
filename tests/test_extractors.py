@@ -128,3 +128,95 @@ def test_create_docx_from_markdown_with_native_styles():
     raw_bytes = save_markdown_to_docx_bytes(md_content)
     assert len(raw_bytes) > 0
 
+
+def test_docx_custom_outline_levels_and_lists(tmp_path):
+    import docx
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from local_anonymizer.extractors import extract_text_from_docx
+
+    docx_path = tmp_path / "custom_doc.docx"
+    doc = docx.Document()
+
+    # 1. Custom heading via outline level
+    p_h1 = doc.add_paragraph("Firmeninterne Hauptueberschrift")
+    pPr = p_h1._p.get_or_add_pPr()
+    outlineLvl = OxmlElement("w:outlineLvl")
+    outlineLvl.set(qn("w:val"), "0")
+    pPr.append(outlineLvl)
+
+    # 2. German Heading 2 style
+    p_h2 = doc.add_heading("Zweiter Unterabschnitt", level=2)
+
+    # 3. Bullet item
+    doc.add_paragraph("Erster Aufzählungspunkt", style="List Bullet")
+
+    # 4. Numbered item
+    doc.add_paragraph("Nummerierter Punkt Eins", style="List Number")
+
+    doc.save(str(docx_path))
+
+    extracted = extract_text_from_docx(docx_path)
+    assert "# Firmeninterne Hauptueberschrift" in extracted
+    assert "## Zweiter Unterabschnitt" in extracted
+    assert "- Erster Aufzählungspunkt" in extracted
+    assert "1. Nummerierter Punkt Eins" in extracted
+
+
+def test_docx_bold_paragraph_false_positive_prevention(tmp_path):
+    import docx
+    from docx.shared import Pt
+    from local_anonymizer.extractors import extract_text_from_docx
+
+    docx_path = tmp_path / "warning_doc.docx"
+    doc = docx.Document()
+
+    # Regular paragraph with bold text that is NOT a heading (has full sentence with period, normal size)
+    p_warn = doc.add_paragraph()
+    run = p_warn.add_run("WICHTIGER HINWEIS: Dieser Text ist fett und wichtig, aber ein normaler Fließtextabsatz.")
+    run.bold = True
+    run.font.size = Pt(11)
+
+    doc.save(str(docx_path))
+
+    extracted = extract_text_from_docx(docx_path)
+    # Must NOT start with '#'
+    assert not extracted.startswith("#")
+    assert "WICHTIGER HINWEIS: Dieser Text ist fett und wichtig, aber ein normaler Fließtextabsatz." in extracted
+
+
+def test_anonymize_within_csv_markdown_tables_preserves_structure(tmp_path):
+    from local_anonymizer.extractors import read_document
+    from local_anonymizer.anonymizer import LocalAnonymizer
+
+    csv_path = tmp_path / "team.csv"
+    csv_path.write_text(
+        "Name,Rolle,Hochschule\n"
+        "Julia Meier,Studentin,ZHAW\n"
+        "Max Mustermann,Dozent,ETH\n",
+        encoding="utf-8"
+    )
+
+    extracted_md = read_document(csv_path)
+    # Verify CSV was parsed into markdown table
+    assert "| Name | Rolle | Hochschule |" in extracted_md
+    assert "| :--- | :--- | :--- |" in extracted_md
+    assert "| Julia Meier | Studentin | ZHAW |" in extracted_md
+
+    anonymizer = LocalAnonymizer()
+    roles = {"julia meier": "STUDENT", "max mustermann": "DOZENT"}
+    result = anonymizer.anonymize(extracted_md, format_mode="numbered_role", roles=roles)
+
+    assert "[PERSON_1_STUDENT]" in result.anonymized_text
+    assert "[PERSON_2_DOZENT]" in result.anonymized_text
+    assert "[ORGANIZATION_1]" in result.anonymized_text or "ZHAW" in result.anonymized_text
+
+    # Structure check: every line should be a markdown table row
+    for line in result.anonymized_text.strip().splitlines():
+        assert line.startswith("|") and line.endswith("|")
+
+    # Roundtrip reversibility check
+    restored = LocalAnonymizer.de_anonymize(result.anonymized_text, result.mapping)
+    assert restored == extracted_md
+
+

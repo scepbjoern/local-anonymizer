@@ -5,7 +5,7 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import spacy
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
@@ -116,6 +116,87 @@ def build_entity_tree(
             root.children = [EntityTreeNode(item=c) for c in children_map[r_key]]
 
     return roots
+
+
+HONORIFICS: Set[str] = {
+    "frau", "herr", "herrn", "dr", "dr.", "prof", "prof.", "prof. dr.", "dozent", "dozentin",
+    "mr", "mr.", "mrs", "mrs.", "ms", "ms.", "miss", "sir", "madam"
+}
+
+
+def compute_smart_link_proposals(
+    items: List[Any],
+    get_text: Optional[Callable[[Any], str]] = None,
+    get_entity_type: Optional[Callable[[Any], str]] = None,
+    get_parent: Optional[Callable[[Any], Optional[str]]] = None,
+) -> None:
+    """
+    Compute smart linking suggestions as interactive proposals (NO auto-commit!).
+    Sets attributes .suggested_parent, .suggested_tag, and .suggested_candidates on each item.
+    """
+    if get_text is None:
+        get_text = lambda x: getattr(x, "original_text", str(x))
+    if get_entity_type is None:
+        get_entity_type = lambda x: getattr(x, "entity_type", "")
+    if get_parent is None:
+        get_parent = lambda x: getattr(x, "parent_group_text", None)
+
+    for g in items:
+        g.suggested_parent = None
+        g.suggested_tag = None
+        g.suggested_candidates = []
+
+        if get_parent(g):
+            continue
+
+        if get_entity_type(g) != "PERSON":
+            continue
+
+        orig_text = get_text(g)
+        orig_lower = orig_text.lower().strip()
+        words = orig_text.split()
+        potential_candidates: List[Tuple[str, str]] = []
+
+        # 1. Single word: Check genitive stem or first/last name
+        if len(words) == 1:
+            stem = re.sub(r"(s|'s|’s)$", "", orig_text, flags=re.IGNORECASE).strip()
+            if stem and stem.lower() != orig_lower:
+                for other in items:
+                    if get_text(other).lower() != orig_lower and get_entity_type(other) == "PERSON" and not get_parent(other):
+                        other_words = get_text(other).split()
+                        if any(stem.lower() == w.lower() for w in other_words):
+                            potential_candidates.append((get_text(other), "GENITIV"))
+
+            for other in items:
+                if get_text(other).lower() != orig_lower and get_entity_type(other) == "PERSON" and not get_parent(other):
+                    other_words = get_text(other).split()
+                    if len(other_words) > 1:
+                        if orig_lower == other_words[0].lower():
+                            potential_candidates.append((get_text(other), "VORNAME"))
+                        elif orig_lower == other_words[-1].lower():
+                            potential_candidates.append((get_text(other), "NACHNAME"))
+
+        # 2. Multi-word: Check German/English honorifics (e.g. "Frau Meier", "Mr. Smith")
+        elif len(words) >= 2 and words[0].lower().rstrip(".") in HONORIFICS:
+            last_name = words[-1].lower()
+            for other in items:
+                if get_text(other).lower() != orig_lower and get_entity_type(other) == "PERSON" and not get_parent(other):
+                    other_words = get_text(other).split()
+                    if len(other_words) > 1 and other_words[0].lower().rstrip(".") not in HONORIFICS:
+                        if last_name == other_words[-1].lower():
+                            potential_candidates.append((get_text(other), "ANREDE"))
+
+        unique_cand_dict: Dict[str, str] = {}
+        for cand_name, tag in potential_candidates:
+            unique_cand_dict.setdefault(cand_name, tag)
+
+        if len(unique_cand_dict) == 1:
+            cand_name, tag = list(unique_cand_dict.items())[0]
+            g.suggested_parent = cand_name
+            g.suggested_tag = tag
+        elif len(unique_cand_dict) > 1:
+            g.suggested_candidates = list(unique_cand_dict.keys())
+            g.suggested_tag = list(unique_cand_dict.values())[0]
 
 
 @dataclass
