@@ -1,6 +1,7 @@
 """Document extraction utilities for various file formats."""
 
 import io
+import re
 from pathlib import Path
 from typing import Union
 import pymupdf  # PyMuPDF
@@ -39,7 +40,17 @@ def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
     full_text = []
     for para in doc.paragraphs:
         if para.text:
-            full_text.append(para.text)
+            text = para.text
+            style_name = para.style.name.lower() if para.style and para.style.name else ""
+            if "heading 1" in style_name:
+                text = f"# {text}"
+            elif "heading 2" in style_name:
+                text = f"## {text}"
+            elif "heading 3" in style_name:
+                text = f"### {text}"
+            elif "heading 4" in style_name:
+                text = f"#### {text}"
+            full_text.append(text)
 
     # Also extract text from tables
     for table in doc.tables:
@@ -54,6 +65,79 @@ def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
 def extract_text_from_docx(path: Path) -> str:
     """Extract text from Microsoft Word .docx files."""
     return extract_text_from_docx_bytes(path.read_bytes())
+
+
+def create_docx_from_markdown(md_text: str) -> docx.Document:
+    """
+    Convert Markdown text into a native Word .docx document using real Word paragraph styles
+    (Heading 1, Heading 2, Heading 3, Heading 4, List Bullet, List Number, Normal).
+    Does NOT output literal '#' or Markdown markers into the document.
+    """
+    doc = docx.Document()
+    lines = md_text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        trimmed = line.strip()
+
+        if not trimmed:
+            i += 1
+            continue
+
+        # Headings
+        if trimmed.startswith("#### "):
+            doc.add_heading(trimmed[5:].strip(), level=4)
+        elif trimmed.startswith("### "):
+            doc.add_heading(trimmed[4:].strip(), level=3)
+        elif trimmed.startswith("## "):
+            doc.add_heading(trimmed[3:].strip(), level=2)
+        elif trimmed.startswith("# "):
+            doc.add_heading(trimmed[2:].strip(), level=1)
+        # Lists
+        elif trimmed.startswith("- ") or trimmed.startswith("* "):
+            doc.add_paragraph(trimmed[2:].strip(), style="List Bullet")
+        elif re.match(r"^\d+\.\s+", trimmed):
+            text_part = re.sub(r"^\d+\.\s+", "", trimmed)
+            doc.add_paragraph(text_part.strip(), style="List Number")
+        # Tables (Markdown | col1 | col2 |)
+        elif trimmed.startswith("|") and trimmed.endswith("|"):
+            table_lines = []
+            while i < len(lines) and lines[i].strip().startswith("|") and lines[i].strip().endswith("|"):
+                table_lines.append(lines[i].strip())
+                i += 1
+            i -= 1
+
+            rows_data = []
+            for t_line in table_lines:
+                cells = [c.strip() for c in t_line.strip("|").split("|")]
+                if all(re.match(r"^:?-+:?$", c) for c in cells if c):
+                    continue
+                rows_data.append(cells)
+
+            if rows_data:
+                num_cols = max(len(r) for r in rows_data)
+                table = doc.add_table(rows=len(rows_data), cols=num_cols)
+                try:
+                    table.style = "Table Grid"
+                except Exception:
+                    pass
+                for r_idx, r_data in enumerate(rows_data):
+                    for c_idx, cell_val in enumerate(r_data):
+                        table.cell(r_idx, c_idx).text = cell_val
+        else:
+            doc.add_paragraph(trimmed)
+
+        i += 1
+
+    return doc
+
+
+def save_markdown_to_docx_bytes(md_text: str) -> bytes:
+    """Convert Markdown text to .docx and return raw bytes."""
+    doc = create_docx_from_markdown(md_text)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 def extract_text_from_pdf_bytes(raw_bytes: bytes, filename: str = "document.pdf") -> str:

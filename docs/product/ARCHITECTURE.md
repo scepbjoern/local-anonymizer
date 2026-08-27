@@ -105,8 +105,16 @@
 
 ### 2.4 Benutzeroberfläche (`app.py`)
 - Aufgebaut mit **NiceGUI** (FastAPI + Vue/Quasar Backend).
-- Desktop-Ausführung über `ui.run(native=True)` (nutzt Microsoft WebView2 auf Windows via `pywebview`).
+- Desktop-Ausführung über `ui.run(native=True)` (nutzt Microsoft WebView2 auf Windows bzw. WebKit/Cocoa auf macOS via `pywebview`).
 - CPU-intensive NLP-Berechnungen werden per `asyncio.to_thread` vom UI-Event-Loop isoliert.
+- Hierarchische Baum-Ansicht (`build_entity_tree`) zur intuitiven Darstellung verknüpfter Namensvarianten mit sofortiger Trennen-Aktion.
+
+### 2.5 Konfigurations- & OS-Architektur (`config.py`, Startskripte)
+- **Persistente Einstellungen:** `~/.local-anonymizer/config.json` speichert Nutzereinstellungen defensiv (mit Fallback auf Standardwerte bei Dateifehlern).
+- **Diagnose-Logging:** `~/.local-anonymizer/app.log` dient als Fehlerprotokoll bei unsichtbarem Start.
+- **Windows-Integration:** `install_windows.bat` erstellt Desktop- und Startmenü-Verknüpfungen mit geräuschlosem `pythonw`-Start.
+- **macOS-Integration:** `start_mac.command` und `install_mac.command` bieten native Startskripte. `pyproject.toml` bindet `pywebview>=5.0.0` ein, was macOS-spezifische Cocoa-Bindings out-of-the-box mitliefert.
+- **Automatisierte Mac-Prüfung:** GitHub Actions Workflow (`.github/workflows/mac-test.yml`) für manuell triggerbare Tests auf `macos-latest`.
 
 ---
 

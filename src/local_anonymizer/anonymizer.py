@@ -5,7 +5,7 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import spacy
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
@@ -70,6 +70,52 @@ class DetectedEntity:
     needs_review: bool = False
     role: Optional[str] = None
     surface_tag: Optional[str] = None
+
+
+@dataclass
+class EntityTreeNode:
+    """Represents a node in a hierarchical entity tree (master and linked surface variants)."""
+    item: Any
+    children: List["EntityTreeNode"] = field(default_factory=list)
+
+
+def build_entity_tree(
+    items: List[Any],
+    get_key: Optional[Callable[[Any], str]] = None,
+    get_parent_key: Optional[Callable[[Any], Optional[str]]] = None,
+) -> List[EntityTreeNode]:
+    """
+    Build a hierarchical tree of entities (roots/masters with linked children).
+    
+    Defaults to reading .key and .parent_group_text if callables are omitted.
+    """
+    if get_key is None:
+        get_key = lambda x: getattr(x, "key", str(x).lower())
+    if get_parent_key is None:
+        get_parent_key = lambda x: (
+            getattr(x, "parent_group_text", "").strip().lower()
+            if getattr(x, "parent_group_text", None)
+            else None
+        )
+
+    item_keys = {get_key(it): it for it in items}
+    roots: List[EntityTreeNode] = []
+    children_map: Dict[str, List[Any]] = {}
+
+    for it in items:
+        p_key = get_parent_key(it)
+        it_key = get_key(it)
+        if p_key and p_key != it_key and p_key in item_keys:
+            children_map.setdefault(p_key, []).append(it)
+        else:
+            roots.append(EntityTreeNode(item=it))
+
+    for root in roots:
+        r_key = get_key(root.item)
+        if r_key in children_map:
+            root.children = [EntityTreeNode(item=c) for c in children_map[r_key]]
+
+    return roots
 
 
 @dataclass
@@ -226,6 +272,44 @@ class LocalAnonymizer:
             if not overlaps:
                 accepted.append(r)
                 accepted_spans.append((r.start, r.end))
+
+        # 3. German/English genitive extension for recognized PERSON entities (e.g. "Julia" -> "Julias", "Julia's")
+        person_results = [r for r in accepted if r.entity_type == "PERSON"]
+        genitive_results: List[RecognizerResult] = []
+        for r in person_results:
+            p_text = text[r.start:r.end].strip()
+            # Split full names into capitalized components (e.g. "Julia Meier" -> ["Julia", "Meier"])
+            name_parts = [part for part in re.findall(r"\b[A-ZÄÖÜ][a-zäöüßA-ZÄÖÜ-]+\b", p_text) if len(part) >= 3]
+            for part in name_parts:
+                # Check if this part is in ignore terms (e.g. "Prof", "Dr")
+                if any(part.lower() == ig.strip().lower() for ig in self.ignore_terms):
+                    continue
+                # Search for genitive: e.g. "Julias", "Julia's", "Julia’s"
+                genitive_pattern = re.compile(r"\b" + re.escape(part) + r"(s|'s|’s)\b")
+                for m in genitive_pattern.finditer(text):
+                    m_start, m_end = m.start(), m.end()
+                    # Check if already covered by accepted spans
+                    is_covered = any(
+                        not (m_end <= s or m_start >= e)
+                        for s, e in accepted_spans
+                    )
+                    is_ignored = any(
+                        not (m_end <= ig_s or m_start >= ig_e)
+                        for ig_s, ig_e in ignored_spans
+                    )
+                    if not is_covered and not is_ignored:
+                        genitive_results.append(
+                            RecognizerResult(
+                                entity_type="PERSON",
+                                start=m_start,
+                                end=m_end,
+                                score=min(0.85, r.score),
+                            )
+                        )
+                        accepted_spans.append((m_start, m_end))
+
+        if genitive_results:
+            accepted.extend(genitive_results)
 
         # Sort by start position in text
         accepted.sort(key=lambda r: r.start)

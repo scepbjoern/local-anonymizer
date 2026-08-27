@@ -1,0 +1,34 @@
+name: macOS Compatibility Test (Manual)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies with GUI & Dev extras
+        run: |
+          uv sync --extra gui --extra dev
+
+      - name: Run Test Suite on macOS
+        run: |
+          uv run pytest tests -v
+
+      - name: Check pywebview & NiceGUI Import on macOS
+        run: |
+          uv run python -c "import webview; print('pywebview import OK'); import nicegui; print('nicegui import OK')"

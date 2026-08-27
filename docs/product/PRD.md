@@ -95,23 +95,35 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 ### 4.5 Feature 5: Interaktives Review-GUI (NiceGUI) *(Umgesetzt)*
 
 * **Single-Page Application (`app.py`):**
-  * Start als eigenständiges natives Desktop-Fenster (`native=True` via pywebview/WebView2) oder im Webbrowser (`--browser`).
+  * Start als eigenständiges natives Desktop-Fenster (`native=True` via pywebview/WebView2 auf Windows bzw. WebKit/Cocoa auf macOS) oder im Webbrowser (`--browser`).
+* **Hierarchische Tree-View:** Klare optische Strukturierung: Hauptidentitäten oben, verknüpfte Schreibweisen (`_VORNAME`, `_ANREDE`) visuell eingerückt darunter mit sofortiger `✕ Trennen`-Aktion.
+* **Transparente Platzhalter-Badges:** Jede Tabellenzeile zeigt direkt den final zugeordneten Platzhalter (z. B. `[PERSON_1_STUDENT]`).
+* **Manuelle Entitätserfassung:** Fehlende Begriffe (Falsch-Negative des NER) können direkt per 1-Klick-Eingabe (`"Remo: PERSON"`) im gesamten Text als Entität forciert werden.
 * **Gebündelte Entitäten-Ansicht:** Identische Begriffe (z. B. 8x „Julia“) werden auf eine einzige Zeile mit Mengenzähler (`8x`) aggregiert.
 * **Aufklappbare Kontext-Vorschau:** Akkordeon-Ansicht zeigt alle Fundstellen im Satzkontext mit visueller Hervorhebung (`... für <mark>Julia</mark> im Herbst ...`).
 * **Sortier-Toolbar:** Umschaltbar nach *Erstes Auftreten*, *Häufigkeit*, *Entitätstyp*, *Alphabetisch* und *Review-Bedarf*.
-* **Reaktive Live-Vorschau:** Text-Vorschau aktualisiert sich bei jedem Klick in der Tabelle ohne Verzögerung im Arbeitsspeicher.
+* **Persistente Einstellungen (`config.json`):** Format-Modus, aktivierte Entitäten, Schwellenwerte, Ignore-Listen und Glossare werden automatisch in `~/.local-anonymizer/config.json` gespeichert.
 * **Desktop-Export-Aktionen:**
   * 📋 *In Zwischenablage kopieren*
-  * 💾 *Native Windows-Dateidialoge („Speichern unter...“)*
-  * 📁 *1-Klick-Export aller 3 Dateien (`_anonymized.txt`, `_mapping.json`, `_report.json`) in einen Zielordner inkl. „Im Explorer öffnen“-Aktion.*
-* **De-Anonymisierungs-Tab:** Wiederherstellung der Originaltexte durch Hochladen der LLM-Antwort und der lokalen Mapping-Datei.
+  * 💾 *Format-Wahl (`.txt` oder `.md`)*
+  * 📁 *1-Klick-Export aller 3 Dateien (`_anonymized.*`, `_mapping.json`, `_report.json`) in einen Zielordner.*
 
 ---
 
 ### 4.6 Feature 6: Deterministische 2-Wege De-Anonymisierung *(Umgesetzt)*
 
-* **Single-Pass Regex-Substitution:** Platzhalter werden nach Längen absteigend sortiert und in einem einzigen Regex-Durchlauf ersetzt, um Kaskadierungsfehler (Überschreiben von Platzhaltern innerhalb ersetzter Klartexte) mathematisch auszuschliessen.
-* **Audit-Report:** JSON-Bericht mit Dokument-Metadaten, Entitätszählern, Konfidenzen und Review-Status.
+* **Single-Pass Regex-Substitution:** Platzhalter werden nach Längen absteigend sortiert und in einem einzigen Regex-Durchlauf ersetzt, um Kaskadierungsfehler mathematisch auszuschliessen.
+* **Dokumenten-Upload im Restore-Tab:** LLM-Antworten können direkt als `.docx`, `.md` oder `.txt` hochgeladen werden.
+* **Automatischer Mapping-Transfer:** Das im ersten Tab aktive Mapping wird automatisch als Standard im Restore-Tab vorgeschlagen.
+* **Word-Export mit echten Formatvorlagen:** Wiederhergestellte Dokumente können als echtes `.docx` mit nativen Absatzformatvorlagen (`Heading 1`, `Heading 2`, `List Bullet`, `Table Grid`) exportiert werden.
+
+---
+
+### 4.7 Feature 7: Plattform- & OS-Integration *(Umgesetzt)*
+
+* **Windows-Integration:** `install_windows.bat` und `start_windows.bat` ermöglichen den Start im Hintergrund (Silent Mode via `pythonw`) mit Desktop- und Startmenü-Verknüpfung sowie Logging unter `~/.local-anonymizer/app.log`.
+* **macOS-Kompatibilität:** `start_mac.command` und `install_mac.command` bieten komfortablen Start. Automatischer Cocoa/WebKit-Support über `pywebview>=5.0.0`.
+* **CI/CD Testsuite:** Manuell auslösbarer GitHub-Actions-Workflow (`.github/workflows/mac-test.yml`) zur Verifikation auf `macos-latest`.
 
 ---
 
@@ -124,20 +136,25 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 * 15/15 Pytest Regressionstests, NiceGUI Desktop-Anwendung, In-Memory File Handling, Entitäten-Bündelung, Kontext-Akkordeons, Sortier-Toolbar, nativer Datei-Export.
 
 ### ✅ Phase 3: Semantische Rollen, Entity-Linking & Markdown-Extraktion (Abgeschlossen)
-* 21/21 Pytest Regressionstests bestanden (100%).
+* 21/21 Pytest Regressionstests bestanden.
 * Einbindung von `pymupdf4llm` für formatierte Markdown-Extraktion aus PDFs.
 * Umsetzung der 3 Platzhalter-Format-Modi (`[TYP_NUMMER]`, `[TYP_NUMMER_ROLLE]`, `[TYP_ROLLE]` mit Kollisionsschutz).
-* Implementierung des Entity-Linkings für Schreibweisen (`VOLLNAME`, `VORNAME`, `NACHNAME`, `KURZFORM`, `ANREDE`) im Core und im GUI inklusive `✕ Trennen`-Aktion.
+* Co-Referenz-Tags (`VOLLNAME`, `VORNAME`, `NACHNAME`, `KURZFORM`, `ANREDE`).
 
-### 🔮 Phase 4: Lokaler SLM-Triage-Layer (Geplant / Ausblick)
-* Optionaler Triage-Filter mit lokalem SLM (z. B. via Ollama / LM Studio) zur automatischen Vorfilterung von Grenzfall-Entitäten.
+### ✅ Phase 4: UX-Optimierungen, Tree-View, Genitiv- & Word-Export (Abgeschlossen)
+* 27/27 Pytest Regressionstests bestanden (100%).
+* Platzhalter-Badges in Tabelle & Baumansicht (Tree-View) für verknüpfte Schreibweisen.
+* Genitiv-Erkennung ("Julias", "Meiers") mit Falsch-Positiv-Schutz.
+* 1-Klick Manuelle Entitätserfassung ("Remo: PERSON").
+* Word-zu-Markdown Überschriften-Extraktion & Markdown-zu-Docx Export mit echten Formatvorlagen.
+* Persistente Konfiguration (`config.json`) & Silent-Mode Windows Launcher (`pythonw`).
+* macOS Launch-Skripte & manueller GitHub Actions Mac-Workflow.
 
 ### 🔮 Phase 5a: Homonym-Zuordnung pro Fundstelle (Geplant nach CAS-Deliverable)
-* Granulare Disambiguierung identischer Textstellen innerhalb eines Dokuments (z. B. das Wort *„Julia“* an Stelle 1 ist Person 1, an Stelle 3 jedoch Person 2) direkt über Einzelauswahlen in den aufklappbaren Kontext-Akkordeons des Review-GUIs.
+* Granulare Disambiguierung identischer Textstellen innerhalb eines Dokuments direkt über Einzelauswahlen in den aufklappbaren Kontext-Akkordeons des Review-GUIs.
 
 ### 🔮 Phase 5b: Projekt-Registry für dokumentübergreifende Mappings (Geplant nach CAS-Deliverable)
 * Verschlüsselte, strikt projekt- und kontextbezogene Mapping-Registry (Passphrase-geschützt via KeePass) zur Wiederverwendung konsistenter Pseudonyme über mehrere Dokumente hinweg.
-* **Leitplanken:** 
-  1. Strikt projekt-gescoped (keine globalen Mappings; saubere Trennung beruflich/privat).
-  2. Registry-Treffer sind immer bestätigungspflichtige Vorschläge im Review-GUI (kein automatisches Überschreiben).
-  3. Dokument-Mappings bleiben zu 100% autark und selbsttragend ohne Laufzeitabhängigkeit von der Registry.
+
+### 🔮 Phase 6: Lokaler SLM-Triage-Layer (Geplant / Ausblick)
+* Optionaler Triage-Filter mit lokalem SLM (z. B. via Ollama / LM Studio) zur automatischen Vorfilterung von Grenzfall-Entitäten.

@@ -21,7 +21,7 @@ dev = [
 ]
 gui = [
     "nicegui>=1.4.0",
-    "pywebview>=4.4.0",
+    "pywebview>=5.0.0",
 ]
 
 [tool.pytest.ini_options]

@@ -1,0 +1,74 @@
+import json
+import logging
+from pathlib import Path
+from typing import List
+
+CONFIG_DIR = Path.home() / ".local-anonymizer"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+LOG_FILE = CONFIG_DIR / "app.log"
+
+# Set up global logging fallback
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    filename=str(LOG_FILE),
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+
+class AppConfig:
+    def __init__(self):
+        self.format_mode: str = "numbered_role"
+        self.active_entities: List[str] = [
+            "PERSON",
+            "ORGANIZATION",
+            "EMAIL_ADDRESS",
+            "PHONE_NUMBER",
+            "LOCATION",
+        ]
+        self.gliner_threshold: float = 0.55
+        self.ignore_terms: str = "CAS, DAS, MAS, BSc, MSc, PhD, MBA, Studierende, Studierenden, Dozent, Dozenten, Lehrperson, Berater, Aufgabensteller"
+        self.glossary: str = "ZHAW: ORGANIZATION\nHWZ: ORGANIZATION\nUZH: ORGANIZATION\nETH: ORGANIZATION"
+        self.export_format: str = "txt"
+
+    def to_dict(self) -> dict:
+        return {
+            "format_mode": self.format_mode,
+            "active_entities": self.active_entities,
+            "gliner_threshold": self.gliner_threshold,
+            "ignore_terms": self.ignore_terms,
+            "glossary": self.glossary,
+            "export_format": self.export_format,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AppConfig":
+        config = cls()
+        config.format_mode = data.get("format_mode", config.format_mode)
+        config.active_entities = data.get("active_entities", config.active_entities)
+        config.gliner_threshold = data.get("gliner_threshold", config.gliner_threshold)
+        config.ignore_terms = data.get("ignore_terms", config.ignore_terms)
+        config.glossary = data.get("glossary", config.glossary)
+        config.export_format = data.get("export_format", config.export_format)
+        return config
+
+    def save(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+            logging.info("Configuration saved successfully.")
+        except Exception as e:
+            logging.error(f"Failed to save config: {e}")
+
+    @classmethod
+    def load(cls) -> "AppConfig":
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return cls.from_dict(data)
+            except Exception as e:
+                logging.error(f"Failed to load config, using defaults: {e}")
+                return cls()
+        return cls()
