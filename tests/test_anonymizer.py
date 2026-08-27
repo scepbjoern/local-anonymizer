@@ -293,5 +293,21 @@ def test_full_name_precedence_over_subword_glossary():
     assert "[PERSON_1_LEHRPERSON]" in result.anonymized_text or "[PERSON_2_LEHRPERSON]" in result.anonymized_text
 
 
+def test_local_anonymizer_analyze_with_progress():
+    from local_anonymizer.anonymizer import LocalAnonymizer
+
+    anonymizer = LocalAnonymizer()
+    progress_updates = []
+    def on_progress(val, msg):
+        progress_updates.append((val, msg))
+
+    results = anonymizer.analyze("Julia Meier arbeitet an der ETH Zürich.", on_progress=on_progress)
+    assert len(progress_updates) >= 4
+    assert progress_updates[0][0] == 0.10
+    assert progress_updates[-1][0] == 0.90
+    assert any(r.entity_type == "PERSON" for r in results)
+
+
+
 
 

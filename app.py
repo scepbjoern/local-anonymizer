@@ -14,13 +14,16 @@ import os
 import re
 import sys
 import threading
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 # Ensure src is in python path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from fastapi import File, UploadFile
+from fastapi.responses import JSONResponse
 from nicegui import app, ui
 
 from local_anonymizer.config import AppConfig, CONFIG_DIR, LOG_FILE
@@ -35,6 +38,21 @@ from local_anonymizer.extractors import (
 
 # Silence presidio analyzer language mismatch warnings
 logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
+
+# In-memory upload cache for large file Drag & Drop (avoids WebSocket size limits)
+_upload_cache: Dict[str, Dict[str, Any]] = {}
+
+
+@app.post("/api/upload")
+async def api_upload(file: UploadFile = File(...)):
+    """FastAPI endpoint to receive large dropped files via HTTP streaming."""
+    content = await file.read()
+    file_id = str(uuid.uuid4())
+    _upload_cache[file_id] = {
+        "filename": file.filename or "upload",
+        "content": content,
+    }
+    return JSONResponse({"file_id": file_id, "filename": file.filename, "size": len(content)})
 
 
 # --- Data Models for Grouped Review ---
@@ -462,6 +480,10 @@ def create_ui():
     file_badge_label = None
     analyze_btn = None
     reset_btn = None
+    reanalysis_warning_card = None
+    extraction_progress_card = None
+    extraction_progress_label = None
+    extraction_progress_bar = None
     ignore_container = None
     glossary_container = None
     restore_anon_input = None
@@ -486,7 +508,34 @@ def create_ui():
                 file_badge_card.set_visibility(False)
         ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen).", type="positive")
 
-    def open_native_file_dialog():
+    async def extract_and_load_file_bytes(raw_bytes: bytes, filename: str):
+        """Asynchronously extract structured text from document bytes with live UI progress."""
+        if extraction_progress_card is not None and extraction_progress_bar is not None and extraction_progress_label is not None:
+            extraction_progress_card.set_visibility(True)
+            extraction_progress_bar.set_value(0.0)
+            extraction_progress_label.set_text(f"Lese '{filename}' ein...")
+            await asyncio.sleep(0.02)
+
+        loop = asyncio.get_running_loop()
+
+        def progress_cb(curr: int, total: int, msg: str):
+            if extraction_progress_bar is not None and extraction_progress_label is not None:
+                val = curr / max(1, total)
+                loop.call_soon_threadsafe(extraction_progress_bar.set_value, val)
+                loop.call_soon_threadsafe(extraction_progress_label.set_text, f"{msg} ({int(val * 100)}%)")
+
+        try:
+            text = await asyncio.to_thread(read_document_from_bytes, raw_bytes, filename, progress_cb)
+            load_content_into_workspace(text, filename)
+        except Exception as ex:
+            err_msg = f"{type(ex).__name__}: {str(ex)}"
+            logging.error(f"File extraction error: {err_msg}", exc_info=True)
+            ui.notify(f"Fehler beim Einlesen von '{filename}': {err_msg}", type="negative", timeout=15000)
+        finally:
+            if extraction_progress_card is not None:
+                extraction_progress_card.set_visibility(False)
+
+    async def open_native_file_dialog():
         """Open native OS file picker with full Win32 lock-sharing support."""
         try:
             import tkinter as tk
@@ -509,8 +558,7 @@ def create_ui():
             if filepath:
                 p = Path(filepath)
                 data = safe_read_bytes(p)
-                text = read_document_from_bytes(data, p.name)
-                load_content_into_workspace(text, p.name)
+                await extract_and_load_file_bytes(data, p.name)
         except Exception as ex:
             err_msg = f"{type(ex).__name__}: {str(ex)}"
             logging.error(f"Native file open error: {err_msg}", exc_info=True)
@@ -537,7 +585,10 @@ def create_ui():
             analyze_btn.set_enabled(False)
         if reset_btn is not None:
             reset_btn.set_visibility(False)
+        if reanalysis_warning_card is not None:
+            reanalysis_warning_card.set_visibility(False)
         ui.notify("Workspace zurückgesetzt.", type="info", icon="delete_sweep")
+
 
     def render_ignore_list_ui():
         if not ignore_container:
@@ -637,6 +688,15 @@ def create_ui():
         stem = Path(state.filename).stem or "dokument"
         ext = state.export_format
 
+        # Sync the current mapping to Tab 2 immediately so it's pre-filled when the user switches tabs
+        if mapping and map_json_input is not None:
+            state.restore_mapping = dict(mapping)
+            map_json_input.value = json.dumps(mapping, indent=2, ensure_ascii=False)
+            logging.info(f"[Tab2 sync] mapping synced: {len(mapping)} entries")
+        else:
+            logging.info(f"[Tab2 sync] SKIPPED: mapping={bool(mapping)}, map_json_input is None={map_json_input is None}")
+
+
         preview_holder.clear()
         with preview_holder:
             if state.format_mode == "role_only" and state.colliding_roles:
@@ -735,13 +795,20 @@ def create_ui():
             ui.notify("Bitte laden Sie zuerst ein Dokument hoch oder fügen Sie Text ein.", type="warning")
             return
 
+        if reanalysis_warning_card is not None:
+            reanalysis_warning_card.set_visibility(False)
+
         # Show visual indicators immediately (< 20ms)
         if analyze_btn:
             analyze_btn.props("loading")
+        
+        progress_bar = None
+        progress_label = None
         if progress_holder:
             progress_holder.clear()
             with progress_holder:
-                ui.linear_progress().props("indeterminate color=primary").classes("w-full mb-2")
+                progress_bar = ui.linear_progress(value=0.0, show_value=False).props("color=primary stripe rounded instant-feedback").classes("w-full mb-1")
+                progress_label = ui.label("0% - Lokale Analyse gestartet...").classes("text-xs text-slate-600 font-medium mb-2")
 
         if table_holder:
             table_holder.clear()
@@ -756,15 +823,29 @@ def create_ui():
         try:
             # Wait for background warmup if still running
             while not _model_ready:
+                if progress_label:
+                    progress_label.set_text("Warte auf KI-Modell-Initialisierung...")
                 await asyncio.sleep(0.1)
+
+            loop = asyncio.get_running_loop()
+
+            def update_progress(val: float, msg: str):
+                if progress_bar and progress_label:
+                    progress_bar.set_value(val)
+                    progress_label.set_text(f"{int(val * 100)}% - {msg}")
+
+            def thread_progress_cb(val: float, msg: str):
+                loop.call_soon_threadsafe(update_progress, val, msg)
 
             def do_analysis(text):
                 global _cached_anonymizer
                 if _cached_anonymizer is None:
                     _cached_anonymizer = build_anonymizer()
-                return _cached_anonymizer.analyze(text)
+                return _cached_anonymizer.analyze(text, on_progress=thread_progress_cb)
 
             results = await asyncio.to_thread(do_analysis, state.raw_text)
+
+            update_progress(0.92, "Fundstellen werden gruppiert...")
 
             groups_dict: Dict[str, EntityGroup] = {}
             for res in results:
@@ -787,6 +868,8 @@ def create_ui():
 
             state.entity_groups = list(groups_dict.values())
 
+            update_progress(0.96, "Smart-Linking & Vorschau werden berechnet...")
+
             # Compute interactive smart-linking suggestions (Proposal model, NO auto-commit)
             from local_anonymizer.anonymizer import compute_smart_link_proposals
             compute_smart_link_proposals(state.entity_groups)
@@ -795,9 +878,11 @@ def create_ui():
             compute_reactive_preview()
 
             total_occurrences = sum(g.count for g in state.entity_groups)
-            ui.notify(f"Analyse abgeschlossen: {len(state.entity_groups)} Begriffe ({total_occurrences} Fundstellen).", type="positive")
             build_review_table()
             refresh_preview_and_exports()
+
+            update_progress(1.0, f"Abgeschlossen: {len(state.entity_groups)} Begriffe ({total_occurrences} Fundstellen)")
+            ui.notify(f"Analyse abgeschlossen: {len(state.entity_groups)} Begriffe ({total_occurrences} Fundstellen).", type="positive")
 
         except Exception as e:
             if table_holder:
@@ -808,6 +893,7 @@ def create_ui():
             if analyze_btn:
                 analyze_btn.props(remove="loading")
             if progress_holder:
+                await asyncio.sleep(0.8)
                 progress_holder.clear()
 
     def get_sorted_groups() -> List[EntityGroup]:
@@ -979,10 +1065,13 @@ def create_ui():
                                         ui.badge(f"💡 {len(master.suggested_candidates)} Namenskandidaten", color="amber-8").props("outline dense").tooltip("Mehrere passende Personen gefunden. Bitte im Dropdown rechts auswählen.")
 
                                     # Manual Link Dropdown
-                                    other_masters = [
-                                        g.original_text for g in state.entity_groups
-                                        if g.key != master.key and g.entity_type == master.entity_type and not g.parent_group_text
-                                    ]
+                                    other_masters = sorted(
+                                        [
+                                            g.original_text for g in state.entity_groups
+                                            if g.key != master.key and g.entity_type == master.entity_type and not g.parent_group_text
+                                        ],
+                                        key=lambda s: s.lower(),
+                                    )
                                     if other_masters:
                                         with ui.row().classes("items-center gap-1"):
                                             def make_link_to_master(grp):
@@ -1005,8 +1094,9 @@ def create_ui():
                                                 options=["Eigenständig"] + other_masters,
                                                 value="Eigenständig",
                                                 label="Verknüpfen mit:",
+                                                with_input=True,
                                                 on_change=make_link_to_master(master),
-                                            ).props("dense outlined bg-white").classes("w-36 text-xs")
+                                            ).props('dense outlined bg-white use-input clearable options-dense menu-props="{ maxHeight: \'280px\' }"').classes("min-w-[180px] max-w-[280px] text-xs")
 
                                 # 5. Score & Action
                                 with ui.row().classes("items-center gap-2"):
@@ -1148,14 +1238,16 @@ def create_ui():
             ui.label("Zu anonymisierende Entitäten:").classes("text-xs font-semibold text-slate-700 mb-1")
             for ent in AVAILABLE_ENTITIES:
                 def make_ent_toggle(e_name):
-                    async def toggle(val):
+                    def toggle(val):
+                        global _cached_anonymizer
                         if val.value and e_name not in state.active_entities:
                             state.active_entities.append(e_name)
                         elif not val.value and e_name in state.active_entities:
                             state.active_entities.remove(e_name)
+                        _cached_anonymizer = None
                         save_current_config()
-                        if state.raw_text and state.raw_text.strip():
-                            await run_analysis()
+                        if state.entity_groups and reanalysis_warning_card is not None:
+                            reanalysis_warning_card.set_visibility(True)
                     return toggle
 
                 ui.checkbox(
@@ -1168,8 +1260,12 @@ def create_ui():
 
             ui.label("Erkennungs-Schwellenwert:").classes("text-xs font-semibold text-slate-700")
             def on_thresh_change(e):
+                global _cached_anonymizer
                 state.gliner_threshold = e.value
+                _cached_anonymizer = None
                 save_current_config()
+                if state.entity_groups and reanalysis_warning_card is not None:
+                    reanalysis_warning_card.set_visibility(True)
             thresh_slider = ui.slider(min=0.20, max=0.95, step=0.05, value=state.gliner_threshold, on_change=on_thresh_change)
             ui.label().bind_text_from(thresh_slider, "value", lambda v: f"Schwellenwert: {v:.2f}").classes("text-xs text-slate-500 mb-2")
 
@@ -1192,6 +1288,18 @@ def create_ui():
                 tab_anonymize = ui.tab("🔒 Anonymisieren & Review")
                 tab_restore = ui.tab("🔄 Wiederherstellen (De-Anonymize)")
 
+            def on_tab_change(e):
+                """Auto-preload mapping into Tab 2 when user switches there after an analysis."""
+                restore_tab_name = tab_restore._props.get("name", "")
+                if e.value == restore_tab_name and state.current_mapping:
+                    if map_json_input is not None and not map_json_input.value.strip():
+                        state.restore_mapping = dict(state.current_mapping)
+                        map_json_input.value = json.dumps(state.current_mapping, indent=2, ensure_ascii=False)
+                        ui.notify(f"Mapping mit {len(state.current_mapping)} Einträgen aus aktueller Analyse vorgeladen.", type="info", icon="auto_awesome")
+
+            tabs.on_value_change(on_tab_change)
+
+
             with ui.tab_panels(tabs, value=tab_anonymize).classes("w-full p-4"):
                 # TAB 1: Anonymize
                 with ui.tab_panel(tab_anonymize):
@@ -1212,21 +1320,25 @@ def create_ui():
                         # Click opens Explorer
                         dropzone_card.on("click", open_native_file_dialog)
 
-                        # Drop handler directly via NiceGUI WebSocket connection
-                        def on_file_dropped(e):
+                        # Drop handler via HTTP streaming / path / base64
+                        async def on_file_dropped(e):
                             data = e.args
                             filename = data.get("name", "dokument")
                             filepath = data.get("path", "")
+                            file_id = data.get("file_id", "")
                             try:
                                 if filepath and Path(filepath).exists():
                                     raw_bytes = safe_read_bytes(filepath)
+                                elif file_id and file_id in _upload_cache:
+                                    cached = _upload_cache.pop(file_id)
+                                    raw_bytes = cached["content"]
+                                    filename = cached["filename"] or filename
                                 elif "base64" in data:
                                     raw_bytes = base64.b64decode(data["base64"])
                                 else:
                                     raise ValueError("Keine Dateidaten empfangen")
 
-                                text = read_document_from_bytes(raw_bytes, filename)
-                                load_content_into_workspace(text, filename)
+                                await extract_and_load_file_bytes(raw_bytes, filename)
                             except Exception as ex:
                                 err_msg = f"{type(ex).__name__}: {str(ex)}"
                                 logging.error(f"Drop error: {err_msg}", exc_info=True)
@@ -1234,7 +1346,7 @@ def create_ui():
 
                         ui.on("file_dropped", on_file_dropped)
 
-                        # Hook HTML5 drag events to the card
+                        # Hook HTML5 drag events with HTTP streaming upload
                         ui.add_body_html(f"""
                         <script>
                         (function() {{
@@ -1283,12 +1395,28 @@ def create_ui():
                                         return;
                                     }}
 
-                                    const reader = new FileReader();
-                                    reader.onload = function(evt) {{
-                                        const b64 = evt.target.result.split(',')[1];
-                                        emitEvent('file_dropped', {{ name: file.name, base64: b64 }});
-                                    }};
-                                    reader.readAsDataURL(file);
+                                    const formData = new FormData();
+                                    formData.append('file', file);
+                                    fetch('/api/upload', {{
+                                        method: 'POST',
+                                        body: formData
+                                    }})
+                                    .then(res => {{
+                                        if (!res.ok) throw new Error('HTTP ' + res.status);
+                                        return res.json();
+                                    }})
+                                    .then(data => {{
+                                        emitEvent('file_dropped', {{ file_id: data.file_id, name: data.filename }});
+                                    }})
+                                    .catch(err => {{
+                                        console.error('Upload failed:', err);
+                                        const reader = new FileReader();
+                                        reader.onload = function(evt) {{
+                                            const b64 = evt.target.result.split(',')[1];
+                                            emitEvent('file_dropped', {{ name: file.name, base64: b64 }});
+                                        }};
+                                        reader.readAsDataURL(file);
+                                    }});
                                 }}, false);
                             }}
                             if (document.readyState === 'loading') {{
@@ -1300,6 +1428,14 @@ def create_ui():
                         }})();
                         </script>
                         """)
+
+                    # Live extraction progress card (for large PDF/Docx files)
+                    with ui.card().classes("w-full p-3 bg-blue-50 border border-blue-200 rounded-xl mb-3 flex-col gap-1") as extraction_progress_card:
+                        extraction_progress_card.set_visibility(False)
+                        with ui.row().classes("items-center gap-2"):
+                            ui.spinner(size="sm", color="primary")
+                            extraction_progress_label = ui.label("Lese Datei ein...").classes("text-xs font-semibold text-slate-700")
+                        extraction_progress_bar = ui.linear_progress(value=0.0, show_value=False).props("color=primary stripe rounded instant-feedback").classes("w-full")
 
                     # Document info badge when loaded (with remove button)
                     with ui.row().classes("w-full mb-2 items-center gap-2") as file_badge_card:
@@ -1324,10 +1460,17 @@ def create_ui():
                             on_change=on_raw_text_change,
                         ).props("outlined rows=6").classes("w-full font-mono text-sm")
 
+                    # Re-analysis Warning Banner (appears when entities or settings changed after initial analysis)
+                    with ui.card().classes("w-full p-2.5 bg-amber-50 border border-amber-300 rounded-lg mb-2") as reanalysis_warning_card:
+                        reanalysis_warning_card.set_visibility(False)
+                        with ui.row().classes("w-full items-center gap-2 text-amber-900 text-xs"):
+                            ui.icon("warning", size="sm").classes("text-amber-600")
+                            ui.label("Die Entitäten-Auswahl / Einstellungen wurden geändert. Klicken Sie auf „Text / Dokument analysieren“, um die Tabelle zu aktualisieren.").classes("font-medium")
+
                     # Prominent Analysis & Workspace Reset Buttons in Action Row
                     with ui.row().classes("w-full items-center justify-between mt-1 mb-4 gap-3 flex-wrap"):
                         analyze_btn = ui.button(
-                            "🔍 Text & Dokument analysieren",
+                            "🔍 Text / Dokument analysieren",
                             icon="psychology",
                             color="primary",
                             on_click=run_analysis,
@@ -1450,7 +1593,13 @@ def create_ui():
                     with ui.row().classes("w-full gap-4"):
                         # Column 1: Anonymized LLM Response
                         with ui.column().classes("flex-1"):
-                            ui.label("1. LLM-Antwort (Text oder Dokument):").classes("font-semibold text-xs text-slate-700")
+                            ui.label("1. LLM-Antwort (Text oder Dokument):").classes("font-semibold text-xs text-slate-700 mb-1")
+
+                            def load_restore_text(text: str, filename: str):
+                                state.restore_anon_text = text
+                                if restore_anon_input is not None:
+                                    restore_anon_input.value = text
+                                ui.notify(f"'{filename}' geladen ({len(text)} Zeichen).", type="positive")
 
                             def open_restore_file_dialog():
                                 try:
@@ -1471,25 +1620,111 @@ def create_ui():
                                         p = Path(filepath)
                                         raw_b = safe_read_bytes(p)
                                         text = read_document_from_bytes(raw_b, p.name)
-                                        state.restore_anon_text = text
-                                        if restore_anon_input is not None:
-                                            restore_anon_input.value = text
-                                        ui.notify(f"LLM-Antwort '{p.name}' geladen ({len(text)} Zeichen).", type="positive")
+                                        load_restore_text(text, p.name)
                                 except Exception as ex:
                                     ui.notify(f"Fehler beim Laden: {str(ex)}", type="negative")
 
-                            ui.button("📂 LLM-Datei auswählen...", icon="folder_open", on_click=open_restore_file_dialog, color="primary").props("unelevated dense size=sm").classes("mb-2")
+                            async def on_restore_file_dropped(e):
+                                data = e.args
+                                filename = data.get("name", "dokument")
+                                filepath = data.get("path", "")
+                                file_id = data.get("file_id", "")
+                                try:
+                                    if filepath and Path(filepath).exists():
+                                        raw_bytes = safe_read_bytes(filepath)
+                                    elif file_id and file_id in _upload_cache:
+                                        cached = _upload_cache.pop(file_id)
+                                        raw_bytes = cached["content"]
+                                        filename = cached["filename"] or filename
+                                    elif "base64" in data:
+                                        raw_bytes = base64.b64decode(data["base64"])
+                                    else:
+                                        raise ValueError("Keine Dateidaten empfangen")
+                                    text = await asyncio.to_thread(read_document_from_bytes, raw_bytes, filename)
+                                    load_restore_text(text, filename)
+                                except Exception as ex:
+                                    ui.notify(f"Fehler beim Laden: {type(ex).__name__}: {str(ex)}", type="negative", timeout=15000)
+
+                            with ui.card().classes(
+                                "w-full py-4 px-3 bg-slate-50 hover:bg-slate-100 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-2 select-none"
+                            ) as restore_drop_card:
+                                restore_drop_id = restore_drop_card.id
+                                restore_drop_card.props(f'id="restore_dropzone_{restore_drop_id}"')
+                                with ui.row().classes("items-center gap-2 pointer-events-none"):
+                                    ui.icon("upload_file", size="sm").classes("text-blue-500")
+                                    ui.label("Ablegen oder klicken").classes("text-sm font-semibold text-slate-700")
+                                ui.label(".docx · .pdf · .txt · .md").classes("text-[11px] text-slate-400 pointer-events-none")
+                                restore_drop_card.on("click", open_restore_file_dialog)
+                                ui.on("restore_file_dropped", on_restore_file_dropped)
+
+                            ui.add_body_html(f"""
+                            <script>
+                            (function() {{
+                                function setupRestoreDropzone() {{
+                                    const el = document.getElementById('restore_dropzone_{restore_drop_id}');
+                                    if (!el || el._dropAttached) return;
+                                    el._dropAttached = true;
+                                    el.addEventListener('dragover', function(e) {{ e.preventDefault(); e.stopPropagation(); el.style.borderColor='#2563eb'; el.style.backgroundColor='#dbeafe'; }}, false);
+                                    el.addEventListener('dragleave', function(e) {{ e.preventDefault(); e.stopPropagation(); el.style.borderColor=''; el.style.backgroundColor=''; }}, false);
+                                    el.addEventListener('drop', function(e) {{
+                                        e.preventDefault(); e.stopPropagation();
+                                        el.style.borderColor=''; el.style.backgroundColor='';
+                                        const files = e.dataTransfer.files;
+                                        if (!files || !files.length) return;
+                                        const file = files[0];
+                                        if (file.path) {{ emitEvent('restore_file_dropped', {{ name: file.name, path: file.path }}); return; }}
+                                        const formData = new FormData();
+                                        formData.append('file', file);
+                                        fetch('/api/upload', {{
+                                            method: 'POST',
+                                            body: formData
+                                        }})
+                                        .then(res => {{
+                                            if (!res.ok) throw new Error('HTTP ' + res.status);
+                                            return res.json();
+                                        }})
+                                        .then(data => {{
+                                            emitEvent('restore_file_dropped', {{ file_id: data.file_id, name: data.filename }});
+                                        }})
+                                        .catch(err => {{
+                                            console.error('Upload failed:', err);
+                                            const reader = new FileReader();
+                                            reader.onload = function(evt) {{ emitEvent('restore_file_dropped', {{ name: file.name, base64: evt.target.result.split(',')[1] }}); }};
+                                            reader.readAsDataURL(file);
+                                        }});
+                                    }}, false);
+                                }}
+                                if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', setupRestoreDropzone);
+                                else setupRestoreDropzone();
+                                setInterval(setupRestoreDropzone, 500);
+                            }})();
+                            </script>
+                            """)
 
                             def on_anon_change(e):
                                 state.restore_anon_text = e.value
                             restore_anon_input = ui.textarea(
                                 placeholder="[PERSON_1_STUDENT_VOLLNAME] arbeitet an [ORGANIZATION_1_HOCHSCHULE]...",
                                 on_change=on_anon_change,
-                            ).props("outlined rows=7").classes("w-full font-mono text-xs")
+                            ).props("outlined rows=6").classes("w-full font-mono text-xs")
 
-                        # Column 2: Mapping File
+                        # Column 2: Mapping File (auto-preloaded from current analysis)
                         with ui.column().classes("flex-1"):
-                            ui.label("2. Mapping-Tabelle (.json):").classes("font-semibold text-xs text-slate-700")
+                            ui.label("2. Mapping-Tabelle (.json):").classes("font-semibold text-xs text-slate-700 mb-1")
+
+                            # Pre-populate from current analysis mapping if available
+                            initial_map_val = ""
+                            if state.current_mapping:
+                                state.restore_mapping = dict(state.current_mapping)
+                                initial_map_val = json.dumps(state.current_mapping, indent=2, ensure_ascii=False)
+                            elif state.restore_mapping:
+                                initial_map_val = json.dumps(state.restore_mapping, indent=2, ensure_ascii=False)
+
+                            def load_mapping_data(mapping_data: dict):
+                                state.restore_mapping = mapping_data
+                                if map_json_input is not None:
+                                    map_json_input.value = json.dumps(mapping_data, indent=2, ensure_ascii=False)
+                                ui.notify(f"Mapping-Tabelle geladen ({len(mapping_data)} Einträge).", type="positive")
 
                             def open_mapping_file_dialog():
                                 try:
@@ -1499,7 +1734,7 @@ def create_ui():
                                     root.withdraw()
                                     root.attributes("-topmost", True)
                                     filepath = filedialog.askopenfilename(
-                                        title="Mapping-Datei auswählen",
+                                        title="Mapping-Datei (.json) auswählen",
                                         filetypes=[
                                             ("JSON-Dateien (*.json)", "*.json"),
                                             ("Alle Dateien (*.*)", "*.*"),
@@ -1509,15 +1744,88 @@ def create_ui():
                                     if filepath:
                                         p = Path(filepath)
                                         raw_b = safe_read_bytes(p)
-                                        mapping_data = json.loads(raw_b.decode("utf-8"))
-                                        state.restore_mapping = mapping_data
-                                        if map_json_input is not None:
-                                            map_json_input.value = json.dumps(mapping_data, indent=2, ensure_ascii=False)
-                                        ui.notify("Mapping-Tabelle geladen.", type="positive")
+                                        load_mapping_data(json.loads(raw_b.decode("utf-8")))
                                 except Exception as ex:
                                     ui.notify(f"Ungültige JSON-Mapping-Datei: {str(ex)}", type="negative")
 
-                            ui.button("📂 Mapping (.json) auswählen...", icon="folder_open", on_click=open_mapping_file_dialog, color="primary").props("unelevated dense size=sm").classes("mb-2")
+                            async def on_mapping_file_dropped(e):
+                                data = e.args
+                                filename = data.get("name", "mapping.json")
+                                filepath = data.get("path", "")
+                                file_id = data.get("file_id", "")
+                                try:
+                                    if filepath and Path(filepath).exists():
+                                        raw_bytes = safe_read_bytes(filepath)
+                                    elif file_id and file_id in _upload_cache:
+                                        cached = _upload_cache.pop(file_id)
+                                        raw_bytes = cached["content"]
+                                        filename = cached["filename"] or filename
+                                    elif "base64" in data:
+                                        raw_bytes = base64.b64decode(data["base64"])
+                                    else:
+                                        raise ValueError("Keine Dateidaten empfangen")
+                                    load_mapping_data(json.loads(raw_bytes.decode("utf-8")))
+                                except Exception as ex:
+                                    ui.notify(f"Fehler beim Laden: {str(ex)}", type="negative", timeout=15000)
+
+                            with ui.card().classes(
+                                "w-full py-4 px-3 bg-slate-50 hover:bg-slate-100 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-2 select-none"
+                            ) as mapping_drop_card:
+                                mapping_drop_id = mapping_drop_card.id
+                                mapping_drop_card.props(f'id="mapping_dropzone_{mapping_drop_id}"')
+                                with ui.row().classes("items-center gap-2 pointer-events-none"):
+                                    ui.icon("data_object", size="sm").classes("text-blue-500")
+                                    ui.label("Ablegen oder klicken").classes("text-sm font-semibold text-slate-700")
+                                if initial_map_val:
+                                    ui.label(f"✅ {len(state.restore_mapping)} Einträge aus aktueller Analyse vorgeladen").classes("text-[11px] text-teal-600 font-semibold pointer-events-none")
+                                else:
+                                    ui.label("mapping.json ablegen oder klicken").classes("text-[11px] text-slate-400 pointer-events-none")
+                                mapping_drop_card.on("click", open_mapping_file_dialog)
+                                ui.on("mapping_file_dropped", on_mapping_file_dropped)
+
+                            ui.add_body_html(f"""
+                            <script>
+                            (function() {{
+                                function setupMappingDropzone() {{
+                                    const el = document.getElementById('mapping_dropzone_{mapping_drop_id}');
+                                    if (!el || el._dropAttached) return;
+                                    el._dropAttached = true;
+                                    el.addEventListener('dragover', function(e) {{ e.preventDefault(); e.stopPropagation(); el.style.borderColor='#2563eb'; el.style.backgroundColor='#dbeafe'; }}, false);
+                                    el.addEventListener('dragleave', function(e) {{ e.preventDefault(); e.stopPropagation(); el.style.borderColor=''; el.style.backgroundColor=''; }}, false);
+                                    el.addEventListener('drop', function(e) {{
+                                        e.preventDefault(); e.stopPropagation();
+                                        el.style.borderColor=''; el.style.backgroundColor='';
+                                        const files = e.dataTransfer.files;
+                                        if (!files || !files.length) return;
+                                        const file = files[0];
+                                        if (file.path) {{ emitEvent('mapping_file_dropped', {{ name: file.name, path: file.path }}); return; }}
+                                        const formData = new FormData();
+                                        formData.append('file', file);
+                                        fetch('/api/upload', {{
+                                            method: 'POST',
+                                            body: formData
+                                        }})
+                                        .then(res => {{
+                                            if (!res.ok) throw new Error('HTTP ' + res.status);
+                                            return res.json();
+                                        }})
+                                        .then(data => {{
+                                            emitEvent('mapping_file_dropped', {{ file_id: data.file_id, name: data.filename }});
+                                        }})
+                                        .catch(err => {{
+                                            console.error('Upload failed:', err);
+                                            const reader = new FileReader();
+                                            reader.onload = function(evt) {{ emitEvent('mapping_file_dropped', {{ name: file.name, base64: evt.target.result.split(',')[1] }}); }};
+                                            reader.readAsDataURL(file);
+                                        }});
+                                    }}, false);
+                                }}
+                                if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', setupMappingDropzone);
+                                else setupMappingDropzone();
+                                setInterval(setupMappingDropzone, 500);
+                            }})();
+                            </script>
+                            """)
 
                             def on_map_text_change(e):
                                 try:
@@ -1525,16 +1833,12 @@ def create_ui():
                                         state.restore_mapping = json.loads(e.value)
                                 except Exception:
                                     pass
-                            
-                            initial_map_val = json.dumps(state.restore_mapping or state.current_mapping, indent=2, ensure_ascii=False) if (state.restore_mapping or state.current_mapping) else ""
-                            if not state.restore_mapping and state.current_mapping:
-                                state.restore_mapping = dict(state.current_mapping)
 
                             map_json_input = ui.textarea(
                                 value=initial_map_val,
                                 placeholder='{\n  "[PERSON_1_STUDENT_VOLLNAME]": "Julia Meier"\n}',
                                 on_change=on_map_text_change,
-                            ).props("outlined rows=7").classes("w-full font-mono text-xs")
+                            ).props("outlined rows=6").classes("w-full font-mono text-xs")
 
                     def run_restore():
                         if not state.restore_anon_text:

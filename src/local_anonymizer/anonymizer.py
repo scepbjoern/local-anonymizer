@@ -308,13 +308,22 @@ class LocalAnonymizer:
         if term not in self.ignore_terms:
             self.ignore_terms.append(term)
 
-    def analyze(self, text: str) -> List[RecognizerResult]:
-        """Analyze text using all configured recognizers with ignore filter and entity filters."""
+    def analyze(
+        self,
+        text: str,
+        on_progress: Optional[Callable[[float, str], None]] = None,
+    ) -> List[RecognizerResult]:
+        """Analyze text using all configured recognizers with ignore filter, entity filters and progress reporting."""
         if not text:
             return []
 
+        if on_progress:
+            on_progress(0.10, "Ignore-Filterung und Vorverarbeitung...")
+
         # If enabled_entities is explicitly empty [], return no entities
         if self.enabled_entities is not None and len(self.enabled_entities) == 0:
+            if on_progress:
+                on_progress(1.00, "Keine Entitäten aktiviert.")
             return []
 
         # Find spans of ignore terms to exclude false positives (e.g. "CAS", "Studierende", "Unternehmen")
@@ -326,6 +335,9 @@ class LocalAnonymizer:
             for match in pattern.finditer(text):
                 ignored_spans.append((match.start(), match.end()))
 
+        if on_progress:
+            on_progress(0.25, "KI-Modell & Presidio Erkennung läuft...")
+
         # Run Presidio analysis without hardcoded score_threshold overriding recognizer thresholds
         results = self.analyzer.analyze(
             text=text,
@@ -333,6 +345,9 @@ class LocalAnonymizer:
             entities=self.enabled_entities,
             score_threshold=None,
         )
+
+        if on_progress:
+            on_progress(0.65, "Filterung & Deduplizierung der Fundstellen...")
 
         # 1. Filter out ignored spans
         filtered_results: List[RecognizerResult] = []
@@ -358,6 +373,9 @@ class LocalAnonymizer:
             if not overlaps:
                 accepted.append(r)
                 accepted_spans.append((r.start, r.end))
+
+        if on_progress:
+            on_progress(0.80, "Genitiv-Erweiterung und Namensanalyse...")
 
         # 3. German/English genitive extension for recognized PERSON entities (e.g. "Julia" -> "Julias", "Julia's")
         person_results = [r for r in accepted if r.entity_type == "PERSON"]
@@ -399,6 +417,10 @@ class LocalAnonymizer:
 
         # Sort by start position in text
         accepted.sort(key=lambda r: r.start)
+
+        if on_progress:
+            on_progress(0.90, "Ergebnisse werden strukturiert...")
+
         return accepted
 
     def anonymize(

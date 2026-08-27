@@ -1,11 +1,13 @@
 """Document extraction utilities for various file formats."""
 
+from __future__ import annotations
+
 import csv
 import io
 import json
 import re
 from pathlib import Path
-from typing import Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 class UnsupportedFileFormatError(ValueError):
     """Raised when an unsupported file format is provided to the extractor."""
     pass
@@ -143,12 +145,97 @@ def extract_text_from_csv_bytes(data: bytes) -> str:
     return "\n".join(md_lines)
 
 
+def _detect_docx_list_type(para, doc) -> Optional[str]:
+    """
+    Detect whether a paragraph is a bullet list, numbered list, or normal text.
+    Returns 'bullet', 'number', or None.
+    """
+    style_name = para.style.name.lower() if para.style and para.style.name else ""
+    if any(k in style_name for k in ["bullet", "listenpunkt", "aufzählung", "aufzaehlung", "list bullet"]):
+        return "bullet"
+    if any(k in style_name for k in ["list number", "nummerierung", "list 2", "list 3"]):
+        return "number"
+
+    # Inspect XML w:numPr
+    num_pr = para._element.xpath("./w:pPr/w:numPr")
+    if not num_pr:
+        return None
+
+    try:
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        num_id_nodes = para._element.xpath("./w:pPr/w:numPr/w:numId/@w:val")
+        ilvl_nodes = para._element.xpath("./w:pPr/w:numPr/w:ilvl/@w:val")
+        num_id = num_id_nodes[0] if num_id_nodes else None
+        ilvl = ilvl_nodes[0] if ilvl_nodes else "0"
+
+        if num_id and hasattr(doc, "part") and hasattr(doc.part, "numbering_part") and doc.part.numbering_part is not None:
+            np = doc.part.numbering_part._element
+            num_nodes = np.xpath(f'./w:num[@w:numId="{num_id}"]/w:abstractNumId/@w:val', namespaces=ns)
+            if num_nodes:
+                ab_id = num_nodes[0]
+                fmt_nodes = np.xpath(f'./w:abstractNum[@w:abstractNumId="{ab_id}"]/w:lvl[@w:ilvl="{ilvl}"]/w:numFmt/@w:val', namespaces=ns)
+                if fmt_nodes:
+                    fmt = fmt_nodes[0].lower()
+                    if fmt == "bullet":
+                        return "bullet"
+                    elif fmt in ["decimal", "lowerletter", "upperletter", "lowerroman", "upperroman", "ordinal"]:
+                        return "number"
+    except Exception:
+        pass
+
+    # Default for list paragraphs where style indicates number
+    if "number" in style_name or "nummer" in style_name:
+        return "number"
+    return "bullet"
+
+
+_INLINE_MD_PATTERN = re.compile(
+    r"(\*\*\*[^*]+\*\*\*|___[^_]+___|"
+    r"\*\*[^*]+\*\*|__[^_]+__|"
+    r"\*[^*]+\*|(?<!\w)_[^_]+_(?!\w)|"
+    r"`[^`]+`)"
+)
+
+
+def _add_formatted_markdown_runs(para, text: str) -> None:
+    """
+    Parse inline markdown tokens (bold, italic, bold-italic, code) and add corresponding docx runs
+    without literal Markdown syntax markers (**...**, *...*, `...`).
+    """
+    parts = _INLINE_MD_PATTERN.split(text)
+    for part in parts:
+        if not part:
+            continue
+        if (part.startswith("***") and part.endswith("***") and len(part) >= 6) or \
+           (part.startswith("___") and part.endswith("___") and len(part) >= 6):
+            content = part[3:-3]
+            r = para.add_run(content)
+            r.bold = True
+            r.italic = True
+        elif (part.startswith("**") and part.endswith("**") and len(part) >= 4) or \
+             (part.startswith("__") and part.endswith("__") and len(part) >= 4):
+            content = part[2:-2]
+            r = para.add_run(content)
+            r.bold = True
+        elif (part.startswith("*") and part.endswith("*") and len(part) >= 2) or \
+             (part.startswith("_") and part.endswith("_") and len(part) >= 2):
+            content = part[1:-1]
+            r = para.add_run(content)
+            r.italic = True
+        elif part.startswith("`") and part.endswith("`") and len(part) >= 2:
+            content = part[1:-1]
+            r = para.add_run(content)
+            r.font.name = "Consolas"
+        else:
+            para.add_run(part)
+
+
 def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
     """
     Extract text from Microsoft Word .docx bytes with:
     - Level 1: XML Outline Level (w:outlineLvl 0..3) for custom corporate heading templates
     - Level 2: Multilingual style names (Heading 1..4, Überschrift 1..4, Title, Subtitle)
-    - Level 3: Bullet & numbered lists via w:numPr and list styles
+    - Level 3: Bullet & numbered lists via XML numbering resolution (w:numFmt) and list styles
     - Level 4: Strict false-positive protection for bold text (only < 60 chars, no ending period, >= 16pt)
     - Level 5: Markdown tables
     """
@@ -170,15 +257,8 @@ def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
         except Exception:
             pass
 
-        # Stufe 2: Listen über XML (w:numPr) oder Style-Namen
-        has_num_pr = False
-        try:
-            has_num_pr = bool(para._element.xpath("./w:pPr/w:numPr"))
-        except Exception:
-            pass
-
-        is_bullet = "bullet" in style_name or "listenpunkt" in style_name or "aufzählung" in style_name
-        is_number = "number" in style_name or "nummerierung" in style_name or "list 2" in style_name or "list 3" in style_name
+        # Stufe 2: Präzise Listen-Erkennung (Bullet vs. Nummerierung)
+        list_type = _detect_docx_list_type(para, doc)
 
         if outline_val is not None and 0 <= outline_val <= 5:
             prefix = "#" * (outline_val + 1)
@@ -191,9 +271,9 @@ def extract_text_from_docx_bytes(raw_bytes: bytes) -> str:
             text = f"### {text}"
         elif "heading 4" in style_name or "überschrift 4" in style_name:
             text = f"#### {text}"
-        elif is_bullet:
+        elif list_type == "bullet":
             text = f"- {text}"
-        elif is_number or has_num_pr:
+        elif list_type == "number":
             text = f"1. {text}"
         elif "quote" in style_name or "zitat" in style_name:
             text = f"> {text}"
@@ -242,7 +322,8 @@ def extract_text_from_docx(path: Path) -> str:
 def create_docx_from_markdown(md_text: str):
     """
     Convert Markdown text into a native Word .docx document using real Word paragraph styles
-    (Heading 1, Heading 2, Heading 3, Heading 4, List Bullet, List Number, Normal).
+    (Heading 1, Heading 2, Heading 3, Heading 4, List Bullet, List Number, Normal)
+    and parse inline formatting (**bold**, *italic*, `code`) into true Word run styles.
     Does NOT output literal '#' or Markdown markers into the document.
     """
     import docx
@@ -259,22 +340,29 @@ def create_docx_from_markdown(md_text: str):
 
         # Headings
         if trimmed.startswith("#### "):
-            doc.add_heading(trimmed[5:].strip(), level=4)
+            p = doc.add_heading(level=4)
+            _add_formatted_markdown_runs(p, trimmed[5:].strip())
         elif trimmed.startswith("### "):
-            doc.add_heading(trimmed[4:].strip(), level=3)
+            p = doc.add_heading(level=3)
+            _add_formatted_markdown_runs(p, trimmed[4:].strip())
         elif trimmed.startswith("## "):
-            doc.add_heading(trimmed[3:].strip(), level=2)
+            p = doc.add_heading(level=2)
+            _add_formatted_markdown_runs(p, trimmed[3:].strip())
         elif trimmed.startswith("# "):
-            doc.add_heading(trimmed[2:].strip(), level=1)
+            p = doc.add_heading(level=1)
+            _add_formatted_markdown_runs(p, trimmed[2:].strip())
         # Lists
         elif trimmed.startswith("- ") or trimmed.startswith("* "):
-            doc.add_paragraph(trimmed[2:].strip(), style="List Bullet")
+            p = doc.add_paragraph(style="List Bullet")
+            _add_formatted_markdown_runs(p, trimmed[2:].strip())
         elif re.match(r"^\d+\.\s+", trimmed):
             text_part = re.sub(r"^\d+\.\s+", "", trimmed)
-            doc.add_paragraph(text_part.strip(), style="List Number")
+            p = doc.add_paragraph(style="List Number")
+            _add_formatted_markdown_runs(p, text_part.strip())
         # Blockquotes
         elif trimmed.startswith("> "):
-            doc.add_paragraph(trimmed[2:].strip(), style="Quote" if "Quote" in doc.styles else "Normal")
+            p = doc.add_paragraph(style="Quote" if "Quote" in doc.styles else "Normal")
+            _add_formatted_markdown_runs(p, trimmed[2:].strip())
         # Tables (Markdown | col1 | col2 |)
         elif trimmed.startswith("|") and trimmed.endswith("|"):
             table_lines = []
@@ -299,9 +387,13 @@ def create_docx_from_markdown(md_text: str):
                     pass
                 for r_idx, r_data in enumerate(rows_data):
                     for c_idx, cell_val in enumerate(r_data):
-                        table.cell(r_idx, c_idx).text = cell_val
+                        cell = table.cell(r_idx, c_idx)
+                        cell.text = ""
+                        p = cell.paragraphs[0]
+                        _add_formatted_markdown_runs(p, cell_val)
         else:
-            doc.add_paragraph(trimmed)
+            p = doc.add_paragraph()
+            _add_formatted_markdown_runs(p, trimmed)
 
         i += 1
 
@@ -316,10 +408,15 @@ def save_markdown_to_docx_bytes(md_text: str) -> bytes:
     return buf.getvalue()
 
 
-def extract_text_from_pdf_bytes(raw_bytes: bytes, filename: str = "document.pdf") -> str:
+def extract_text_from_pdf_bytes(
+    raw_bytes: bytes,
+    filename: str = "document.pdf",
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> str:
     """
     Extract structured Markdown text from PDF bytes using pymupdf4llm.
     Preserves headings, lists, tables, and bold/italic styles.
+    Supports optional progress_callback(current_page, total_pages, status_text) for large PDFs.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
     import pymupdf
@@ -337,7 +434,24 @@ def extract_text_from_pdf_bytes(raw_bytes: bytes, filename: str = "document.pdf"
         )
 
     try:
-        md_text = pymupdf4llm.to_markdown(doc)
+        if progress_callback and doc_pages > 1:
+            page_mds = []
+            for page_idx in range(doc_pages):
+                progress_callback(
+                    page_idx + 1,
+                    doc_pages,
+                    f"PDF-Seite {page_idx + 1} von {doc_pages} wird extrahiert..."
+                )
+                try:
+                    p_md = pymupdf4llm.to_markdown(doc, pages=[page_idx])
+                    page_mds.append(p_md.strip())
+                except Exception:
+                    page_mds.append(doc[page_idx].get_text().strip())
+            md_text = "\n\n".join(p for p in page_mds if p)
+        else:
+            if progress_callback:
+                progress_callback(1, max(1, doc_pages), "PDF-Inhalt wird extrahiert...")
+            md_text = pymupdf4llm.to_markdown(doc)
     except Exception:
         pages_text = [page.get_text().strip() for page in doc if page.get_text().strip()]
         md_text = "\n\n--- Page Break ---\n\n".join(pages_text)
@@ -347,11 +461,16 @@ def extract_text_from_pdf_bytes(raw_bytes: bytes, filename: str = "document.pdf"
     return md_text.strip()
 
 
-def extract_text_from_pdf(path: Path) -> str:
+def extract_text_from_pdf(path: Path, progress_callback: Optional[Callable[[int, int, str], None]] = None) -> str:
     """
     Extract structured Markdown text from PDF files using pymupdf4llm.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
+    path = Path(path)
+    if path.exists():
+        raw_data = safe_read_bytes(path)
+        return extract_text_from_pdf_bytes(raw_data, filename=path.name, progress_callback=progress_callback)
+
     import pymupdf
     import pymupdf4llm
     doc = pymupdf.open(str(path))
@@ -376,31 +495,45 @@ def extract_text_from_pdf(path: Path) -> str:
     return md_text.strip()
 
 
-def read_document_from_bytes(data: bytes, filename: str) -> str:
-    """Unified document reader from in-memory bytes."""
+def read_document_from_bytes(
+    data: bytes,
+    filename: str,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> str:
+    """Unified document reader from in-memory bytes with optional progress callback."""
     ext = Path(filename).suffix.lower()
     if ext in [".txt", ".md"]:
+        if progress_callback:
+            progress_callback(1, 1, "Textdatei wird eingelesen...")
         return extract_text_from_txt_bytes(data)
     elif ext == ".json":
+        if progress_callback:
+            progress_callback(1, 1, "JSON-Struktur wird eingelesen...")
         return extract_text_from_json_bytes(data)
     elif ext == ".csv":
+        if progress_callback:
+            progress_callback(1, 1, "CSV-Tabelle wird eingelesen...")
         return extract_text_from_csv_bytes(data)
     elif ext == ".docx":
+        if progress_callback:
+            progress_callback(1, 1, "Word-Dokumentstruktur wird analysiert...")
         return extract_text_from_docx_bytes(data)
     elif ext == ".pdf":
-        return extract_text_from_pdf_bytes(data, filename=filename)
+        return extract_text_from_pdf_bytes(data, filename=filename, progress_callback=progress_callback)
     else:
         raise UnsupportedFileFormatError(
             f"Unsupported file format: '{ext}'. Supported formats: .txt, .md, .json, .csv, .docx, .pdf"
         )
 
 
-def read_document(file_path: Union[str, Path]) -> str:
+def read_document(
+    file_path: Union[str, Path],
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> str:
     """Unified document reader supporting .txt, .md, .json, .csv, .docx, and .pdf."""
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    ext = path.suffix.lower()
     raw_data = safe_read_bytes(path)
-    return read_document_from_bytes(raw_data, path.name)
+    return read_document_from_bytes(raw_data, path.name, progress_callback=progress_callback)

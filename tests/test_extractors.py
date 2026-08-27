@@ -129,6 +129,31 @@ def test_create_docx_from_markdown_with_native_styles():
     assert len(raw_bytes) > 0
 
 
+def test_create_docx_from_markdown_inline_formatting():
+    from local_anonymizer.extractors import create_docx_from_markdown
+
+    md = "Hier ist **fetter Text**, *kursiver Text*, ***fett-kursiv*** und `Consolas-Code`."
+    doc = create_docx_from_markdown(md)
+    p = doc.paragraphs[0]
+
+    assert "**" not in p.text
+    assert "*" not in p.text
+    assert "`" not in p.text
+    assert p.text == "Hier ist fetter Text, kursiver Text, fett-kursiv und Consolas-Code."
+
+    bold_runs = [r for r in p.runs if r.bold and not r.italic]
+    assert any("fetter Text" in r.text for r in bold_runs)
+
+    italic_runs = [r for r in p.runs if r.italic and not r.bold]
+    assert any("kursiver Text" in r.text for r in italic_runs)
+
+    bi_runs = [r for r in p.runs if r.bold and r.italic]
+    assert any("fett-kursiv" in r.text for r in bi_runs)
+
+    code_runs = [r for r in p.runs if r.font.name == "Consolas"]
+    assert any("Consolas-Code" in r.text for r in code_runs)
+
+
 def test_docx_custom_outline_levels_and_lists(tmp_path):
     import docx
     from docx.oxml import OxmlElement
@@ -218,5 +243,30 @@ def test_anonymize_within_csv_markdown_tables_preserves_structure(tmp_path):
     # Roundtrip reversibility check
     restored = LocalAnonymizer.de_anonymize(result.anonymized_text, result.mapping)
     assert restored == extracted_md
+
+
+def test_read_document_from_bytes_with_progress():
+    import pymupdf
+    from local_anonymizer.extractors import read_document_from_bytes
+
+    doc = pymupdf.open()
+    p1 = doc.new_page()
+    p1.insert_text((50, 50), "Page 1 Content")
+    p2 = doc.new_page()
+    p2.insert_text((50, 50), "Page 2 Content")
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    progress_calls = []
+    def on_progress(curr, total, msg):
+        progress_calls.append((curr, total, msg))
+
+    text = read_document_from_bytes(pdf_bytes, "test.pdf", progress_callback=on_progress)
+    assert "Page 1 Content" in text
+    assert "Page 2 Content" in text
+    assert len(progress_calls) >= 2
+    assert progress_calls[-1][0] == 2
+    assert progress_calls[-1][1] == 2
+
 
 
