@@ -28,7 +28,14 @@ from fastapi.responses import JSONResponse
 from nicegui import app, ui
 
 from local_anonymizer.anonymizer import clean_tag
-from local_anonymizer.config import AppConfig, CONFIG_DIR, LOG_FILE
+from local_anonymizer.config import (
+    AppConfig,
+    CONFIG_DIR,
+    ENTITY_MODE_ALL,
+    ENTITY_MODE_EXPLICIT_ONLY,
+    ENTITY_MODE_OFF,
+    LOG_FILE,
+)
 from local_anonymizer.extractors import (
     UnsupportedFileFormatError,
     create_docx_from_markdown,
@@ -95,6 +102,7 @@ class EntityOccurrence:
     score: float
     context_html: str
     needs_review: bool
+    source: str = "automatic"
 
 
 class EntityGroup:
@@ -139,7 +147,11 @@ class AppState:
         self.filename: str = ""
         self.raw_text: str = ""
         self.entity_groups: List[EntityGroup] = []
-        self.active_entities: List[str] = list(self.config.active_entities)
+        self.entity_modes: Dict[str, str] = resolve_entity_modes(self.config)
+        # Legacy compatibility for config files and code paths that still expose active_entities.
+        self.active_entities: List[str] = [
+            entity for entity, mode in self.entity_modes.items() if mode == ENTITY_MODE_ALL
+        ]
         self.format_mode: str = self.config.format_mode  # "numbered", "numbered_role", "role_only"
         self.export_format: str = self.config.export_format  # "txt", "md"
         self.gliner_threshold: float = self.config.gliner_threshold
@@ -211,27 +223,32 @@ def build_anonymizer(app_state: Optional[AppState] = None):
     if app_state is not None:
         glossary = parse_glossary(app_state.glossary_text)
         ignore_terms = parse_ignore_terms(app_state.ignore_terms_text)
+        general_entities, glossary_entities = get_recognizer_entities(app_state.entity_modes)
         return LocalAnonymizer(
             language="de",
             glossary=glossary,
             ignore_terms=ignore_terms,
-            enabled_entities=list(app_state.active_entities),
+            enabled_entities=general_entities,
+            enabled_glossary_entities=glossary_entities,
             gliner_threshold=app_state.gliner_threshold,
         )
     else:
         cfg = AppConfig.load()
+        entity_modes = resolve_entity_modes(cfg)
+        general_entities, glossary_entities = get_recognizer_entities(entity_modes)
         return LocalAnonymizer(
             language="de",
             glossary=parse_glossary(cfg.glossary),
             ignore_terms=parse_ignore_terms(cfg.ignore_terms),
-            enabled_entities=list(cfg.active_entities),
+            enabled_entities=general_entities,
+            enabled_glossary_entities=glossary_entities,
             gliner_threshold=cfg.gliner_threshold,
         )
 
 
 def sync_cached_anonymizer_settings(anon, app_state: "AppState") -> None:
     """
-    Push the current UI-configured settings (active entities, threshold, ignore terms, glossary)
+    Push the current UI-configured settings (entity modes, threshold, ignore terms, glossary)
     onto an already-built LocalAnonymizer instance, so a cached instance stays in sync with
     sidebar edits instead of only reflecting the settings it was first constructed with.
 
@@ -239,7 +256,9 @@ def sync_cached_anonymizer_settings(anon, app_state: "AppState") -> None:
     glossary update silently wrote to a dead `.terms` attribute instead of the real `.glossary`
     for a while without anyone noticing.
     """
-    anon.enabled_entities = list(app_state.active_entities)
+    general_entities, glossary_entities = get_recognizer_entities(app_state.entity_modes)
+    anon.enabled_entities = general_entities
+    anon.enabled_glossary_entities = glossary_entities
     anon.gliner_recognizer.threshold = app_state.gliner_threshold
     anon.set_ignore_terms(parse_ignore_terms(app_state.ignore_terms_text))
     new_glossary = parse_glossary(app_state.glossary_text)
@@ -281,7 +300,12 @@ def render_entity_source_overview(overview: List[Dict[str, Any]]) -> None:
                     color="positive" if active else "grey",
                 ).classes("text-sm")
                 ui.label(row["category"]).classes("text-sm font-mono font-bold text-slate-800")
-                if not active:
+                mode = row.get("mode")
+                if mode == ENTITY_MODE_EXPLICIT_ONLY:
+                    ui.badge("nur explizite Einträge", color="teal").props("dense")
+                elif mode == "automatic_only":
+                    ui.badge("nur automatische Erkennung", color="purple").props("dense")
+                elif not active:
                     ui.badge("inaktiv", color="grey-5").props("dense")
 
             with ui.column().classes("w-full gap-1 mt-1 pl-6"):
@@ -323,10 +347,6 @@ def _warmup_background_thread():
             _model_ready = True
 
 
-# Start background warmup immediately in separate thread
-threading.Thread(target=_warmup_background_thread, daemon=True).start()
-
-
 # Supported entity labels
 AVAILABLE_ENTITIES = sorted([
     "PERSON",
@@ -363,11 +383,65 @@ SURFACE_TAG_OPTIONS: Dict[str, str] = {
     "KURZFORM": "Kurzform / Kürzel (z. B. JM)",
 }
 
+ENTITY_MODE_OPTIONS: Dict[str, str] = {
+    ENTITY_MODE_OFF: "Aus – nichts anonymisieren",
+    ENTITY_MODE_EXPLICIT_ONLY: "Nur Glossar & manuell",
+    ENTITY_MODE_ALL: "Alle Quellen",
+}
+
+
+def resolve_entity_modes(config: AppConfig) -> Dict[str, str]:
+    """Load source-aware category modes, migrating older active_entities settings safely."""
+    saved_modes = getattr(config, "entity_modes", {}) or {}
+    legacy_active = set(getattr(config, "active_entities", []) or [])
+    return {
+        entity: saved_modes.get(
+            entity,
+            ENTITY_MODE_ALL if entity in legacy_active else ENTITY_MODE_OFF,
+        )
+        for entity in AVAILABLE_ENTITIES
+    }
+
+
+def get_recognizer_entities(entity_modes: Dict[str, str]) -> Tuple[List[str], List[str]]:
+    """Translate UI modes into general-recognizer and glossary category filters."""
+    general_entities = [
+        entity for entity in AVAILABLE_ENTITIES
+        if entity_modes.get(entity, ENTITY_MODE_OFF) == ENTITY_MODE_ALL
+    ]
+    glossary_entities = [
+        entity for entity in AVAILABLE_ENTITIES
+        if entity_modes.get(entity, ENTITY_MODE_OFF) in (ENTITY_MODE_EXPLICIT_ONLY, ENTITY_MODE_ALL)
+    ]
+    return general_entities, glossary_entities
+
+
+def is_category_enabled(st: AppState, entity_type: str) -> bool:
+    """Return whether a category may contribute to the anonymized output at all."""
+    return st.entity_modes.get(entity_type, ENTITY_MODE_OFF) != ENTITY_MODE_OFF
+
+
+def get_active_occurrences(st: AppState, group: EntityGroup) -> List[EntityOccurrence]:
+    """Filter a group's occurrences according to its category mode and detection source."""
+    mode = st.entity_modes.get(group.entity_type, ENTITY_MODE_OFF)
+    if mode == ENTITY_MODE_OFF:
+        return []
+    if mode == ENTITY_MODE_EXPLICIT_ONLY:
+        return [occ for occ in group.occurrences if occ.source in ("glossary", "manual")]
+    return list(group.occurrences)
+
+
+# Start background warmup only after all configuration helpers are defined.
+threading.Thread(target=_warmup_background_thread, daemon=True).start()
+
 
 def save_current_config(st: AppState):
     """Save user modifications back to persistent config."""
     st.config.format_mode = st.format_mode
-    st.config.active_entities = st.active_entities
+    st.config.entity_modes = dict(st.entity_modes)
+    st.config.active_entities = [
+        entity for entity, mode in st.entity_modes.items() if mode == ENTITY_MODE_ALL
+    ]
     st.config.gliner_threshold = st.gliner_threshold
     st.config.ignore_terms = st.ignore_terms_text
     st.config.glossary = st.glossary_text
@@ -397,8 +471,10 @@ def compute_reactive_preview(st: AppState) -> Tuple[str, Dict[str, str], Dict]:
     if not st.raw_text:
         return "", {}, {}
 
-    active_groups = [g for g in st.entity_groups if g.enabled]
+    active_groups = [g for g in st.entity_groups if g.enabled and get_active_occurrences(st, g)]
     if not active_groups:
+        for group in st.entity_groups:
+            group.placeholder = "(ignoriert / inaktiv)"
         st.current_mapping = {}
         st.current_anon_text = st.raw_text
         st.current_report = {"source_file": st.filename, "entity_count": 0, "mapping": {}, "entities": []}
@@ -457,7 +533,8 @@ def compute_reactive_preview(st: AppState) -> Tuple[str, Dict[str, str], Dict]:
     flat_occurrences = []
 
     for g in st.entity_groups:
-        if not g.enabled:
+        active_occurrences = get_active_occurrences(st, g)
+        if not g.enabled or not active_occurrences:
             g.placeholder = "(ignoriert / inaktiv)"
             continue
 
@@ -480,7 +557,7 @@ def compute_reactive_preview(st: AppState) -> Tuple[str, Dict[str, str], Dict]:
         g.placeholder = placeholder
         mapping[placeholder] = g.original_text
 
-        for occ in g.occurrences:
+        for occ in active_occurrences:
             flat_occurrences.append({
                 "start": occ.start,
                 "end": occ.end,
@@ -1051,12 +1128,15 @@ def create_ui():
                 needs_rev = 0.70 <= res.score < 0.85
                 ctx_html = extract_context_snippet(state.raw_text, res.start, res.end)
 
+                metadata = res.recognition_metadata or {}
+                source = "glossary" if metadata.get("recognizer_name") == "FuzzyGlossaryRecognizer" else "automatic"
                 occ = EntityOccurrence(
                     start=res.start,
                     end=res.end,
                     score=res.score,
                     context_html=ctx_html,
                     needs_review=needs_rev,
+                    source=source,
                 )
                 if key not in groups_dict:
                     groups_dict[key] = EntityGroup(original_text=norm, entity_type=res.entity_type)
@@ -1198,7 +1278,9 @@ def create_ui():
                                             build_review_table()
                                         return on_change
 
-                                    ui.checkbox(value=master.enabled, on_change=make_group_check(master)).props("dense")
+                                    master_check = ui.checkbox(value=master.enabled, on_change=make_group_check(master)).props("dense")
+                                    if not is_category_enabled(state, master.entity_type):
+                                        master_check.disable()
                                     ui.label(master.original_text).classes("font-mono text-sm font-bold text-slate-800")
                                     ui.badge(f"{master.count}x", color="primary" if master.count > 1 else "grey-6").props("dense")
 
@@ -1349,7 +1431,9 @@ def create_ui():
                                 with ui.row().classes("w-full items-center justify-between gap-3 pr-2 flex-wrap"):
                                     with ui.row().classes("items-center gap-2 min-w-[260px]"):
                                         ui.label("↳").classes("text-teal-700 font-bold text-base")
-                                        ui.checkbox(value=child.enabled, on_change=make_group_check(child)).props("dense")
+                                        child_check = ui.checkbox(value=child.enabled, on_change=make_group_check(child)).props("dense")
+                                        if not is_category_enabled(state, child.entity_type):
+                                            child_check.disable()
                                         ui.label(child.original_text).classes("font-mono text-sm font-bold text-teal-900")
                                         ui.badge(f"{child.count}x", color="teal-6").props("dense")
                                         c_badge = ui.badge(child.placeholder, color="teal-9").props("outline dense").classes("text-xs font-mono font-bold")
@@ -1441,25 +1525,35 @@ def create_ui():
 
             ui.separator().classes("my-2")
 
-            ui.label("Allgemeine Erkennung aktivieren:").classes("text-xs font-semibold text-slate-700 mb-1")
-            ui.label("Steuert KI-, Bibliotheks- und Regex-Erkennung. Explizite Glossar- und manuelle Einträge bleiben unabhängig aktiv.").classes("text-[11px] text-slate-500 mb-1")
+            ui.label("Erkennung je Entitätstyp:").classes("text-xs font-semibold text-slate-700 mb-1")
+            ui.label("Aus = Kategorie vollständig aus. Nur Glossar & manuell = keine automatische Erkennung. Alle Quellen = KI, Regex, Bibliothek und explizite Einträge.").classes("text-[11px] text-slate-500 mb-2")
             for ent in AVAILABLE_ENTITIES:
-                def make_ent_toggle(e_name):
-                    def toggle(val):
-                        if val.value and e_name not in state.active_entities:
-                            state.active_entities.append(e_name)
-                        elif not val.value and e_name in state.active_entities:
-                            state.active_entities.remove(e_name)
-                        save_current_config(state)
-                        if state.entity_groups and reanalysis_warning_card is not None:
-                            reanalysis_warning_card.set_visibility(True)
-                    return toggle
+                with ui.row().classes("w-full items-center justify-between gap-1"):
+                    ui.label(ent).classes("text-xs font-mono text-slate-700")
 
-                ui.checkbox(
-                    ent,
-                    value=ent in state.active_entities,
-                    on_change=make_ent_toggle(ent),
-                ).classes("text-xs my-0")
+                    def make_entity_mode_change(e_name):
+                        def change_mode(e):
+                            state.entity_modes[e_name] = e.value or ENTITY_MODE_OFF
+                            state.active_entities = [
+                                entity for entity, mode in state.entity_modes.items()
+                                if mode == ENTITY_MODE_ALL
+                            ]
+                            save_current_config(state)
+                            # Existing groups are re-filtered immediately by source; a new analysis
+                            # is still needed when automatic detection has just been enabled.
+                            compute_reactive_preview(state)
+                            refresh_preview_and_exports()
+                            if state.entity_groups:
+                                build_review_table()
+                                if reanalysis_warning_card is not None:
+                                    reanalysis_warning_card.set_visibility(True)
+                        return change_mode
+
+                    ui.select(
+                        options=ENTITY_MODE_OPTIONS,
+                        value=state.entity_modes.get(ent, ENTITY_MODE_OFF),
+                        on_change=make_entity_mode_change(ent),
+                    ).props("dense outlined bg-white options-dense").classes("w-44 text-xs")
 
             ui.separator().classes("my-2")
 
@@ -1782,6 +1876,12 @@ def create_ui():
                                     if not state.raw_text or not state.raw_text.strip():
                                         ui.notify("Kein Text im Workspace vorhanden.", type="warning")
                                         return
+                                    if state.entity_modes.get(manual_type.value, ENTITY_MODE_OFF) == ENTITY_MODE_OFF:
+                                        ui.notify(
+                                            f"{manual_type.value} ist vollständig ausgeschaltet. Bitte zuerst 'Nur Glossar & manuell' oder 'Alle Quellen' wählen.",
+                                            type="warning",
+                                        )
+                                        return
 
                                     # Search whole-word matches in current document text
                                     pattern = re.compile(r"\b" + re.escape(term) + r"\b", re.IGNORECASE)
@@ -1811,6 +1911,7 @@ def create_ui():
                                                     score=1.0,
                                                     context_html=ctx_html,
                                                     needs_review=False,
+                                                    source="manual",
                                                 )
                                             )
 

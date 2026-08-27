@@ -27,6 +27,31 @@ def test_disabled_general_detection_keeps_glossary_terms(monkeypatch):
     assert results[0].end == 3
 
 
+def test_glossary_can_be_disabled_independently_of_general_detection(monkeypatch):
+    """The category master switch must suppress glossary hits even if general detection is on."""
+    from presidio_analyzer import RecognizerResult
+
+    anonymizer = LocalAnonymizer(
+        glossary={"SAP": "IT_SYSTEM"},
+        enabled_entities=["IT_SYSTEM"],
+        enabled_glossary_entities=[],
+    )
+
+    def fake_general_detection(**kwargs):
+        return [
+            RecognizerResult(
+                entity_type="IT_SYSTEM",
+                start=0,
+                end=3,
+                score=1.0,
+                recognition_metadata={"recognizer_name": "FuzzyGlossaryRecognizer"},
+            )
+        ]
+
+    monkeypatch.setattr(anonymizer.analyzer, "analyze", fake_general_detection)
+    assert anonymizer.analyze("SAP") == []
+
+
 def test_builtin_generic_terms_are_ignored_but_explicit_glossary_wins(monkeypatch):
     """Generic labels such as E-Mail and App are suppressed unless explicitly configured."""
     from presidio_analyzer import RecognizerResult
@@ -268,12 +293,14 @@ def test_config_persistence(tmp_path, monkeypatch):
     # Modify and save
     cfg.format_mode = "role_only"
     cfg.export_format = "md"
+    cfg.entity_modes = {"IT_SYSTEM": "off", "PERSON": "all"}
     cfg.save()
 
     # Verify reload
     cfg2 = cfg_mod.AppConfig.load()
     assert cfg2.format_mode == "role_only"
     assert cfg2.export_format == "md"
+    assert cfg2.entity_modes == {"IT_SYSTEM": "off", "PERSON": "all"}
 
 
 def test_smart_linking_proposal_logic():
@@ -498,5 +525,14 @@ def test_entity_source_overview_reflects_actual_recognizers():
         assert all(s["recognizer"] != "SpacyRecognizer" for s in row["sources"])
 
 
+def test_entity_source_overview_reflects_glossary_master_switch():
+    anonymizer = LocalAnonymizer(
+        glossary={"SAP": "IT_SYSTEM"},
+        enabled_entities=[],
+        enabled_glossary_entities=[],
+    )
+    overview = {row["category"]: row for row in anonymizer.get_entity_source_overview()}
 
+    assert overview["IT_SYSTEM"]["active"] is False
+    assert overview["IT_SYSTEM"]["mode"] == "off"
 

@@ -47,6 +47,7 @@ def handle_anonymize(args: argparse.Namespace) -> None:
     glossary = config.get("glossary", {})
     ignore_terms = config.get("ignore_terms", [])
     enabled_entities = config.get("enabled_entities", None)
+    enabled_glossary_entities = config.get("enabled_glossary_entities", None)
     custom_labels = config.get("custom_labels", None)
     threshold = config.get("threshold", 0.55)
     model = args.model or config.get("model", "urchade/gliner_multi_pii-v1")
@@ -89,6 +90,7 @@ def handle_anonymize(args: argparse.Namespace) -> None:
             custom_labels=custom_labels,
             gliner_threshold=threshold,
             gliner_model=model,
+            enabled_glossary_entities=enabled_glossary_entities,
         )
 
         result = pipeline.process_file(

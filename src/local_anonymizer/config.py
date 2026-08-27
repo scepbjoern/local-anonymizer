@@ -2,11 +2,20 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 CONFIG_DIR = Path.home() / ".local-anonymizer"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "app.log"
+
+ENTITY_MODE_OFF = "off"
+ENTITY_MODE_EXPLICIT_ONLY = "explicit_only"
+ENTITY_MODE_ALL = "all"
+VALID_ENTITY_MODES = {
+    ENTITY_MODE_OFF,
+    ENTITY_MODE_EXPLICIT_ONLY,
+    ENTITY_MODE_ALL,
+}
 
 # Set up global logging fallback with rotation (1MB max, 2 backups, WARNING level)
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,6 +50,9 @@ class AppConfig:
             "PHONE_NUMBER",
             "LOCATION",
         ]
+        # New source-aware setting. An empty mapping keeps older config files backward-compatible;
+        # the UI derives the initial modes from active_entities when no mapping exists yet.
+        self.entity_modes: Dict[str, str] = {}
         self.gliner_threshold: float = 0.55
         self.ignore_terms: str = "CAS, DAS, MAS, BSc, MSc, PhD, MBA, Studierende, Studierenden, Dozent, Dozenten, Lehrperson, Berater, Aufgabensteller"
         self.glossary: str = "ZHAW: ORGANIZATION\nHWZ: ORGANIZATION\nUZH: ORGANIZATION\nETH: ORGANIZATION"
@@ -50,6 +62,7 @@ class AppConfig:
         return {
             "format_mode": self.format_mode,
             "active_entities": self.active_entities,
+            "entity_modes": self.entity_modes,
             "gliner_threshold": self.gliner_threshold,
             "ignore_terms": self.ignore_terms,
             "glossary": self.glossary,
@@ -61,6 +74,13 @@ class AppConfig:
         config = cls()
         config.format_mode = data.get("format_mode", config.format_mode)
         config.active_entities = data.get("active_entities", config.active_entities)
+        raw_modes = data.get("entity_modes", {})
+        if isinstance(raw_modes, dict):
+            config.entity_modes = {
+                str(entity): str(mode)
+                for entity, mode in raw_modes.items()
+                if str(mode) in VALID_ENTITY_MODES
+            }
         config.gliner_threshold = data.get("gliner_threshold", config.gliner_threshold)
         config.ignore_terms = data.get("ignore_terms", config.ignore_terms)
         config.glossary = data.get("glossary", config.glossary)

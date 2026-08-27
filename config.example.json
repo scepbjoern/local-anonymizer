@@ -21,6 +21,11 @@
     "UID_NUMBER",
     "IT_SYSTEM"
   ],
+  "enabled_glossary_entities": [
+    "PERSON",
+    "ORGANIZATION",
+    "IT_SYSTEM"
+  ],
   "glossary": {
     "abcd": "PERSON",
     "efgh": "PERSON",

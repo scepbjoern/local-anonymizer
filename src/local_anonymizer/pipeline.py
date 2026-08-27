@@ -32,6 +32,7 @@ class AnonymizationPipeline:
         custom_labels: Optional[Dict[str, str]] = None,
         gliner_model: str = "urchade/gliner_multi_pii-v1",
         gliner_threshold: float = 0.55,
+        enabled_glossary_entities: Optional[Sequence[str]] = None,
     ):
         self.anonymizer = LocalAnonymizer(
             language=language,
@@ -41,6 +42,7 @@ class AnonymizationPipeline:
             custom_labels=custom_labels,
             gliner_model=gliner_model,
             gliner_threshold=gliner_threshold,
+            enabled_glossary_entities=enabled_glossary_entities,
         )
 
     def process_file(

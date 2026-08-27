@@ -89,13 +89,13 @@
 - **`FuzzyGlossaryRecognizer`:**
   - Nutzt `rapidfuzz.fuzz.ratio` mit Schwellenwerten (High Confidence $\ge 90\%$, Review-Bedarf $\ge 75\%$).
   - Bevorzugt exakte Treffer (Score 1.0) vor Fuzzy-Treffern.
-  - Explizite Glossar-Treffer bleiben auch bei deaktiviertem Entitätstyp aktiv und überschreiben generische Ignore-Begriffe bewusst.
+  - Explizite Glossar-Treffer werden gemäss der Kategorie-Richtlinie separat zugelassen oder vollständig blockiert und überschreiben bei Zulassung generische Ignore-Begriffe bewusst.
 - **Deterministische Phase-B-Recognizer:**
   - `AddressPatternRecognizer` erkennt zusammenhängende Schweizer und deutsche Adressen per Regex und weist die bekannte Kollision zwischen vierstelliger Schweizer PLZ und Jahreszahl konservativ zurück.
   - `AHVNumberRecognizer` validiert die AHV-Kontrollziffer; `UIDNumberRecognizer` validiert CHE/UID nach Modulo 11. Formal korrekte, aber prüfziffern-ungültige Nummern werden nicht als Entitäten ausgegeben.
   - `IT_SYSTEM` wird über das dynamisch aus dem Glossar abgeleitete Zieltypenset sowie separate GLiNER-Sicherheitsnetz-Prompts erkannt.
 
-Die UI-Schalter für Entitätstypen begrenzen die allgemeine KI-/Bibliotheks-/Regex-Erkennung. Glossar-Treffer werden in einem getrennten, direkten Pass geprüft; dadurch kann beispielsweise `IT_SYSTEM` für die allgemeine KI-Erkennung deaktiviert bleiben, während explizit konfigurierte Systeme wie `SAP` weiterhin geprüft werden. Manuelle, dokumentbezogene Markierungen werden unabhängig davon in der Review-Tabelle verarbeitet.
+Die UI-Schalter für Entitätstypen verwenden drei Modi: `Aus` blockiert alle Quellen, `Nur Glossar & manuell` deaktiviert KI-/Bibliotheks-/Regex-Erkennung und `Alle Quellen` aktiviert sämtliche Quellen. Glossar-Treffer werden in einem getrennten, direkten Pass geprüft; dadurch kann beispielsweise `IT_SYSTEM` auf „Nur Glossar & manuell“ stehen, während ein vollständiges „Aus“ auch `SAP` blockiert. Manuelle, dokumentbezogene Markierungen folgen derselben Kategorie-Richtlinie.
 
 ### 2.3 Platzhalter-Engine & Entity-Linking (`anonymizer.py`) *(Umgesetzt in Phase 3)*
 - **Format-Modi:**

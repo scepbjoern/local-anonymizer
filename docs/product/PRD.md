@@ -51,8 +51,8 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 * **Fuzzy-Glossar (RapidFuzz):**
   * Zuordnung interner Firmenkürzel (z. B. `"abcd"` $\rightarrow$ `PERSON`).
   * Fehlertolerantes Matching bei Tippfehlern (z. B. `"ZHW"` $\rightarrow$ `"ZHAW"`).
-* **Globale & Session-Ignore-Listen:** Schutz generischer Rollen, Grade und Feldbezeichnungen (`CAS`, `BSc`, `Studierende`, `Dozent`, `Unternehmen`, `E-Mail`, `App`, `Applikation`). Explizite Glossar-Treffer überschreiben diese Schutzliste bewusst.
-* **Getrennte Erkennungssteuerung:** Die Entitätsschalter begrenzen die allgemeine KI-/Bibliotheks-/Regex-Erkennung. Glossar-Treffer und manuelle Markierungen bleiben unabhängig aktiv; eine leere Auswahl bedeutet damit „nur Glossar und manuelle Markierungen“.
+* **Globale & Session-Ignore-Listen:** Schutz generischer Rollen, Grade und Feldbezeichnungen (`CAS`, `BSc`, `Studierende`, `Dozent`, `Unternehmen`, `E-Mail`, `App`, `Applikation`). Zulässige explizite Glossar-Treffer überschreiben diese Schutzliste bewusst.
+* **Dreistufige Erkennungssteuerung:** `Aus` blockiert alle Quellen einer Kategorie, `Nur Glossar & manuell` lässt nur explizite und manuelle Einträge zu, `Alle Quellen` aktiviert KI-, Bibliotheks-, Regex- und explizite Erkennung.
 * **Deterministische Schweizer Erweiterungen:** `ADDRESS` erkennt Schweizer und deutsche Adressmuster; `AHV_NUMBER` wird mit der AHV-Kontrollziffer und `UID_NUMBER` mit der offiziellen Modulo-11-Prüfziffer validiert. `IT_SYSTEM` nutzt das Glossar als Primärquelle und GLiNER-Prompts als Sicherheitsnetz.
 
 ---

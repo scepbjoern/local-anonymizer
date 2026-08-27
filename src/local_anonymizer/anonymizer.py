@@ -280,6 +280,7 @@ class LocalAnonymizer:
         fuzzy_high_threshold: float = 90.0,
         fuzzy_review_threshold: float = 75.0,
         enabled_entities: Optional[Sequence[str]] = None,
+        enabled_glossary_entities: Optional[Sequence[str]] = None,
     ):
         self.language = language
         self.glossary = glossary or {}
@@ -293,6 +294,11 @@ class LocalAnonymizer:
 
         # Explicitly preserve empty list [] vs None (None = all entities, [] = no entities)
         self.enabled_entities = list(enabled_entities) if enabled_entities is not None else None
+        # Separate glossary filter: None preserves the public API's historical "all glossary
+        # entries" behavior, while [] explicitly disables glossary matching.
+        self.enabled_glossary_entities = (
+            list(enabled_glossary_entities) if enabled_glossary_entities is not None else None
+        )
 
         # Setup Presidio AnalyzerEngine with lightweight blank NLP engine
         from presidio_analyzer import AnalyzerEngine, RecognizerResult
@@ -438,11 +444,22 @@ class LocalAnonymizer:
 
         enabled = self.enabled_entities
         glossary_categories = set(self.fuzzy_recognizer.supported_entities)
+        enabled_glossary = self.enabled_glossary_entities
         overview: List[Dict[str, Any]] = []
         for category in sorted(category_sources.keys()):
+            general_active = (enabled is None) or (category in enabled)
+            glossary_active = (
+                enabled_glossary is None or category in enabled_glossary
+            ) and category in glossary_categories
             overview.append({
                 "category": category,
-                "active": (enabled is None) or (category in enabled) or (category in glossary_categories),
+                "active": general_active or glossary_active,
+                "mode": (
+                    "all" if general_active and glossary_active
+                    else "explicit_only" if glossary_active
+                    else "automatic_only" if general_active
+                    else "off"
+                ),
                 "sources": category_sources[category],
             })
         return overview
@@ -459,12 +476,18 @@ class LocalAnonymizer:
         if on_progress:
             on_progress(0.10, "Ignore-Filterung und Vorverarbeitung...")
 
-        # If enabled_entities is explicitly empty [], only configured glossary terms remain
-        # eligible; explicit user entries are intentionally independent from AI/regex toggles.
+        configured_glossary_types = set(self.fuzzy_recognizer.supported_entities)
+        if self.enabled_glossary_entities is None:
+            allowed_glossary_types = configured_glossary_types
+        else:
+            allowed_glossary_types = configured_glossary_types.intersection(self.enabled_glossary_entities)
+
+        # If enabled_entities is explicitly empty [], only glossary terms allowed by the
+        # separate glossary filter remain eligible.
         if (
             self.enabled_entities is not None
             and len(self.enabled_entities) == 0
-            and not self.fuzzy_recognizer.glossary
+            and not allowed_glossary_types
         ):
             if on_progress:
                 on_progress(1.00, "Keine Entitäten aktiviert.")
@@ -495,11 +518,11 @@ class LocalAnonymizer:
                 score_threshold=None,
             )
 
-        # Keep explicit glossary terms active even when their category is disabled for the
-        # model/library/regex pass. Categories already enabled are supplied by Presidio above;
-        # only disabled glossary categories need a direct second pass to avoid re-enabling GLiNER.
-        if self.enabled_entities is not None and self.fuzzy_recognizer.glossary:
-            disabled_glossary_types = set(self.fuzzy_recognizer.supported_entities).difference(self.enabled_entities)
+        # Keep only policy-allowed glossary terms active. Categories already enabled for the
+        # general pass are supplied by Presidio above; disabled general categories need a direct
+        # fuzzy pass, without re-enabling any disabled category.
+        if self.enabled_entities is not None and allowed_glossary_types:
+            disabled_glossary_types = allowed_glossary_types.difference(self.enabled_entities)
             if disabled_glossary_types:
                 results.extend(
                     self.fuzzy_recognizer.analyze(text=text, entities=sorted(disabled_glossary_types))
@@ -518,6 +541,8 @@ class LocalAnonymizer:
             r.end = clean_e
 
             is_glossary_result = (r.recognition_metadata or {}).get("recognizer_name") == "FuzzyGlossaryRecognizer"
+            if is_glossary_result and r.entity_type not in allowed_glossary_types:
+                continue
             is_ignored = any(
                 not (r.end <= ig_start or r.start >= ig_end)
                 for ig_start, ig_end in ignored_spans
