@@ -428,6 +428,8 @@ def create_ui():
     raw_text_area = None
     progress_holder = None
     upload_ui_elem = None
+    upload_status_label = None
+    analyze_btn = None
     reset_btn = None
     ignore_container = None
     glossary_container = None
@@ -475,9 +477,9 @@ def create_ui():
                                     ui.notify(f"'{t}' aus Ignore-Liste entfernt.", type="info")
                                 return on_remove
 
-                            with ui.badge(color="slate-2").props("outline dense").classes("text-[11px] text-slate-700 items-center gap-1 pl-1.5 pr-0.5 py-0.5"):
-                                ui.label(term).classes("font-mono")
-                                ui.button(icon="close", on_click=make_remove_ig(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0")
+                            with ui.row().classes("items-center gap-1 bg-slate-100 border border-slate-300 rounded px-2 py-0.5 shadow-none"):
+                                ui.label(term).classes("font-mono font-semibold text-xs text-slate-900")
+                                ui.button(icon="close", on_click=make_remove_ig(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-0.5 hover:bg-red-100")
 
     def render_glossary_list_ui():
         if not glossary_container:
@@ -521,10 +523,10 @@ def create_ui():
                                     ui.notify(f"'{t}' aus Glossar entfernt.", type="info")
                                 return on_remove
 
-                            with ui.badge(color="blue-1").props("outline dense").classes("text-[11px] text-slate-800 items-center gap-1 pl-1.5 pr-0.5 py-0.5"):
-                                ui.label(term).classes("font-mono font-bold")
-                                ui.label(f"({ent_type})").classes("text-[9px] text-blue-700")
-                                ui.button(icon="close", on_click=make_remove_g(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0")
+                            with ui.row().classes("items-center gap-1.5 bg-blue-50 border border-blue-300 rounded px-2 py-0.5 shadow-none"):
+                                ui.label(term).classes("font-mono font-bold text-xs text-slate-900")
+                                ui.label(f"({ent_type})").classes("text-[10px] font-semibold text-blue-800 bg-blue-100 px-1 rounded")
+                                ui.button(icon="close", on_click=make_remove_g(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-0.5 hover:bg-red-100")
 
     def refresh_preview_and_exports():
         if not preview_holder or not export_holder:
@@ -627,7 +629,7 @@ def create_ui():
                 ).props("unelevated")
 
     async def run_analysis():
-        if not state.raw_text:
+        if not state.raw_text or not state.raw_text.strip():
             ui.notify("Bitte laden Sie zuerst ein Dokument hoch oder fügen Sie Text ein.", type="warning")
             return
 
@@ -689,37 +691,59 @@ def create_ui():
                 progress_holder.clear()
 
     async def handle_upload(e):
+        if upload_status_label is not None:
+            upload_status_label.set_visibility(False)
         try:
-            if hasattr(e, "file"):
+            if hasattr(e, "file") and e.file is not None:
                 data = await e.file.read()
                 filename = e.file.name
-            elif hasattr(e, "content"):
+            elif hasattr(e, "content") and e.content is not None:
                 data = e.content.read()
-                filename = e.name
+                filename = getattr(e, "name", "document")
             else:
-                raise ValueError("Unbekanntes Upload-Event-Format")
+                raise ValueError(f"Unbekanntes Upload-Format: {e}")
 
             state.filename = filename
             state.raw_text = read_document_from_bytes(data, filename)
             if raw_text_area is not None:
                 raw_text_area.value = state.raw_text
-            ui.notify(f"Datei '{filename}' geladen ({len(state.raw_text)} Zeichen).", type="positive")
-
-            # Cleanly reset uploader queue to avoid max-files lock
-            if upload_ui_elem is not None:
-                upload_ui_elem.reset()
+            if analyze_btn is not None:
+                analyze_btn.set_enabled(True)
             if reset_btn is not None:
                 reset_btn.set_visibility(True)
+            if upload_ui_elem is not None:
+                upload_ui_elem.reset()
 
-            # Run analysis asynchronously so HTTP upload request returns immediately to browser
-            asyncio.create_task(run_analysis())
-        except UnsupportedFileFormatError as fe:
-            ui.notify(f"Nicht unterstütztes Format: {str(fe)}", type="negative")
-        except ValueError as ve:
-            ui.notify(f"Fehler beim Lesen des Dokuments: {str(ve)}", type="negative", timeout=10000)
+            ui.notify(f"Datei '{filename}' geladen ({len(state.raw_text)} Zeichen). Klicken Sie auf 'Text & Dokument analysieren'.", type="positive")
+            if upload_status_label is not None:
+                upload_status_label.set_text(f"✅ Erfolgreich geladen: '{filename}' ({len(state.raw_text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.")
+                upload_status_label.classes("text-positive text-xs font-bold")
+                upload_status_label.set_visibility(True)
+
         except Exception as ex:
-            logging.error(f"Upload error: {ex}", exc_info=True)
-            ui.notify(f"Fehler beim Upload: {str(ex)}", type="negative")
+            err_msg = f"{type(ex).__name__}: {str(ex)}"
+            logging.error(f"Upload error: {err_msg}", exc_info=True)
+            ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000, close_button=True)
+            if upload_status_label is not None:
+                upload_status_label.set_text(f"❌ Fehler beim Laden von '{getattr(e, 'name', 'Datei')}': {err_msg}")
+                upload_status_label.classes("text-negative text-xs font-bold")
+                upload_status_label.set_visibility(True)
+
+    def handle_rejected(e):
+        details = ""
+        try:
+            if hasattr(e, "args") and e.args:
+                details = str(e.args)
+        except Exception:
+            pass
+        err_text = f"Upload abgelehnt: {details or 'Dateiformat oder Dateibeschränkung ungültig'}"
+        ui.notify(err_text, type="negative", timeout=15000)
+        if upload_status_label is not None:
+            upload_status_label.set_text(f"⚠️ {err_text}")
+            upload_status_label.classes("text-negative text-xs font-bold")
+            upload_status_label.set_visibility(True)
+        if upload_ui_elem is not None:
+            upload_ui_elem.reset()
 
     def reset_workspace():
         """Reset raw text, filename, and analysis table."""
@@ -738,6 +762,10 @@ def create_ui():
             table_holder.clear()
         if upload_ui_elem is not None:
             upload_ui_elem.reset()
+        if upload_status_label is not None:
+            upload_status_label.set_visibility(False)
+        if analyze_btn is not None:
+            analyze_btn.set_enabled(False)
         if reset_btn is not None:
             reset_btn.set_visibility(False)
         ui.notify("Workspace zurückgesetzt.", type="info", icon="delete_sweep")
@@ -1083,7 +1111,7 @@ def create_ui():
                         elif not val.value and e_name in state.active_entities:
                             state.active_entities.remove(e_name)
                         save_current_config()
-                        if state.raw_text:
+                        if state.raw_text and state.raw_text.strip():
                             await run_analysis()
                     return toggle
 
@@ -1104,12 +1132,12 @@ def create_ui():
 
             ui.separator().classes("my-2")
 
-            # Interactive Ignore List (Alphabetical with [x] delete buttons)
+            # Interactive Ignore List (Alphabetical with [x] delete buttons, high-contrast)
             with ui.expansion("Ignore-Liste (Nicht ersetzen)", icon="visibility_off").classes("w-full text-xs"):
                 ignore_container = ui.column().classes("w-full")
                 render_ignore_list_ui()
 
-            # Interactive Fuzzy Glossary (Alphabetical with [x] delete buttons)
+            # Interactive Fuzzy Glossary (Alphabetical with [x] delete buttons, high-contrast)
             with ui.expansion("Fuzzy-Glossar (Eigene Begriffe)", icon="library_books").classes("w-full text-xs mt-1"):
                 glossary_container = ui.column().classes("w-full")
                 render_glossary_list_ui()
@@ -1125,27 +1153,81 @@ def create_ui():
                 with ui.tab_panel(tab_anonymize):
                     ui.label("Stufe 1: Dokument laden & Text-Eingabe").classes("text-base font-bold text-slate-800 mb-1")
                     
-                    # Direct Document Upload in Main Workspace
+                    # Direct Document Upload / File Selection in Main Workspace
                     with ui.card().classes("w-full p-3 bg-slate-50 border border-dashed border-slate-300 rounded-lg mb-3"):
                         with ui.row().classes("w-full items-center justify-between gap-4 flex-wrap"):
-                            with ui.row().classes("items-center gap-2"):
+                            with ui.row().classes("items-center gap-3"):
                                 ui.icon("cloud_upload", size="md").classes("text-primary")
                                 with ui.column().classes("gap-0"):
-                                    ui.label("Dokument hier hochladen (.docx, .pdf, .txt, .md, .csv, .json):").classes("text-xs font-bold text-slate-700")
+                                    ui.label("Dokument laden (.docx, .pdf, .txt, .md, .csv, .json):").classes("text-xs font-bold text-slate-700")
                                     ui.label("Struktur (Überschriften, Listen & Tabellen) wird automatisch als Markdown extrahiert").classes("text-[11px] text-slate-500")
 
-                            with ui.row().classes("items-center gap-2"):
+                            with ui.row().classes("items-center gap-2 flex-wrap"):
+                                def open_native_file_dialog():
+                                    try:
+                                        import tkinter as tk
+                                        from tkinter import filedialog
+                                        root = tk.Tk()
+                                        root.withdraw()
+                                        root.attributes("-topmost", True)
+                                        filepath = filedialog.askopenfilename(
+                                            title="Dokument zum Anonymisieren auswählen",
+                                            filetypes=[
+                                                ("Unterstützte Dokumente (*.docx, *.pdf, *.txt, *.md, *.csv, *.json)", "*.docx;*.pdf;*.txt;*.md;*.csv;*.json"),
+                                                ("Word-Dokumente (*.docx)", "*.docx"),
+                                                ("PDF-Dokumente (*.pdf)", "*.pdf"),
+                                                ("Text & Markdown (*.txt, *.md)", "*.txt;*.md"),
+                                                ("Tabellen & Daten (*.csv, *.json)", "*.csv;*.json"),
+                                                ("Alle Dateien (*.*)", "*.*"),
+                                            ]
+                                        )
+                                        root.destroy()
+                                        if filepath:
+                                            p = Path(filepath)
+                                            data = p.read_bytes()
+                                            state.filename = p.name
+                                            state.raw_text = read_document_from_bytes(data, p.name)
+                                            if raw_text_area is not None:
+                                                raw_text_area.value = state.raw_text
+                                            if analyze_btn is not None:
+                                                analyze_btn.set_enabled(True)
+                                            if reset_btn is not None:
+                                                reset_btn.set_visibility(True)
+                                            ui.notify(f"Datei '{p.name}' erfolgreich geladen ({len(state.raw_text)} Zeichen).", type="positive")
+                                            if upload_status_label is not None:
+                                                upload_status_label.set_text(f"✅ Geladen: '{p.name}' ({len(state.raw_text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.")
+                                                upload_status_label.classes("text-positive text-xs font-bold")
+                                                upload_status_label.set_visibility(True)
+                                    except Exception as ex:
+                                        err_msg = f"{type(ex).__name__}: {str(ex)}"
+                                        logging.error(f"Native file open error: {err_msg}", exc_info=True)
+                                        ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
+                                        if upload_status_label is not None:
+                                            upload_status_label.set_text(f"❌ Fehler beim Laden: {err_msg}")
+                                            upload_status_label.classes("text-negative text-xs font-bold")
+                                            upload_status_label.set_visibility(True)
+
+                                ui.button("📂 Datei auswählen...", icon="folder_open", on_click=open_native_file_dialog, color="primary").props("unelevated dense").classes("text-xs font-bold")
+                                ui.label("oder hier ablegen:").classes("text-xs text-slate-500 font-medium")
+
                                 upload_ui_elem = ui.upload(
                                     on_upload=handle_upload,
+                                    on_rejected=handle_rejected,
                                     auto_upload=True,
-                                    max_files=1,
-                                ).props("outlined dense flat").classes("w-72")
+                                ).props("outlined dense flat").classes("w-60")
+
+                        upload_status_label = ui.label("").classes("text-xs font-bold mt-2")
+                        upload_status_label.set_visibility(False)
 
                     with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note", value=True).classes("w-full mb-2"):
                         def on_raw_text_change(e):
-                            state.raw_text = e.value
+                            state.raw_text = e.value or ""
+                            has_content = bool(state.raw_text and state.raw_text.strip())
+                            if analyze_btn is not None:
+                                analyze_btn.set_enabled(has_content)
                             if reset_btn is not None:
-                                reset_btn.set_visibility(bool(e.value and e.value.strip()))
+                                reset_btn.set_visibility(has_content)
+
                         raw_text_area = ui.textarea(
                             value=state.raw_text,
                             placeholder="Text hier eingeben oder Dokument oben hochladen...",
@@ -1154,12 +1236,13 @@ def create_ui():
 
                     # Prominent Analysis & Workspace Reset Buttons in Action Row
                     with ui.row().classes("w-full items-center justify-between mt-1 mb-4 gap-3 flex-wrap"):
-                        ui.button(
+                        analyze_btn = ui.button(
                             "🔍 Text & Dokument analysieren",
                             icon="psychology",
                             color="primary",
                             on_click=run_analysis,
                         ).props("unelevated").classes("px-4 py-2 font-bold")
+                        analyze_btn.set_enabled(bool(state.raw_text and state.raw_text.strip()))
 
                         reset_btn = ui.button(
                             "🗑️ Workspace zurücksetzen",
@@ -1221,12 +1304,12 @@ def create_ui():
 
                             async def handle_restore_file_upload(e):
                                 try:
-                                    if hasattr(e, "file"):
+                                    if hasattr(e, "file") and e.file is not None:
                                         data = await e.file.read()
                                         filename = e.file.name
-                                    elif hasattr(e, "content"):
+                                    elif hasattr(e, "content") and e.content is not None:
                                         data = e.content.read()
-                                        filename = e.name
+                                        filename = getattr(e, "name", "document")
                                     else:
                                         raise ValueError("Unbekanntes Upload-Format")
                                     text = read_document_from_bytes(data, filename)
@@ -1239,7 +1322,6 @@ def create_ui():
                             ui.upload(
                                 on_upload=handle_restore_file_upload,
                                 auto_upload=True,
-                                max_files=1,
                             ).props("outlined dense flat").classes("w-full mb-2")
 
                             def on_anon_change(e):
@@ -1255,9 +1337,9 @@ def create_ui():
 
                             async def on_map_upload(e):
                                 try:
-                                    if hasattr(e, "file"):
+                                    if hasattr(e, "file") and e.file is not None:
                                         data = await e.file.read()
-                                    elif hasattr(e, "content"):
+                                    elif hasattr(e, "content") and e.content is not None:
                                         data = e.content.read()
                                     else:
                                         raise ValueError("Unbekanntes Upload-Format")
@@ -1268,7 +1350,7 @@ def create_ui():
                                 except Exception as ex:
                                     ui.notify(f"Ungültige JSON-Mapping-Datei: {str(ex)}", type="negative")
 
-                            ui.upload(on_upload=on_map_upload, auto_upload=True, max_files=1).props("outlined dense flat").classes("w-full mb-2")
+                            ui.upload(on_upload=on_map_upload, auto_upload=True).props("outlined dense flat").classes("w-full mb-2")
 
                             def on_map_text_change(e):
                                 try:
