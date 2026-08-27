@@ -4,6 +4,8 @@
 
 `local-anonymizer` is a lightweight, local-first Desktop GUI, CLI tool, and Python library that scrubs Personally Identifiable Information (PII) and company-specific sensitive entities from documents and text before sending them to cloud or local LLMs. Once the LLM completes its task (e.g., summarization, rewriting, or extraction), `local-anonymizer` seamlessly restores the original entities using a secure, local-only mapping table.
 
+Für die praktische Nutzung steht ein deutschsprachiger [Benutzerleitfaden](docs/guide/00-einstieg.md) mit Installation, Review, Export, Wiederherstellung, Datenschutz und Fehlerbehebung bereit.
+
 ---
 
 ## ✨ Key Features
@@ -37,18 +39,22 @@ Using [`uv`](https://github.com/astral-sh/uv) (recommended):
 ```bash
 git clone https://github.com/scepbjoern/local-anonymizer.git
 cd local-anonymizer
-uv sync
+uv sync --extra gui
 ```
 
 Or using standard `pip`:
 
 ```bash
-pip install -e .
+pip install -e ".[gui]"
 ```
 
 ---
 
 ### 2. Interactive Review-GUI (NiceGUI Desktop Application)
+
+Eine schrittweise Anleitung für Studierende und andere Nutzerinnen und Nutzer
+steht im [Benutzerleitfaden](docs/guide/00-einstieg.md). Die folgenden Befehle sind
+die technische Kurzreferenz.
 
 Launch the application in native desktop mode:
 
@@ -66,13 +72,13 @@ On Windows, you can also double-click `start_windows.vbs` for a silent backgroun
 > **Data Privacy & In-Memory Processing:**
 > All entity analysis, secret mapping tables, and text transformations reside strictly in RAM. When using the native file picker (`tkinter`), files are read directly into memory. When using drag-and-drop in the GUI, large files are streamed to a temporary local upload directory (`~/.local-anonymizer/temp_uploads`, max 50 MB) and are immediately unlinked/deleted from disk as soon as they are loaded into RAM.
 
-> [!TIP]
+> [!WARNING]
 > **Hinweis für macOS-Nutzer:**
-> Auf macOS startet das GUI standardmäßig über das WebKit/Cocoa-Backend von `pywebview`. Falls kein separates Fenster gewünscht ist oder WebKit-Abhängigkeiten fehlen, kann die Anwendung jederzeit mit dem `--browser`-Flag gestartet werden:
+> Die Mac-Startskripte und der automatisierte Testworkflow sind vorbereitet, aber die Anwendung wurde bisher nicht praktisch auf macOS getestet. Der Browser-Modus kann als Versuch verwendet werden:
 > ```bash
 > uv run --extra gui python app.py --browser
 > ```
-> Das Windows-Hilfsskript `start_windows.vbs` ist für Windows-Systeme optimiert; auf macOS erfolgt der Start direkt über das Terminal oder ein Shell-Skript.
+> Das Windows-Hilfsskript `start_windows.vbs` ist der getestete Referenzweg; auf macOS erfolgt der Start direkt über das Terminal oder ein Shell-Skript.
 
 ---
 
@@ -127,6 +133,10 @@ Run the full automated test suite (covers all recognizers, extractors, multi-enc
 ```bash
 uv run pytest
 ```
+
+Weitere Dokumentation ist über den [Dokumentations-Wegweiser](docs/INDEX.md)
+erreichbar. Die Produkt- und Architekturdokumente beschreiben Anforderungen
+und technische Umsetzung; der Benutzerleitfaden beschreibt die Bedienung.
 
 ---
 

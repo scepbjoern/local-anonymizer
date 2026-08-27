@@ -117,7 +117,7 @@ Die UI-Schalter für Entitätstypen verwenden drei Modi: `Aus` blockiert alle Qu
 
 ### 2.4 Benutzeroberfläche (`app.py`)
 - Aufgebaut mit **NiceGUI** (FastAPI + Vue/Quasar Backend).
-- Desktop-Ausführung über `ui.run(native=True)` (nutzt Microsoft WebView2 auf Windows bzw. WebKit/Cocoa auf macOS via `pywebview`).
+- Desktop-Ausführung über `ui.run(native=True)` (Windows über Microsoft WebView2). Für macOS sind Startskripte und ein Browser-Fallback vorbereitet, aber noch nicht praktisch getestet.
 - CPU-intensive NLP-Berechnungen werden per `asyncio.to_thread` vom UI-Event-Loop isoliert.
 - Hierarchische Baum-Ansicht (`build_entity_tree`) zur intuitiven Darstellung verknüpfter Namensvarianten mit sofortiger Trennen-Aktion.
 
@@ -125,8 +125,7 @@ Die UI-Schalter für Entitätstypen verwenden drei Modi: `Aus` blockiert alle Qu
 - **Persistente Einstellungen:** `~/.local-anonymizer/config.json` speichert Nutzereinstellungen defensiv (mit Fallback auf Standardwerte bei Dateifehlern).
 - **Diagnose-Logging:** `~/.local-anonymizer/app.log` dient als Fehlerprotokoll bei unsichtbarem Start.
 - **Windows-Integration:** `install_windows.bat` erstellt Desktop- und Startmenü-Verknüpfungen mit geräuschlosem `pythonw`-Start.
-- **macOS-Integration:** `start_mac.command` und `install_mac.command` bieten native Startskripte. `pyproject.toml` bindet `pywebview>=5.0.0` ein, was macOS-spezifische Cocoa-Bindings out-of-the-box mitliefert.
-- **Automatisierte Mac-Prüfung:** GitHub Actions Workflow (`.github/workflows/mac-test.yml`) für manuell triggerbare Tests auf `macos-latest`.
+- **macOS-Vorbereitung:** `start_mac.command` und `install_mac.command` sowie ein manuell triggerbarer GitHub-Actions-Workflow (`.github/workflows/mac-test.yml`) sind vorhanden. Ein manueller End-to-End-Test auf macOS steht noch aus.
 
 ---
 
@@ -135,7 +134,7 @@ Die UI-Schalter für Entitätstypen verwenden drei Modi: `Aus` blockiert alle Qu
 | Aspekt | Garantie | Technische Umsetzung |
 | :--- | :--- | :--- |
 | **Datenabfluss** | 0% externe Datenübertragung | Offline-Modus für HuggingFace (`HF_HUB_OFFLINE=1`), kein Telemetrie-Code in NiceGUI/Presidio |
-| **Persistenz** | Keine PII auf dauerhaften Datenträgern | Reine RAM-Verarbeitung für Entitäten & Mappings (`io.BytesIO`, Python-State). Temporärer Drag-and-Drop HTTP-Puffer (`temp_uploads`) wird per `try...finally` sofort nach RAM-Transfer und via `atexit` bereinigt. |
+| **Persistenz** | Keine absichtliche dauerhafte Speicherung von PII durch die Pipeline | Entitäten und Mappings werden im Python-State verarbeitet. Beim Drag-and-drop kann ein Upload kurzzeitig im lokalen Ordner `temp_uploads` liegen; er wird nach dem RAM-Transfer und zusätzlich beim Beenden bereinigt. |
 | **Reversibilität** | 100% mathematische Wiederherstellbarkeit | Deterministische JSON-Mappingtabelle, Single-Pass-Regex |
 | **Admin-Rechte** | 0% Admin-Rechte erforderlich | Reine User-Space-Dependencies (`uv pip install`) |
 

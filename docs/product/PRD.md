@@ -98,7 +98,7 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 ### 4.5 Feature 5: Interaktives Review-GUI (NiceGUI) *(Umgesetzt)*
 
 * **Single-Page Application (`app.py`):**
-  * Start als eigenständiges natives Desktop-Fenster (`native=True` via pywebview/WebView2 auf Windows bzw. WebKit/Cocoa auf macOS) oder im Webbrowser (`--browser`).
+  * Start als eigenständiges natives Desktop-Fenster (`native=True` via pywebview/WebView2 auf Windows) oder im Webbrowser (`--browser`). Für macOS sind Startskripte und ein Browser-Fallback vorbereitet, aber noch nicht praktisch getestet.
 * **Hierarchische Tree-View:** Klare optische Strukturierung: Hauptidentitäten oben, verknüpfte Schreibweisen (`_VORNAME`, `_ANREDE`) visuell eingerückt darunter mit sofortiger `✕ Trennen`-Aktion.
 * **Transparente Platzhalter-Badges:** Jede Tabellenzeile zeigt direkt den final zugeordneten Platzhalter (z. B. `[PERSON_1_STUDENT]`).
 * **Manuelle Entitätserfassung:** Fehlende Begriffe (Falsch-Negative des NER) können direkt per 1-Klick-Eingabe (`"Remo: PERSON"`) im gesamten Text als Entität forciert werden.
@@ -126,8 +126,7 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 ### 4.7 Feature 7: Plattform- & OS-Integration *(Umgesetzt)*
 
 * **Windows-Integration:** `install_windows.bat` und `start_windows.bat` ermöglichen den Start im Hintergrund (Silent Mode via `pythonw`) mit Desktop- und Startmenü-Verknüpfung sowie Logging unter `~/.local-anonymizer/app.log`.
-* **macOS-Kompatibilität:** `start_mac.command` und `install_mac.command` bieten komfortablen Start. Automatischer Cocoa/WebKit-Support über `pywebview>=5.0.0`.
-* **CI/CD Testsuite:** Manuell auslösbarer GitHub-Actions-Workflow (`.github/workflows/mac-test.yml`) zur Verifikation auf `macos-latest`.
+* **macOS-Vorbereitung:** `start_mac.command` und `install_mac.command` sowie ein manueller GitHub-Actions-Workflow (`.github/workflows/mac-test.yml`) sind vorhanden. Die Anwendung wurde bisher nicht manuell auf macOS getestet; eine vollständige Plattformfreigabe liegt daher noch nicht vor.
 
 ---
 
@@ -159,6 +158,9 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 
 ### 🔮 Phase 5b: Projekt-Registry für dokumentübergreifende Mappings (Geplant nach CAS-Deliverable)
 * Verschlüsselte, strikt projekt- und kontextbezogene Mapping-Registry (Passphrase-geschützt via KeePass) zur Wiederverwendung konsistenter Pseudonyme über mehrere Dokumente hinweg.
+* Projektbezogene Glossare, Ignore-Listen, Entitätseinstellungen und manuell vergebene Rollen, beispielsweise `LEHRPERSON` oder `STUDIENGANGSLEITUNG`, sollen über mehrere Dokumente einer CAS-Abschlussarbeit konsistent verfügbar sein.
+* Eine kontrollierte projektübergreifende Wiederverwendung kann später geprüft werden; Speicherform und genaue Berechtigungsgrenzen sind noch offen.
 
 ### 🔮 Phase 6: Lokaler SLM-Triage-Layer (Geplant / Ausblick)
-* Optionaler Triage-Filter mit lokalem SLM (z. B. via Ollama / LM Studio) zur automatischen Vorfilterung von Grenzfall-Entitäten.
+* Optionaler lokaler LLM-/SLM-Prüflayer (z. B. via Ollama / LM Studio), der Begriffe, Kontext und Tabellenentscheidung gemeinsam bewertet und Empfehlungen für Entitätstyp, Anonymisierung, Glossar und Rolle abgibt.
+* Unterstützung bei schwierigen Fällen sowie optionaler Sicherheitscheck des bereits anonymisierten Dokuments auf verbliebene sensible Angaben.

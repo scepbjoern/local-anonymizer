@@ -1,0 +1,86 @@
+# LLM-Nutzung, Export und Wiederherstellung
+
+## Exportdateien
+
+Nach dem Review kannst du die anonymisierte Vorschau und die zugehörigen
+Informationen speichern. Beim vollständigen Export entstehen typischerweise:
+
+1. eine anonymisierte Text- oder Markdown-Datei;
+2. eine Mapping-Datei (`*_mapping.json`);
+3. ein Prüfbericht (`*_report.json`).
+
+Die anonymisierte Datei ist für die Weitergabe an ein externes LLM vorgesehen.
+Die Mapping-Datei enthält die Zuordnung zwischen Platzhaltern und Originalwerten
+und muss lokal beziehungsweise geschützt aufbewahrt werden.
+
+## Arbeit mit einem externen LLM
+
+Übermittle nur die anonymisierte Datei und deinen Arbeitsauftrag. Kontrolliere
+vorher, dass keine Originalnamen, E-Mail-Adressen, internen Systeme oder
+anderen vertraulichen Angaben in der Datei verblieben sind.
+
+### Wichtiger Hinweis zu den Platzhaltern
+
+Setze vor deinen eigentlichen Arbeitsauftrag mindestens diesen Satz:
+
+> Behandle alle Tokens im Format `[TYP_...]` als unveränderliche Platzhalter: Verändere, übersetze, lösche oder ersetze sie nicht und übernimm sie an allen passenden Stellen exakt.
+
+Bei längeren Aufgaben kannst du zusätzlich folgende Anweisung verwenden:
+
+```text
+Die Platzhalter im Dokument sind geschützt. Bitte verändere niemals ihre
+Schreibweise, Gross-/Kleinschreibung, eckigen Klammern, Unterstriche oder
+Nummern. Übersetze, lösche oder ersetze keine Platzhalter und erfinde keine
+neuen Platzhalter. Wenn du einen anonymisierten Namen, eine Organisation oder
+ein System erwähnst, verwende den vorhandenen Platzhalter exakt. Gib deine
+Antwort so zurück, dass alle vorhandenen Platzhalter erhalten bleiben.
+```
+
+Das ist eine wichtige Vorsichtsmassnahme, aber keine technische Garantie. Ein
+LLM kann Platzhalter trotzdem löschen, verändern oder inhaltlich ersetzen.
+Prüfe deshalb die Antwort vor der Wiederherstellung.
+
+### Beispiel für einen Arbeitsauftrag
+
+```text
+Bitte fasse den folgenden anonymisierten Text auf maximal 500 Wörter zusammen.
+Behalte die Kernaussagen und die Gliederung bei. Die Platzhalter sind geschützt
+und müssen exakt erhalten bleiben:
+
+Behandle alle Tokens im Format `[TYP_...]` als unveränderliche Platzhalter:
+Verändere, übersetze, lösche oder ersetze sie nicht und übernimm sie an allen
+passenden Stellen exakt.
+
+[ANONYMISIERTER TEXT HIER EINFÜGEN]
+```
+
+Verwende nicht versehentlich die Mapping-Datei als Teil dieses Auftrags.
+
+## Wiederherstellung
+
+Wechsle in den Tab **Wiederherstellen (De-Anonymize)** und lade:
+
+1. die Antwort des LLM als `.docx`, `.md` oder `.txt` beziehungsweise füge den
+   Text ein;
+2. die zugehörige Mapping-Datei (`.json`).
+
+Klicke danach auf **Dokument wiederherstellen**. Die Platzhalter werden durch
+die lokal gespeicherten Originalwerte ersetzt.
+
+![Tab für die Wiederherstellung mit Mapping-Datei](assets/03-wiederherstellung.png)
+
+*Auch in diesem Schritt bleibt die Mapping-Datei lokal und wird getrennt von
+der anonymisierten LLM-Datei behandelt.*
+
+Prüfe das Ergebnis anschliessend kurz auf:
+
+- unveränderte Platzhalter;
+- vom LLM umformulierte oder gelöschte Platzhalter;
+- Formatierungsänderungen;
+- Stellen, an denen der LLM-Inhalt bewusst vom Original abweicht.
+
+## Mapping und Bericht schützen
+
+Die Mapping-Datei ist kein gewöhnlicher Export für die Weitergabe. Bewahre sie
+getrennt von der anonymisierten Datei auf und teile sie nur, wenn die
+Originalwerte ausdrücklich benötigt werden.
