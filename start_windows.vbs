@@ -7,13 +7,14 @@ WshShell.CurrentDirectory = scriptDir
 
 ' Terminate any orphaned pythonw.exe instances to ensure clean port binding
 On Error Resume Next
-WshShell.Run "taskkill /f /im pythonw.exe", 0, True
+WshShell.Run "cmd /c taskkill /f /im pythonw.exe 2>nul", 0, True
 On Error GoTo 0
 
 pyExe = scriptDir & "\.venv\Scripts\pythonw.exe"
+appPy = scriptDir & "\app.py"
 If FSO.FileExists(pyExe) Then
     ' Launch main application directly (< 200ms instant UI, zero splash delay)
-    WshShell.Run """" & pyExe & """ app.py", 0, False
+    WshShell.Run """" & pyExe & """ """ & appPy & """", 0, False
 Else
     ' Fallback to uv
     WshShell.Run "uv run python app.py", 0, False
