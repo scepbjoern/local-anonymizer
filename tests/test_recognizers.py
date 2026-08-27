@@ -42,6 +42,17 @@ def test_fuzzy_glossary_exact_match_priority():
     assert zhaw_match.recognition_metadata["glossary_match"] == "direct"
 
 
+def test_glossary_exact_match_supports_punctuation():
+    recognizer = FuzzyGlossaryRecognizer(glossary={"eClaims+": "IT_SYSTEM"})
+    results = recognizer.analyze("Das System eClaims+ wurde aktualisiert.", entities=["IT_SYSTEM"])
+
+    match = next(r for r in results if r.entity_type == "IT_SYSTEM")
+    assert match.start == 11
+    assert match.end == 19
+    assert match.score == 1.0
+    assert match.recognition_metadata["glossary_match"] == "direct"
+
+
 def test_get_optimal_device():
     from local_anonymizer.recognizers import get_optimal_device
     device = get_optimal_device()

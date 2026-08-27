@@ -27,7 +27,7 @@ from fastapi import File, UploadFile
 from fastapi.responses import JSONResponse
 from nicegui import app, ui
 
-from local_anonymizer.anonymizer import clean_tag
+from local_anonymizer.anonymizer import REVIEW_SCORE_THRESHOLD, clean_tag
 from local_anonymizer.config import (
     AppConfig,
     CONFIG_DIR,
@@ -130,8 +130,19 @@ class EntityGroup:
         return len(self.occurrences)
 
     @property
-    def max_score(self) -> float:
-        return max((occ.score for occ in self.occurrences), default=0.0)
+    def score_range(self) -> Tuple[float, float]:
+        scores = [occ.score for occ in self.occurrences]
+        return (min(scores), max(scores)) if scores else (0.0, 0.0)
+
+    @property
+    def score_display(self) -> str:
+        """Display one score or the complete score range across all occurrences."""
+        if not self.occurrences:
+            return "–"
+        low, high = self.score_range
+        if len(self.occurrences) == 1:
+            return f"{high:.2f}"
+        return f"{low:.2f}–{high:.2f}"
 
     @property
     def needs_review(self) -> bool:
@@ -1170,7 +1181,7 @@ def create_ui():
                 orig = state.raw_text[res.start:res.end]
                 norm = orig.strip()
                 key = norm.lower()
-                needs_rev = 0.70 <= res.score < 0.85
+                needs_rev = res.score < REVIEW_SCORE_THRESHOLD
                 ctx_html = extract_context_snippet(state.raw_text, res.start, res.end)
 
                 source, method = classify_recognition_result(res)
@@ -1433,7 +1444,9 @@ def create_ui():
 
                                 # 5. Score & Action
                                 with ui.row().classes("items-center gap-2"):
-                                    ui.label(f"{master.max_score:.2f}").classes("text-xs font-mono text-slate-600")
+                                    ui.label(master.score_display).classes("text-xs font-mono text-slate-600").tooltip(
+                                        f"Score-Bereich über {master.count} Fundstellen"
+                                    )
                                     if master.needs_review:
                                         ui.badge("⚠️ Review", color="warning").props("dense")
                                     else:

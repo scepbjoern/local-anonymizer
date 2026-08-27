@@ -2,6 +2,7 @@
 
 import os
 import re
+import unicodedata
 import warnings
 
 # Disable noisy HuggingFace and transformers warnings for local CLI runs
@@ -443,15 +444,30 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
         if not text or not self.glossary:
             return []
 
-        # Tokenize text into words with start and end character offsets
+        # Find literal glossary terms first. This is intentionally independent from the word
+        # tokenizer below so terms containing punctuation (e.g. "eClaims+", "C++", ".NET")
+        # can still be classified as direct matches.
+        raw_candidates: List[Tuple[int, int, str, float, str, str]] = []  # (..., term, match_kind)
+        for canonical_term, entity_type in self.glossary.items():
+            if entities and entity_type not in entities:
+                continue
+            term = canonical_term.strip()
+            if not term:
+                continue
+            exact_pattern = re.compile(
+                r"(?<!\w)" + re.escape(term) + r"(?!\w)",
+                flags=re.IGNORECASE,
+            )
+            for match in exact_pattern.finditer(text):
+                raw_candidates.append(
+                    (match.start(), match.end(), entity_type, 1.0, canonical_term, "direct")
+                )
+
+        # Tokenize text into words with start and end character offsets for fuzzy matching.
         word_matches = list(re.finditer(r"\b[\w.-]+\b", text))
-        if not word_matches:
-            return []
 
         # Determine max number of words in glossary terms
-        max_glossary_words = max(len(term.split()) for term in self.glossary.keys())
-
-        raw_candidates: List[Tuple[int, int, str, float, str, str]] = []  # (..., term, match_kind)
+        max_glossary_words = max((len(term.split()) for term in self.glossary.keys()), default=0)
 
         num_words = len(word_matches)
         for i in range(num_words):
@@ -467,18 +483,26 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
                     if entities and entity_type not in entities:
                         continue
 
-                    # Exact match (Case-insensitive or Case-sensitive)
-                    if span_text.lower() == canonical_term.lower():
+                    # Skip short single-character noise
+                    if len(span_text) < 3 and len(canonical_term) < 3:
+                        continue
+
+                    # Literal matches were handled above. Normalize case and Unicode here so
+                    # equivalent whitespace/Unicode forms still receive a direct label when
+                    # they are represented by the tokenizer span.
+                    normalized_span = " ".join(
+                        unicodedata.normalize("NFKC", span_text).split()
+                    ).casefold()
+                    normalized_term = " ".join(
+                        unicodedata.normalize("NFKC", canonical_term).split()
+                    ).casefold()
+                    if normalized_span == normalized_term:
                         raw_candidates.append(
                             (start_char, end_char, entity_type, 1.0, canonical_term, "direct")
                         )
                         continue
 
-                    # Skip short single-character noise
-                    if len(span_text) < 3 and len(canonical_term) < 3:
-                        continue
-
-                    ratio = fuzz.ratio(span_text.lower(), canonical_term.lower())
+                    ratio = fuzz.ratio(normalized_span, normalized_term)
                     if ratio >= self.high_confidence_threshold:
                         raw_candidates.append(
                             (start_char, end_char, entity_type, 0.95, canonical_term, "fuzzy")

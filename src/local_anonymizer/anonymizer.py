@@ -54,6 +54,10 @@ DEFAULT_IGNORE_TERMS = [
     "Software", "System", "Systeme", "Plattform", "Plattformen", "Datenbank", "Datenbanken",
 ]
 
+# Scores below this threshold are uncertain enough to require human review. The lower bound
+# previously used by the UI hid especially weak predictions instead of flagging them.
+REVIEW_SCORE_THRESHOLD = 0.85
+
 
 def clean_tag(text: str) -> str:
     """Clean a role or surface tag to be uppercase alphanumeric with underscores."""
@@ -286,11 +290,12 @@ class LocalAnonymizer:
         self.glossary = glossary or {}
         self.gliner_threshold = gliner_threshold
 
-        # Combine user ignore terms with sensible default role/degree terms
-        combined_ignore = set(DEFAULT_IGNORE_TERMS)
-        if ignore_terms:
-            combined_ignore.update(ignore_terms)
-        self.ignore_terms = list(combined_ignore)
+        # Keep built-in safeguards separate from user terms: deliberate user ignores must take
+        # precedence over glossary entries, while an explicit glossary entry may still override
+        # a generic built-in safeguard such as "App" or "Email".
+        self.default_ignore_terms = list(DEFAULT_IGNORE_TERMS)
+        self.user_ignore_terms = list(ignore_terms or [])
+        self.ignore_terms = list(dict.fromkeys(self.default_ignore_terms + self.user_ignore_terms))
 
         # Explicitly preserve empty list [] vs None (None = all entities, [] = no entities)
         self.enabled_entities = list(enabled_entities) if enabled_entities is not None else None
@@ -378,10 +383,8 @@ class LocalAnonymizer:
 
     def set_ignore_terms(self, ignore_terms: Optional[Sequence[str]] = None) -> None:
         """Replace user ignore terms while retaining the built-in generic-term safeguards."""
-        combined_ignore = set(DEFAULT_IGNORE_TERMS)
-        if ignore_terms:
-            combined_ignore.update(ignore_terms)
-        self.ignore_terms = list(combined_ignore)
+        self.user_ignore_terms = list(ignore_terms or [])
+        self.ignore_terms = list(dict.fromkeys(self.default_ignore_terms + self.user_ignore_terms))
 
     def _annotate_detection_methods(self, results: List[RecognizerResult]) -> None:
         """Attach a stable source label to every result for transparent review display."""
@@ -407,8 +410,24 @@ class LocalAnonymizer:
 
     def add_ignore_term(self, term: str) -> None:
         """Add a term to the ignore list."""
-        if term not in self.ignore_terms:
-            self.ignore_terms.append(term)
+        if term not in self.user_ignore_terms:
+            self.user_ignore_terms.append(term)
+            self.ignore_terms = list(dict.fromkeys(self.default_ignore_terms + self.user_ignore_terms))
+
+    @staticmethod
+    def _find_term_spans(text: str, terms: Sequence[str]) -> List[Tuple[int, int]]:
+        """Return text spans matching terms, including terms containing punctuation."""
+        spans: List[Tuple[int, int]] = []
+        for term in terms:
+            clean_term = term.strip()
+            if not clean_term:
+                continue
+            pattern = re.compile(
+                r"(?<!\w)" + re.escape(clean_term) + r"(?!\w)",
+                re.IGNORECASE,
+            )
+            spans.extend((match.start(), match.end()) for match in pattern.finditer(text))
+        return spans
 
     def get_entity_source_overview(self) -> List[Dict[str, Any]]:
         """
@@ -515,14 +534,11 @@ class LocalAnonymizer:
                 on_progress(1.00, "Keine Entitäten aktiviert.")
             return []
 
-        # Find spans of ignore terms to exclude false positives (e.g. "CAS", "Studierende", "Unternehmen")
-        ignored_spans: List[Tuple[int, int]] = []
-        for term in self.ignore_terms:
-            if not term.strip():
-                continue
-            pattern = re.compile(r"\b" + re.escape(term.strip()) + r"\b", re.IGNORECASE)
-            for match in pattern.finditer(text):
-                ignored_spans.append((match.start(), match.end()))
+        # Find spans of ignore terms to exclude false positives. Built-in and user terms remain
+        # separate because they have different precedence relative to the explicit glossary.
+        default_ignored_spans = self._find_term_spans(text, self.default_ignore_terms)
+        user_ignored_spans = self._find_term_spans(text, self.user_ignore_terms)
+        ignored_spans = default_ignored_spans + user_ignored_spans
 
         if on_progress:
             on_progress(0.25, "KI-Modell & Presidio Erkennung läuft...")
@@ -567,19 +583,23 @@ class LocalAnonymizer:
             is_glossary_result = (r.recognition_metadata or {}).get("recognizer_name") == "FuzzyGlossaryRecognizer"
             if is_glossary_result and r.entity_type not in allowed_glossary_types:
                 continue
-            is_ignored = any(
+            is_default_ignored = any(
                 not (r.end <= ig_start or r.start >= ig_end)
-                for ig_start, ig_end in ignored_spans
+                for ig_start, ig_end in default_ignored_spans
             )
-            # An explicit glossary entry wins over a generic ignore term. This keeps built-in
-            # ignores useful for model noise without blocking deliberate user configuration.
-            if not is_ignored or is_glossary_result:
-                if (
-                    self.enabled_entities is None
-                    or r.entity_type in self.enabled_entities
-                    or is_glossary_result
-                ):
-                    filtered_results.append(r)
+            is_user_ignored = any(
+                not (r.end <= ig_start or r.start >= ig_end)
+                for ig_start, ig_end in user_ignored_spans
+            )
+            # User ignores always win. Glossary entries may only override built-in generic terms.
+            if is_user_ignored or (is_default_ignored and not is_glossary_result):
+                continue
+            if (
+                self.enabled_entities is None
+                or r.entity_type in self.enabled_entities
+                or is_glossary_result
+            ):
+                filtered_results.append(r)
 
         # 2. German gender suffix extension (e.g. "Veranlasser" + ":in" -> "Veranlasser:in", "Sachbearbeiter" + ":innen")
         for r in filtered_results:
@@ -848,7 +868,7 @@ class LocalAnonymizer:
             else:
                 placeholder = value_to_placeholder[key]
 
-            needs_review = 0.70 <= res.score < 0.85
+            needs_review = res.score < REVIEW_SCORE_THRESHOLD
             entity = DetectedEntity(
                 entity_type=res.entity_type,
                 original_text=orig_val,

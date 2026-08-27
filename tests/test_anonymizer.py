@@ -104,6 +104,34 @@ def test_builtin_generic_terms_are_ignored_but_explicit_glossary_wins(monkeypatc
     assert len(glossary_results) == 1
     assert glossary_results[0].entity_type == "IT_SYSTEM"
 
+
+def test_user_ignore_overrides_explicit_glossary(monkeypatch):
+    """A deliberate user ignore must remain authoritative over a glossary entry."""
+    anonymizer = LocalAnonymizer(
+        glossary={"Claims": "IT_SYSTEM"},
+        ignore_terms=["Claims"],
+        enabled_entities=[],
+    )
+
+    results = anonymizer.analyze("Claims")
+
+    assert results == []
+
+
+def test_low_score_detection_requires_review():
+    anonymizer = LocalAnonymizer()
+
+    from presidio_analyzer import RecognizerResult
+
+    def fake_analyze(text, on_progress=None):
+        return [RecognizerResult(entity_type="ORGANIZATION", start=0, end=5, score=0.66)]
+
+    anonymizer.analyze = fake_analyze
+    result = anonymizer.anonymize("Alpha")
+
+    assert result.entities[0].needs_review is True
+    assert result.entities[0] in result.review_needed
+
 def test_enabled_entities_none_allows_all():
     anonymizer = LocalAnonymizer(enabled_entities=None)
     # Should redact both
