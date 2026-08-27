@@ -5,6 +5,7 @@ Runs completely locally and offline with in-memory processing.
 
 import argparse
 import asyncio
+import base64
 import html
 import io
 import json
@@ -106,7 +107,7 @@ class AppState:
         self.format_mode: str = self.config.format_mode  # "numbered", "numbered_role", "role_only"
         self.export_format: str = self.config.export_format  # "txt", "md"
         self.gliner_threshold: float = self.config.gliner_threshold
-        self.sort_by: str = "Erstes Auftreten im Text"
+        self.sort_by: str = "Alphabetisch (A–Z)"  # Default alphabetical
         self.ignore_terms_text: str = self.config.ignore_terms
         self.glossary_text: str = self.config.glossary
         self.colliding_roles: Set[Tuple[str, str]] = set()
@@ -428,9 +429,9 @@ def create_ui():
     export_holder = None
     raw_text_area = None
     progress_holder = None
-    upload_ui_elem = None
     upload_status_label = None
-    file_badge_container = None
+    file_badge_card = None
+    file_badge_label = None
     analyze_btn = None
     reset_btn = None
     ignore_container = None
@@ -439,18 +440,13 @@ def create_ui():
     map_json_input = None
     restored_preview = None
 
-    def update_file_badge():
-        if file_badge_container is None:
-            return
-        file_badge_container.clear()
-        if state.filename:
-            with file_badge_container:
-                with ui.row().classes("items-center gap-2 bg-blue-100/90 border border-blue-300 rounded-lg px-3 py-1 text-xs text-blue-950"):
-                    ui.icon("description", size="xs").classes("text-blue-700")
-                    ui.label(f"{state.filename} ({len(state.raw_text)} Zeichen)").classes("font-bold font-mono")
-                    def remove_file():
-                        reset_workspace()
-                    ui.button(icon="close", on_click=remove_file).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-1").tooltip("Datei entfernen")
+    def update_file_badge_state():
+        if file_badge_card is not None and file_badge_label is not None:
+            if state.filename:
+                file_badge_label.set_text(f"{state.filename} ({len(state.raw_text)} Zeichen)")
+                file_badge_card.set_visibility(True)
+            else:
+                file_badge_card.set_visibility(False)
 
     def render_ignore_list_ui():
         if not ignore_container:
@@ -717,7 +713,7 @@ def create_ui():
                 progress_holder.clear()
 
     def load_content_into_workspace(text: str, filename: str):
-        """Unified workspace loader."""
+        """Unified workspace loader with instant reactive updates."""
         state.filename = filename
         state.raw_text = text
         if raw_text_area is not None:
@@ -726,56 +722,32 @@ def create_ui():
             analyze_btn.set_enabled(bool(text and text.strip()))
         if reset_btn is not None:
             reset_btn.set_visibility(bool(text and text.strip()))
-        if upload_ui_elem is not None:
-            upload_ui_elem.reset()
-        update_file_badge()
+        update_file_badge_state()
         if upload_status_label is not None:
             upload_status_label.set_visibility(False)
         ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen). Bitte auf 'Text & Dokument analysieren' klicken.", type="positive")
 
-    async def handle_upload(e):
-        if upload_status_label is not None:
-            upload_status_label.set_visibility(False)
+    def handle_dropped_file_event(e):
+        """Handle HTML5 drag-and-drop file event received from frontend."""
         try:
-            if hasattr(e, "file") and e.file is not None:
-                data = await e.file.read()
-                filename = e.file.name
-            elif hasattr(e, "content") and e.content is not None:
-                data = e.content.read()
-                filename = getattr(e, "name", "document")
-            else:
-                raise ValueError(f"Unbekanntes Upload-Format: {e}")
-
-            text = read_document_from_bytes(data, filename)
+            filename = e.args.get("filename", "dokument")
+            base64_str = e.args.get("base64", "")
+            raw_bytes = base64.b64decode(base64_str)
+            text = read_document_from_bytes(raw_bytes, filename)
             load_content_into_workspace(text, filename)
-
         except Exception as ex:
             err_msg = f"{type(ex).__name__}: {str(ex)}"
-            logging.error(f"Upload error: {err_msg}", exc_info=True)
-            ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000, close_button=True)
+            logging.error(f"Drop error: {err_msg}", exc_info=True)
+            ui.notify(f"Fehler beim Laden der abgelegten Datei: {err_msg}", type="negative", timeout=15000)
             if upload_status_label is not None:
-                upload_status_label.set_text(f"❌ Fehler beim Laden von '{getattr(e, 'name', 'Datei')}': {err_msg}")
+                upload_status_label.set_text(f"❌ Fehler: {err_msg}")
                 upload_status_label.classes("text-negative text-xs font-bold")
                 upload_status_label.set_visibility(True)
 
-    def handle_rejected(e):
-        details = ""
-        try:
-            if hasattr(e, "args") and e.args:
-                details = str(e.args)
-        except Exception:
-            pass
-        err_text = f"Upload abgelehnt: {details or 'Dateiformat oder Dateibeschränkung ungültig'}"
-        ui.notify(err_text, type="negative", timeout=15000)
-        if upload_status_label is not None:
-            upload_status_label.set_text(f"⚠️ {err_text}")
-            upload_status_label.classes("text-negative text-xs font-bold")
-            upload_status_label.set_visibility(True)
-        if upload_ui_elem is not None:
-            upload_ui_elem.reset()
+    ui.on("file_drop_event", handle_dropped_file_event)
 
     def open_native_file_dialog():
-        """Open native OS file picker with full lock-sharing support."""
+        """Open native OS file picker with full Win32 lock-sharing support."""
         try:
             import tkinter as tk
             from tkinter import filedialog
@@ -796,7 +768,7 @@ def create_ui():
             root.destroy()
             if filepath:
                 p = Path(filepath)
-                # safe_read_bytes opens with FILE_SHARE_READ | FILE_SHARE_WRITE so files currently open in Word load cleanly
+                # safe_read_bytes opens with FILE_SHARE_READ | FILE_SHARE_WRITE so files open in Word/OneDrive load cleanly
                 data = safe_read_bytes(p)
                 text = read_document_from_bytes(data, p.name)
                 load_content_into_workspace(text, p.name)
@@ -808,6 +780,8 @@ def create_ui():
                 upload_status_label.set_text(f"❌ Fehler beim Laden: {err_msg}")
                 upload_status_label.classes("text-negative text-xs font-bold")
                 upload_status_label.set_visibility(True)
+
+    ui.on("request_native_dialog", lambda _: open_native_file_dialog())
 
     def reset_workspace():
         """Reset raw text, filename, and analysis table."""
@@ -824,12 +798,9 @@ def create_ui():
             export_holder.clear()
         if table_holder is not None:
             table_holder.clear()
-        if upload_ui_elem is not None:
-            upload_ui_elem.reset()
-        if file_badge_container is not None:
-            file_badge_container.clear()
         if upload_status_label is not None:
             upload_status_label.set_visibility(False)
+        update_file_badge_state()
         if analyze_btn is not None:
             analyze_btn.set_enabled(False)
         if reset_btn is not None:
@@ -838,16 +809,18 @@ def create_ui():
 
     def get_sorted_groups() -> List[EntityGroup]:
         """Return entity groups sorted according to user selection."""
-        if state.sort_by == "Häufigkeit (meiste Treffer zuerst)":
+        if state.sort_by == "Alphabetisch (A–Z)":
+            return sorted(state.entity_groups, key=lambda g: g.original_text.lower())
+        elif state.sort_by == "Erstes Auftreten im Text":
+            return sorted(state.entity_groups, key=lambda g: g.first_start)
+        elif state.sort_by == "Häufigkeit (meiste Treffer zuerst)":
             return sorted(state.entity_groups, key=lambda g: (-g.count, g.first_start))
         elif state.sort_by == "Entitätstyp (PERSON, ORG, ...)":
             return sorted(state.entity_groups, key=lambda g: (g.entity_type, g.original_text.lower()))
-        elif state.sort_by == "Alphabetisch (A–Z)":
-            return sorted(state.entity_groups, key=lambda g: g.original_text.lower())
         elif state.sort_by == "⚠️ Review-Bedarf zuerst":
             return sorted(state.entity_groups, key=lambda g: (not g.needs_review, -g.count, g.first_start))
         else:
-            return sorted(state.entity_groups, key=lambda g: g.first_start)
+            return sorted(state.entity_groups, key=lambda g: g.original_text.lower())
 
     def build_review_table():
         if not table_holder:
@@ -876,10 +849,10 @@ def create_ui():
 
                     ui.select(
                         options=[
+                            "Alphabetisch (A–Z)",
                             "Erstes Auftreten im Text",
                             "Häufigkeit (meiste Treffer zuerst)",
                             "Entitätstyp (PERSON, ORG, ...)",
-                            "Alphabetisch (A–Z)",
                             "⚠️ Review-Bedarf zuerst",
                         ],
                         value=state.sort_by,
@@ -1220,25 +1193,32 @@ def create_ui():
                 with ui.tab_panel(tab_anonymize):
                     ui.label("Stufe 1: Dokument laden & Text-Eingabe").classes("text-base font-bold text-slate-800 mb-1")
                     
-                    # Modern Unified Drop-Zone with Native Click & Drag-Drop
-                    with ui.card().classes("w-full p-4 bg-slate-50 border-2 border-dashed border-blue-300 hover:border-blue-500 transition-colors rounded-xl mb-3 shadow-none"):
-                        with ui.row().classes("w-full items-center justify-between gap-4 flex-wrap"):
-                            with ui.row().classes("items-center gap-3 cursor-pointer flex-grow").on("click", open_native_file_dialog):
-                                ui.icon("cloud_upload", size="lg").classes("text-primary")
-                                with ui.column().classes("gap-0"):
-                                    ui.label("Datei hier ablegen oder zum Auswählen klicken").classes("text-sm font-bold text-slate-800")
-                                    ui.label("Unterstützt Word (.docx), PDF, Text (.txt, .md), CSV und JSON • Automatische Struktur-Erkennung").classes("text-xs text-slate-500")
+                    # 100% Unified HTML5 Drop-Zone (Click to pick OR drag-and-drop directly anywhere onto the box)
+                    ui.html("""
+                    <div id="unified_dropzone"
+                         onclick="emitEvent('request_native_dialog')"
+                         ondragover="event.preventDefault(); this.style.borderColor='#2563eb'; this.style.backgroundColor='#eff6ff';"
+                         ondragleave="this.style.borderColor='#93c5fd'; this.style.backgroundColor='#f8fafc';"
+                         ondrop="event.preventDefault(); this.style.borderColor='#93c5fd'; this.style.backgroundColor='#f8fafc'; if(event.dataTransfer.files.length > 0) { const f = event.dataTransfer.files[0]; const r = new FileReader(); r.onload = (e) => emitEvent('file_drop_event', { filename: f.name, base64: e.target.result.split(',')[1] }); r.readAsDataURL(f); }"
+                         style="width: 100%; padding: 1.5rem 1rem; background-color: #f8fafc; border: 2px dashed #93c5fd; border-radius: 0.75rem; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; cursor: pointer; transition: all 0.15s ease-in-out; margin-bottom: 0.75rem;">
+                        <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.25rem;">
+                            <span class="q-icon material-icons" style="font-size: 1.75rem; color: #1976d2;">cloud_upload</span>
+                            <span style="font-size: 0.95rem; font-weight: 700; color: #1e293b;">Datei hier ablegen oder zum Auswählen klicken</span>
+                        </div>
+                        <span style="font-size: 0.75rem; color: #64748b;">Unterstützt Word (.docx), PDF, Text (.txt, .md), CSV und JSON • Automatische Struktur-Erkennung</span>
+                    </div>
+                    """).classes("w-full")
 
-                            with ui.row().classes("items-center gap-2"):
-                                upload_ui_elem = ui.upload(
-                                    on_upload=handle_upload,
-                                    on_rejected=handle_rejected,
-                                    auto_upload=True,
-                                ).props("outlined dense flat").classes("w-52")
+                    # Document info badge when loaded (with remove button)
+                    with ui.row().classes("w-full mb-2 items-center gap-2") as file_badge_card:
+                        file_badge_card.set_visibility(False)
+                        with ui.row().classes("items-center gap-2 bg-blue-100 border border-blue-300 rounded-lg px-3 py-1 text-xs text-blue-950"):
+                            ui.icon("description", size="xs").classes("text-blue-700")
+                            file_badge_label = ui.label("").classes("font-bold font-mono")
+                            ui.button(icon="close", on_click=reset_workspace).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-1").tooltip("Geladenes Dokument entfernen")
 
-                        file_badge_container = ui.row().classes("w-full mt-2 items-center gap-2")
-                        upload_status_label = ui.label("").classes("text-xs font-bold mt-1")
-                        upload_status_label.set_visibility(False)
+                    upload_status_label = ui.label("").classes("text-xs font-bold mb-2")
+                    upload_status_label.set_visibility(False)
 
                     with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note", value=True).classes("w-full mb-2"):
                         def on_raw_text_change(e):
@@ -1382,27 +1362,33 @@ def create_ui():
                         with ui.column().classes("flex-1"):
                             ui.label("1. LLM-Antwort (Text oder Dokument):").classes("font-semibold text-xs text-slate-700")
 
-                            async def handle_restore_file_upload(e):
+                            def open_restore_file_dialog():
                                 try:
-                                    if hasattr(e, "file") and e.file is not None:
-                                        data = await e.file.read()
-                                        filename = e.file.name
-                                    elif hasattr(e, "content") and e.content is not None:
-                                        data = e.content.read()
-                                        filename = getattr(e, "name", "document")
-                                    else:
-                                        raise ValueError("Unbekanntes Upload-Format")
-                                    text = read_document_from_bytes(data, filename)
-                                    state.restore_anon_text = text
-                                    restore_anon_input.value = text
-                                    ui.notify(f"LLM-Antwort '{filename}' geladen ({len(text)} Zeichen).", type="positive")
+                                    import tkinter as tk
+                                    from tkinter import filedialog
+                                    root = tk.Tk()
+                                    root.withdraw()
+                                    root.attributes("-topmost", True)
+                                    filepath = filedialog.askopenfilename(
+                                        title="Anonymisierte LLM-Antwort auswählen",
+                                        filetypes=[
+                                            ("Dokumente (*.docx, *.pdf, *.txt, *.md)", "*.docx;*.pdf;*.txt;*.md"),
+                                            ("Alle Dateien (*.*)", "*.*"),
+                                        ]
+                                    )
+                                    root.destroy()
+                                    if filepath:
+                                        p = Path(filepath)
+                                        raw_b = safe_read_bytes(p)
+                                        text = read_document_from_bytes(raw_b, p.name)
+                                        state.restore_anon_text = text
+                                        if restore_anon_input is not None:
+                                            restore_anon_input.value = text
+                                        ui.notify(f"LLM-Antwort '{p.name}' geladen ({len(text)} Zeichen).", type="positive")
                                 except Exception as ex:
                                     ui.notify(f"Fehler beim Laden: {str(ex)}", type="negative")
 
-                            ui.upload(
-                                on_upload=handle_restore_file_upload,
-                                auto_upload=True,
-                            ).props("outlined dense flat").classes("w-full mb-2")
+                            ui.button("📂 LLM-Datei auswählen...", icon="folder_open", on_click=open_restore_file_dialog, color="primary").props("unelevated dense size=sm").classes("mb-2")
 
                             def on_anon_change(e):
                                 state.restore_anon_text = e.value
@@ -1415,22 +1401,33 @@ def create_ui():
                         with ui.column().classes("flex-1"):
                             ui.label("2. Mapping-Tabelle (.json):").classes("font-semibold text-xs text-slate-700")
 
-                            async def on_map_upload(e):
+                            def open_mapping_file_dialog():
                                 try:
-                                    if hasattr(e, "file") and e.file is not None:
-                                        data = await e.file.read()
-                                    elif hasattr(e, "content") and e.content is not None:
-                                        data = e.content.read()
-                                    else:
-                                        raise ValueError("Unbekanntes Upload-Format")
-                                    mapping_data = json.loads(data.decode("utf-8"))
-                                    state.restore_mapping = mapping_data
-                                    map_json_input.value = json.dumps(mapping_data, indent=2, ensure_ascii=False)
-                                    ui.notify("Mapping-Tabelle geladen.", type="positive")
+                                    import tkinter as tk
+                                    from tkinter import filedialog
+                                    root = tk.Tk()
+                                    root.withdraw()
+                                    root.attributes("-topmost", True)
+                                    filepath = filedialog.askopenfilename(
+                                        title="Mapping-Datei auswählen",
+                                        filetypes=[
+                                            ("JSON-Dateien (*.json)", "*.json"),
+                                            ("Alle Dateien (*.*)", "*.*"),
+                                        ]
+                                    )
+                                    root.destroy()
+                                    if filepath:
+                                        p = Path(filepath)
+                                        raw_b = safe_read_bytes(p)
+                                        mapping_data = json.loads(raw_b.decode("utf-8"))
+                                        state.restore_mapping = mapping_data
+                                        if map_json_input is not None:
+                                            map_json_input.value = json.dumps(mapping_data, indent=2, ensure_ascii=False)
+                                        ui.notify("Mapping-Tabelle geladen.", type="positive")
                                 except Exception as ex:
                                     ui.notify(f"Ungültige JSON-Mapping-Datei: {str(ex)}", type="negative")
 
-                            ui.upload(on_upload=on_map_upload, auto_upload=True).props("outlined dense flat").classes("w-full mb-2")
+                            ui.button("📂 Mapping (.json) auswählen...", icon="folder_open", on_click=open_mapping_file_dialog, color="primary").props("unelevated dense size=sm").classes("mb-2")
 
                             def on_map_text_change(e):
                                 try:
