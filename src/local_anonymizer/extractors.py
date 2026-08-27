@@ -558,6 +558,19 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
                 cleaned_lines.append("| " + " | ".join(c.strip() for c in cells) + " |")
                 continue
             cleaned_cells = [clean_markdown_table_cell(c) for c in cells]
+
+            # Heal split table cells from indented TOC (Inhaltsverzeichnis) columns
+            # Pattern: 4 columns where col0 is chapter number, col1 is word prefix, col2 is word suffix starting with lowercase, col3 is page number
+            if len(cleaned_cells) == 4:
+                col0, col1, col2, col3 = cleaned_cells
+                if (
+                    re.match(r"^(?:\d+|[A-ZIVXLCDM]+)$", col0)
+                    and re.match(r"^[A-Za-zÄÖÜäöüß]+$", col1)
+                    and re.match(r"^[a-zäöüß]", col2)
+                    and re.match(r"^(?:\d+|[ivxlcdmIVXLCDM]+|[-–—])$", col3)
+                ):
+                    cleaned_cells = [col0, "", col1 + col2, col3]
+
             cleaned_lines.append("| " + " | ".join(cleaned_cells) + " |")
         else:
             # Outside tables: convert any remaining <br> to newlines, but DO NOT run PascalCase separation on normal text!

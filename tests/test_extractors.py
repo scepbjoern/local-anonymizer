@@ -456,5 +456,31 @@ def test_strip_html_markup():
     assert cleaned == "Hier ist wichtiger Text und unterstrichenes Wort sowie roter Text."
 
 
+def test_clean_extracted_pdf_markdown_toc_table_healing():
+    """Verify indented TOC table column splits (e.g. 'Proz | essidentifikation') are healed cleanly."""
+    from local_anonymizer.extractors import clean_extracted_pdf_markdown
+
+    raw_toc = (
+        "# **Inhaltsverzeichnis**\n\n"
+        "| 1 | Proz | essidentifikation | 1 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| | 1.1 | Unternehmenskontext | 1 |\n"
+        "| | 1.2 | Einbettung in Prozessarchitektur | 3 |\n"
+        "| 2 | Proz | esserhebung | 6 |\n"
+        "| | 2.1 | Verwendete Systeme | 6 |\n"
+        "| 6 | Anh | ang | 14 |\n"
+        "| | 6.1 | Glossar | 14 |\n"
+    )
+
+    cleaned = clean_extracted_pdf_markdown(raw_toc)
+
+    assert "| 1 | | Prozessidentifikation | 1 |" in cleaned
+    assert "| | 1.1 | Unternehmenskontext | 1 |" in cleaned
+    assert "| 2 | | Prozesserhebung | 6 |" in cleaned
+    assert "| 6 | | Anhang | 14 |" in cleaned
+    assert "Proz | ess" not in cleaned
+    assert "Anh | ang" not in cleaned
+
+
 
 
