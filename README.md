@@ -11,7 +11,14 @@ Für die praktische Nutzung steht ein deutschsprachiger [Benutzerleitfaden](docs
 ## ✨ Key Features
 
 - **🛡️ 100% Local & Private:** All entity detection, mapping, and text transformations run completely on your local machine. No data or telemetry leaves your computer.
-- **🤖 Zero-Shot Multilingual PII Detection:** Powered by [GLiNER](https://github.com/urchade/GLiNER) (`urchade/gliner_multi_pii-v1`) with intelligent sentence-boundary-aware chunking for German and English PII extraction without document length limits.
+- **🤖 Dual-Model Hybrid AI Ensemble:**
+  - **GLiNER Zero-Shot (`urchade/gliner_multi_pii-v1`):** Flexible extraction of organizations, roles, and open-vocabulary entities with chunking for arbitrary text lengths.
+  - **European PII Classifier (`bardsai/eu-pii-anonimization-multilang`):** Specialized Token-Classification model for high-precision European person names, locations, IDs, and health data.
+- **⚖️ 4-Tier Source Priority Hierarchy:**
+  - `Tier 4 (Highest):` User Glossary & Project Vocabulary (Exact & Fuzzy)
+  - `Tier 3:` Deterministic Libraries & Validators (Google `phonenumbers`, Checksum-validated AHV, UID, IBAN, Email, Address Regex)
+  - `Tier 2:` Specialized EU-PII Model (High precision on `PERSON`, `LOCATION`, `ID_NUMBER`, `HEALTH_DATA`)
+  - `Tier 1:` GLiNER Zero-Shot Model (`ORGANIZATION`, `ROLE`, and fallback safety net)
 - **🏷️ 3 Semantic Placeholder Modes:**
   - **Modus 1 (Classic):** `[PERSON_1]`, `[ORGANIZATION_1]`
   - **Modus 2 (Numbered + Role, Recommended):** `[PERSON_1_STUDENT]`, `[ORGANIZATION_1_ZULIEFERER]`
@@ -22,7 +29,7 @@ Für die praktische Nutzung steht ein deutschsprachiger [Benutzerleitfaden](docs
 - **🚫 Interactive Ignore Lists:** Exclude generic roles, academic degrees, or product names that should never be scrubbed (e.g., `"CAS"`, `"BSc"`, `"Dozent"`).
 - **👔 Optional Role Detection:** `ROLE` recognizes job titles such as `CEO`, `CFO`, or `Leiter Prozessmanagement`; it is off by default because process roles are often meaningful content.
 - **🇨🇭 Deterministic Swiss/CH-PII Detection:** Recognizes Swiss/German addresses plus checksum-validated AHV and CHE/UID numbers; internal IT systems are supported through the glossary and GLiNER safety-net prompts.
-- **🔎 Transparent Review Sources:** Each finding shows whether it came from AI, Regex, a local library, the glossary (direct or fuzzy), or a manual marking. Icon actions can ignore a group, add it permanently to the glossary, or mark it only for the current run.
+- **🔎 Transparent Review Sources & Bulk Toggles:** Each finding shows whether it came from `🤖 GLiNER`, `🤖 EU-PII`, `🔤 Regex`, `📚 Bibliothek` (Google `phonenumbers`), `📖 Glossar` (direct/fuzzy), or `✍ Manuell`. The toolbar includes "Alle aktivieren", "Alle abwählen" and an interactive "Alle aufklappen / zuklappen" toggle.
 - **📄 Multi-Format Document Support:** Structured text and Markdown extraction for Word `.docx`, `.pdf`, `.csv`, `.json`, `.txt`, and `.md` with robust multi-encoding fallback (`utf-8-sig`, `cp1252`, `iso-8859-15`).
 - **📊 Advanced PDF-to-Markdown Extraction:** Structured Markdown extraction powered by PyMuPDF RAG (preserving headers, lists, bold/italic, and clean tables without tearing words across columns), picture text toggle, and recurring header/footer suppression with Page-1 title protection.
 - **🖥️ Native Desktop GUI:** Responsive, instant-startup NiceGUI interface running as a native desktop window (with `--browser` option for web workflows).
@@ -106,6 +113,17 @@ The CLI provides two primary commands: `anonymize` and `restore`.
 
 Scrub sensitive information from `.docx`, `.pdf`, `.csv`, `.json`, `.txt`, or `.md` files:
 
+
+---
+
+### 3. Command Line Interface (CLI)
+
+The CLI provides two primary commands: `anonymize` and `restore`.
+
+#### Step 1: Anonymize a Document
+
+Scrub sensitive information from `.docx`, `.pdf`, `.csv`, `.json`, `.txt`, or `.md` files:
+
 ```bash
 uv run cli.py anonymize path/to/document.docx
 ```
@@ -121,6 +139,8 @@ uv run cli.py anonymize path/to/document.docx --config config.example.json
 - `--output-dir`, `-o`: Directory to save outputs (default: same directory as input).
 - `--no-mapping`: Permanent non-reversible scrubbing (no mapping file generated).
 - `--language`, `-l`: Language code (default: `de`).
+- `--enable-eupii` / `--disable-eupii`: Toggle the European PII token classification model (`bardsai/eu-pii-anonimization-multilang`).
+- `--eupii-threshold`: Score threshold for EU-PII predictions (default: `0.50`).
 
 **Generated Files:**
 1. `<name>_anonymized.txt` (or `.md`): Anonymized document ready for LLM prompts.
@@ -164,7 +184,10 @@ Customize detection behavior using a simple JSON file:
 {
   "language": "de",
   "format_mode": "numbered_role",
-  "gliner_threshold": 0.35,
+  "gliner_threshold": 0.55,
+  "enable_eupii": true,
+  "eupii_threshold": 0.50,
+  "eupii_model_name": "bardsai/eu-pii-anonimization-multilang",
   "enabled_entities": [
     "PERSON",
     "ORGANIZATION",
@@ -175,6 +198,8 @@ Customize detection behavior using a simple JSON file:
     "ADDRESS",
     "AHV_NUMBER",
     "UID_NUMBER",
+    "ID_NUMBER",
+    "HEALTH_DATA",
     "IT_SYSTEM"
   ],
   "enabled_glossary_entities": [
@@ -200,6 +225,8 @@ Customize detection behavior using a simple JSON file:
 ```
 
 - **`format_mode`**: Select `numbered` (`[TYP_NR]`), `numbered_role` (`[TYP_NR_ROLLE]`), or `role_only` (`[TYP_ROLLE]`).
+- **`enable_eupii`**: Enable or disable the local European PII token classification model (default: `true`).
+- **`eupii_threshold`**: Minimum confidence score for EU-PII detections (default: `0.50`).
 - **`enabled_entities`**: Choose which entity categories general AI/library/regex detection should inspect and mask.
 - **`enabled_glossary_entities`**: Choose which categories may use explicit glossary entries. An empty list disables glossary matching completely; in the GUI this is the `Aus` mode.
 - **`glossary`**: Explicitly map internal acronyms and company names to entity types. Allowed explicit entries take precedence over generic built-in ignore terms.
@@ -217,6 +244,7 @@ from local_anonymizer.pipeline import AnonymizationPipeline
 # Initialize pipeline
 pipeline = AnonymizationPipeline(
     language="de",
+    enable_eupii=True,
     glossary={"abcd": "PERSON", "ZHAW": "ORGANIZATION"},
     ignore_terms=["CAS"],
     enabled_entities=["PERSON", "ORGANIZATION", "EMAIL_ADDRESS", "PHONE_NUMBER", "IBAN_CODE"],
@@ -225,8 +253,7 @@ pipeline = AnonymizationPipeline(
 
 # 1. Anonymize document
 result = pipeline.process_file("contract.docx")
-print("Anonymized Text:
-", result.anonymization_result.anonymized_text)
+print("Anonymized Text:\n", result.anonymization_result.anonymized_text)
 
 # (Send result.anonymization_result.anonymized_text to LLM...)
 
@@ -251,13 +278,13 @@ Input Document (.docx / .pdf / .csv / .json / .txt / .md)
          │
          ▼
  ┌────────────────────────────────────────────────────────┐
- │ Presidio Analyzer + Chunking Engine                    │
- │  ├── GLiNER Zero-Shot Recognizer (Multi-PII)           │
- │  ├── RapidFuzz Custom Glossary Recognizer              │
- │  ├── CH/DE Address & Swiss Checksum Recognizers        │
- │  ├── IT-System Prompts (Glossary + GLiNER fallback)    │
+ │ Presidio Analyzer + Ensemble Engine                    │
+ │  ├── EU-PII Classifier (bardsai/eu-pii, Tier 2)        │
+ │  ├── GLiNER Zero-Shot Recognizer (Multi-PII, Tier 1)   │
+ │  ├── RapidFuzz Custom Glossary Recognizer (Tier 4)     │
+ │  ├── Swiss Checksum Recognizers (AHV, UID, IBAN)       │
+ │  ├── CH/DE Address Regex & Google phonenumbers (Tier 3)│
  │  ├── Gender Suffix Handler & Sentence Splitter         │
- │  └── Ignore-Terms & Entity-Type Filter                 │
  └────────────────────────────────────────────────────────┘
          │
          ▼

@@ -82,19 +82,29 @@
   Beide Pfade sind durch `try...finally`-Sofortlöschung, Startup-Bereinigung (`cleanup_temp_uploads` / `cleanup_extraction_temp_files`) sowie `atexit`-Handler gegen verwaiste Dateien abgesichert.
 - **Fehlerbehandlung:** Bildbasierte PDFs ohne Textlayer werden über `doc.page_count > 0 and not pages_text` erkannt und werfen `ValueError` mit klarer OCR-Hinweismeldung. Bei mehrseitigen PDFs fängt eine 3-Stufen-Fehlerbehandlung Einzelseitenfehler ab, ohne das Gesamtdokument abzubrechen.
 
-### 2.2 Presidio Analyzer & Custom Recognizers (`recognizers.py`)
-- **`GLiNERRecognizer`:**
+### 2.2 Presidio Analyzer, Dual-Modell-Ensemble & Custom Recognizers (`recognizers.py`)
+- **`EUPiiRecognizer` (Stufe 2):**
+  - Kapselt das vortrainierte europäische PII-Modell `bardsai/eu-pii-anonimization-multilang` (XLM-RoBERTa Token-Klassifikation).
+  - Selektiv aktiviert für 4 hochpräzise Kernkategorien: `PERSON`, `LOCATION`, `ID_NUMBER` und `HEALTH_DATA`.
+  - Nutzt Fast-Tokenizer-Windowing (`max_length=384`, `stride=64`), BIO-Tag-Aggregation mit subtoken-präziser Wortfortführung und Deduplizierung.
+  - Führt vorab eine kanonische Schutzprüfung auf dem Volltext durch (`_get_protected_deterministic_spans`): Überlappt ein ML-Span mit einem gültigen AHV-, UID-, IBAN-, E-Mail-, Adress-, URL-, Datums- oder Telefon-Treffer, wird er verworfen.
+  - Verwaltet Offline-First-Zustände thread-sicher über den atomaren Kontextmanager `set_huggingface_offline_mode(offline)` unter `_HF_HUB_LOCK` mit exakter Snapshot-Wiederherstellung.
+- **`GLiNERRecognizer` (Stufe 1):**
   - Kapselt `urchade/gliner_multi_pii-v1`.
   - Hält ein Singleton-Klassen-Cache `_MODEL_CACHE`, sodass das PyTorch-Modell nur ein einziges Mal in den RAM geladen wird.
   - Wendet `chunk_text_with_offsets` an, um das 384-Token-Limit von DeBERTa/GLiNER ohne Informationsverlust zu handhaben.
   - Verwendet für `PERSON` präzisere Prompts wie `person's proper name`, `named person` und `proper name`, um generische Rollennomen weniger häufig zu erfassen. `ROLE`/`JOB_TITLE` nutzt die Prompts `job title`, `professional role` und `position` in einem getrennten Modellpass und ist standardmässig deaktiviert.
+  - Dient als Primärmodell für `ORGANIZATION` und `ROLE` sowie als flexibles Sicherheitsnetz für offene/ungewöhnliche Diagnosen.
+- **4-Stufen Quellenhierarchie (Source Priority):**
+  - Bei überlappenden Spans gilt strikt: `Glossar (Stufe 4)` > `Deterministisch / Validatoren / Bibliothek (Stufe 3)` > `EU-PII (Stufe 2)` > `GLiNER (Stufe 1)`.
 - **`is_sentence_boundary`:**
   - Schützt deutsche und englische Standardabkürzungen (`Dr.`, `Prof.`, `Bahnhofstr.`, `Nr.`, `14. Juli`), damit Sätze nicht mitten im Eigennamen zerschnitten werden.
-- **`FuzzyGlossaryRecognizer`:**
+- **`FuzzyGlossaryRecognizer` (Stufe 4):**
   - Nutzt `rapidfuzz.fuzz.ratio` mit Schwellenwerten (High Confidence $\ge 90\%$, Review-Bedarf $\ge 75\%$).
   - Bevorzugt exakte Treffer (Score 1.0) vor Fuzzy-Treffern.
   - Explizite Glossar-Treffer werden gemäss der Kategorie-Richtlinie separat zugelassen oder vollständig blockiert. Sie können eingebaute generische Ignore-Begriffe bewusst überschreiben; persönliche Ignore-Einträge behalten immer Vorrang.
-- **Deterministische Phase-B-Recognizer:**
+- **Deterministische Recognizer & Bibliotheken (Stufe 3):**
+  - `ValidatedPhoneRecognizer` bindet Google `phonenumbers` (`libphonenumber`) mit vollem Ländercode- und Prüfziffern-Support ein und vergibt den autoritativen Score 1.0, sodass Telefonnummern nicht durch KI-Zero-Shot-Scores verdrängt werden.
   - `AddressPatternRecognizer` erkennt zusammenhängende Schweizer und deutsche Adressen per Regex und weist die bekannte Kollision zwischen vierstelliger Schweizer PLZ und Jahreszahl konservativ zurück.
   - `AHVNumberRecognizer` validiert die AHV-Kontrollziffer; `UIDNumberRecognizer` validiert CHE/UID nach Modulo 11. Formal korrekte, aber prüfziffern-ungültige Nummern werden nicht als Entitäten ausgegeben.
   - `IT_SYSTEM` wird über das dynamisch aus dem Glossar abgeleitete Zieltypenset sowie separate GLiNER-Sicherheitsnetz-Prompts erkannt.

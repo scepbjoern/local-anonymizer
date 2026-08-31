@@ -23,15 +23,15 @@ musst du die Analyse nochmals starten.
 
 ## Erkennungsmethoden
 
-Bei jeder Fundstelle wird die Methode angezeigt. Typische Angaben sind:
+Bei jeder Fundstelle wird die konkrete Erkennungsquelle transparent angezeigt:
 
-- **KI**: kontextbasierte Erkennung durch GLiNER;
-- **Regex**: deterministisches Muster, beispielsweise für bestimmte
-  Adress- oder Identifikatorformate;
-- **Bibliothek**: Erkennung durch eine eingebundene Standardbibliothek;
-- **Glossar · direkt**: exakte Übereinstimmung mit deiner Begriffsliste;
-- **Glossar · Fuzzy**: fehlertolerante Ähnlichkeitsübereinstimmung;
-- **Manuell**: von dir für diesen Lauf markierte Fundstelle.
+- **🤖 GLiNER**: flexibles Zero-Shot-KI-Modell (besonders für Organisationen, Rollen und als Ergänzungsnetz);
+- **🤖 EU-PII**: spezialisierter europäischer Token-Klassifikator mit Spitzenpräzision für Namen, Orte, Ausweis-IDs und Diagnosen;
+- **🔤 Regex**: deterministisches Muster (z. B. für Prüfziffern-validierte AHV-, UID- oder IBAN-Nummern sowie E-Mail- und Adressmuster);
+- **📚 Bibliothek**: Erkennung durch eine lokale Fachbibliothek (z. B. Google `phonenumbers` für Schweizer und internationale Telefonnummern);
+- **📖 Glossar · direkt**: exakte Übereinstimmung mit deiner Begriffsliste;
+- **📖 Glossar · Fuzzy**: fehlertolerante Ähnlichkeitsübereinstimmung;
+- **✍ Manuell**: von dir für diesen Lauf markierte Fundstelle.
 
 Ein Glossar-Treffer mit Sonderzeichen, etwa `eClaims+`, kann direkt sein, wenn
 der Eintrag exakt so in der Begriffsliste steht.
@@ -54,15 +54,12 @@ Kontext.
 Fundstellen. Für eine Entscheidung sollte zusätzlich der aufgeklappte Kontext
 geprüft werden.*
 
-## Treffer für den aktuellen Lauf ändern
+## Treffer für den aktuellen Lauf ändern & Schnellaktionen
 
-Mit dem Kontrollkästchen links kannst du eine ganze Gruppe aus der aktuellen
-Anonymisierung herausnehmen. Das ändert noch nicht automatisch die dauerhafte
-Ignore-Liste.
-
-Für einzelne Fundstellen kannst du den Kontext aufklappen. Dort siehst du den
-konkreten Textausschnitt und kannst die Fundstelle separat aktivieren oder
-deaktivieren, soweit dies für den aktuellen Eintrag vorgesehen ist.
+- **Alle aufklappen / zuklappen:** Über die Schaltfläche in der Aktionsleiste oberhalb der Tabelle kannst du mit einem Klick sämtliche Fundstellen-Kontexte aller Zeilen gleichzeitig öffnen oder wieder schliessen.
+- **Alle aktivieren / Alle abwählen:** Schaltet sämtliche erkannten Gruppen auf einmal ein oder aus.
+- **Gruppe aktivieren/deaktivieren:** Mit dem Kontrollkästchen links kannst du eine einzelne Gruppe aus der aktuellen Anonymisierung herausnehmen. Das ändert noch nicht die dauerhafte Ignore-Liste.
+- **Kontext prüfen:** Für einzelne Fundstellen klappst du die Zeile auf. Dort siehst du den konkreten Textausschnitt, die genaue Erkennungsmethode und den Konfidenzwert.
 
 ## Ignore-Liste
 

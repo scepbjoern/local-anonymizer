@@ -43,17 +43,23 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 
 ---
 
-### 4.2 Feature 2: Hybride Entitätserkennung (Zero-Shot NER & Glossar) *(Umgesetzt)*
+### 4.2 Feature 2: Hybride Dual-Modell-Entitätserkennung (GLiNER + EU-PII + Presidio + Glossar) *(Umgesetzt)*
 
-* **Multilinguales Zero-Shot NER:** Basiert auf [GLiNER](https://github.com/urchade/GLiNER) (`urchade/gliner_multi_pii-v1`) zur Erkennung von:
-  * `PERSON`, `ORGANIZATION`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `LOCATION`, `DATE_TIME`, `IBAN_CODE`, `CREDIT_CARD`, `ID_NUMBER`, `FINANCIAL_DATA`, `HEALTH_DATA`, `IP_ADDRESS`, `IT_SYSTEM` und optional `ROLE`.
+* **Dual-Modell KI-Ensemble:**
+  * **EU-PII Token-Klassifikator (`bardsai/eu-pii-anonimization-multilang`):** Spezialisiertes RoBERTa-Modell für höchste Präzision bei europäischen Personennamen (`PERSON`), Orten (`LOCATION`), Dokumenten-IDs (`ID_NUMBER`) und Diagnosen (`HEALTH_DATA`).
+  * **GLiNER Zero-Shot NER (`urchade/gliner_multi_pii-v1`):** Flexible Erkennung von `ORGANIZATION`, `ROLE`, offenen Kategorien und Sicherheitsnetz bei verpassten Diagnosen.
+* **4-Stufen Quellenhierarchie (Source Priority Hierarchy):**
+  * `Stufe 4 (Höchste Priorität):` Projekt-Glossar & Begriffsliste (`FuzzyGlossaryRecognizer`)
+  * `Stufe 3:` Deterministische Validatoren & Bibliotheken (Google `phonenumbers`, Prüfziffern-validierte AHV-, UID- und IBAN-Nummern, E-Mail- und Adress-Regex)
+  * `Stufe 2:` EU-PII Spezialmodell (Vorrang bei `PERSON`, `LOCATION`, `ID_NUMBER`, `HEALTH_DATA`)
+  * `Stufe 1:` GLiNER Zero-Shot Modell (`ORGANIZATION`, `ROLE` sowie Ergänzungsnetz)
+* **Kanonischer Überlappungsschutz:** Deterministische Treffer (z. B. Schweizer AHV, UID, IBAN, Telefonnummern) werden vorab auf dem Gesamtdokument berechnet; überlappende ML-Modellspans werden strikt verworfen, um KI-Halluzinationen auszuschliessen.
 * **Abkürzungs-bewusstes Chunking:** Zerlegung langer Texte in überlappungsfreie Abschnitte (<800 Zeichen), ohne Satzgrenzen bei typischen Abkürzungen (`Dr.`, `Prof.`, `Bahnhofstr.`, `14. Juli`) zu zerschneiden.
 * **Fuzzy-Glossar (RapidFuzz):**
   * Zuordnung interner Firmenkürzel (z. B. `"abcd"` $\rightarrow$ `PERSON`).
   * Fehlertolerantes Matching bei Tippfehlern (z. B. `"ZHW"` $\rightarrow$ `"ZHAW"`).
 * **Globale & Session-Ignore-Listen:** Schutz generischer Rollen, Grade und Feldbezeichnungen (`CAS`, `BSc`, `Studierende`, `Dozent`, `Unternehmen`, `E-Mail`, `App`, `Applikation`). Eingebaute Standard-Ignores können durch bewusste Glossar-Einträge überschrieben werden; persönliche Ignore-Einträge behalten immer Vorrang.
 * **Dreistufige Erkennungssteuerung:** `Aus` blockiert alle Quellen einer Kategorie, `Nur Glossar & manuell` lässt nur explizite und manuelle Einträge zu, `Alle Quellen` aktiviert KI-, Bibliotheks-, Regex- und explizite Erkennung.
-* **Deterministische Schweizer Erweiterungen:** `ADDRESS` erkennt Schweizer und deutsche Adressmuster; `AHV_NUMBER` wird mit der AHV-Kontrollziffer und `UID_NUMBER` mit der offiziellen Modulo-11-Prüfziffer validiert. `IT_SYSTEM` nutzt das Glossar als Primärquelle und GLiNER-Prompts als Sicherheitsnetz.
 * **Optionale Rollen-Erkennung:** Präzisere PERSON-Prompts reduzieren Falschpositive bei generischen Rollennomen. `ROLE`/`JOB_TITLE` erkennt Funktionsbezeichnungen, ist aber standardmässig deaktiviert und kann bei Bedarf über KI oder Glossar aktiviert werden.
 
 ---

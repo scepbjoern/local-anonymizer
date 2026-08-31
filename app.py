@@ -1307,6 +1307,29 @@ def create_ui():
             ui.label("Vergeben Sie optionale Rollen oder übernehmen Sie Verknüpfungsvorschläge. Jede Zeile zeigt den zugeordneten Platzhalter und klappt Fundstellen auf:").classes("text-sm text-slate-600 mb-3")
 
             # Toolbar: Sorting & Bulk actions
+            all_expansions: List[Any] = []
+            toggle_expand_btn = None
+
+            def update_expand_btn():
+                if not toggle_expand_btn:
+                    return
+                any_open = any(bool(exp.value) for exp in all_expansions)
+                if any_open:
+                    toggle_expand_btn.set_text("Alle zuklappen")
+                    toggle_expand_btn.props("icon=unfold_less")
+                else:
+                    toggle_expand_btn.set_text("Alle aufklappen")
+                    toggle_expand_btn.props("icon=unfold_more")
+
+            def toggle_all_expansions():
+                any_open = any(bool(exp.value) for exp in all_expansions)
+                for exp in all_expansions:
+                    if any_open:
+                        exp.close()
+                    else:
+                        exp.open()
+                update_expand_btn()
+
             with ui.row().classes("w-full items-center justify-between bg-slate-100 p-2.5 rounded-lg border mb-3 flex-wrap gap-2"):
                 with ui.row().classes("items-center gap-2"):
                     ui.icon("sort", size="sm").classes("text-slate-600")
@@ -1343,6 +1366,12 @@ def create_ui():
 
                     ui.button("Alle aktivieren", icon="select_all", on_click=select_all, color="slate").props("outline dense size=sm")
                     ui.button("Alle abwählen", icon="deselect", on_click=deselect_all, color="slate").props("outline dense size=sm")
+                    toggle_expand_btn = ui.button(
+                        "Alle aufklappen",
+                        icon="unfold_more",
+                        on_click=toggle_all_expansions,
+                        color="slate",
+                    ).props("outline dense size=sm")
 
             sorted_groups = get_sorted_groups()
             from local_anonymizer.anonymizer import build_entity_tree
@@ -1359,6 +1388,8 @@ def create_ui():
 
                     # Master Row
                     with ui.expansion().classes(f"w-full border rounded {row_bg}") as exp:
+                        all_expansions.append(exp)
+                        exp.on_value_change(lambda _: update_expand_btn())
                         with exp.add_slot("header"):
                             with ui.row().classes("w-full items-center justify-between gap-3 pr-2 flex-wrap"):
                                 # 1. Checkbox + Name + Count + Assigned Placeholder Badge
@@ -1573,6 +1604,8 @@ def create_ui():
                     for child_node in root_node.children:
                         child: EntityGroup = child_node.item
                         with ui.expansion().classes("w-full ml-6 my-1 bg-teal-50/50 border-l-4 border-teal-500 border rounded shadow-none") as child_exp:
+                            all_expansions.append(child_exp)
+                            child_exp.on_value_change(lambda _: update_expand_btn())
                             with child_exp.add_slot("header"):
                                 with ui.row().classes("w-full items-center justify-between gap-3 pr-2 flex-wrap"):
                                     with ui.row().classes("items-center gap-2 min-w-[260px]"):
