@@ -522,9 +522,9 @@ def test_pdf_parallel_extraction_ordering():
     assert "Footer Page 1" not in extracted
     assert "Footer Page 5" not in extracted
 
-    # 3. Verify progress callback was triggered up to 10/10
-    assert len(progress_steps) == 10
-    assert (10, 10) in progress_steps
+    # 3. Verify progress callback was triggered up to (10, 10)
+    assert len(progress_steps) > 0
+    assert progress_steps[-1] == (10, 10)
 
 
 def test_pdf_parallel_extraction_corrupted_page_resilience(monkeypatch):

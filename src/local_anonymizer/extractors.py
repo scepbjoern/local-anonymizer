@@ -594,26 +594,50 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
     return text.strip()
 
 
-def _extract_single_page_worker(raw_bytes: bytes, page_idx: int, margins: tuple) -> str:
+def _extract_pages_chunk_worker(
+    raw_bytes: bytes,
+    page_indices: List[int],
+    include_headers_footers: bool,
+) -> List[Tuple[int, str]]:
     """
-    Top-level picklable worker for multiprocessing PDF page extraction.
-    Executes in an isolated worker process without C-state collisions.
+    Top-level picklable worker for multiprocessing PDF chunk extraction.
+    Receives raw_bytes once per chunk/process to eliminate Windows IPC overhead.
     Provides 3-stage fallback: PyMuPDF RAG Markdown -> PyMuPDF plain text -> Error placeholder.
     """
     import pymupdf
     import pymupdf4llm.helpers.pymupdf_rag as rag
 
+    results = []
     try:
         doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
         try:
-            try:
-                return rag.to_markdown(doc, pages=[page_idx], margins=margins).strip()
-            except Exception:
-                return doc[page_idx].get_text("text").strip()
+            for page_idx in page_indices:
+                if include_headers_footers:
+                    margins = (0, 0, 0, 0)
+                else:
+                    margins = (0, 0, 0, 50) if page_idx == 0 else (0, 50, 0, 50)
+
+                try:
+                    try:
+                        p_md = rag.to_markdown(
+                            doc,
+                            pages=[page_idx],
+                            margins=margins,
+                            table_strategy="lines",
+                        ).strip()
+                    except Exception:
+                        p_md = doc[page_idx].get_text("text").strip()
+                except Exception as ex:
+                    p_md = f"[Hinweis: Seite {page_idx + 1} konnte nicht extrahiert werden: {ex}]"
+
+                results.append((page_idx, p_md))
         finally:
             doc.close()
     except Exception as ex:
-        return f"[Hinweis: Seite {page_idx + 1} konnte nicht extrahiert werden: {ex}]"
+        for page_idx in page_indices:
+            results.append((page_idx, f"[Hinweis: Seite {page_idx + 1} konnte nicht extrahiert werden: {ex}]"))
+
+    return results
 
 
 def extract_text_from_pdf_bytes(
@@ -625,8 +649,7 @@ def extract_text_from_pdf_bytes(
 ) -> str:
     """
     Extract structured Markdown text from PDF bytes using PyMuPDF's RAG layout engine.
-    For multi-page PDFs, utilizes multi-core multiprocessing (ProcessPoolExecutor capped at 4 workers)
-    for high throughput without C-state concurrency issues or excessive memory usage.
+    For multi-page PDFs, utilizes chunked multi-core multiprocessing across available CPU cores.
     Preserves headings, lists, tables, and bold/italic styles while maintaining intact word and sentence structure.
     Supports optional progress_callback(current_page, total_pages, status_text) for large PDFs.
     Preserves document title on page 1 while suppressing running headers/footers on subsequent pages when include_headers_footers=False.
@@ -654,43 +677,47 @@ def extract_text_from_pdf_bytes(
         # Single page: Execute directly without multiprocessing pool overhead
         if progress_callback:
             progress_callback(1, 1, "PDF-Inhalt wird extrahiert...")
-        margins = (0, 0, 0, 0) if include_headers_footers else (0, 0, 0, 50)
-        page_mds = [_extract_single_page_worker(raw_bytes, 0, margins)]
+        results = _extract_pages_chunk_worker(raw_bytes, [0], include_headers_footers)
+        page_mds = [results[0][1]]
     else:
-        # Multi-page: Process pages in parallel using ProcessPoolExecutor capped at 4 workers
-        max_workers = min(os.cpu_count() or 4, 4, doc_pages)
+        # Multi-page: Chunk pages and scale across performance CPU cores
+        cpu_cores = os.cpu_count() or 4
+        max_workers = min(cpu_cores, 6, doc_pages)
+
+        # Partition pages into contiguous chunks (one chunk per worker)
+        chunk_size = (doc_pages + max_workers - 1) // max_workers
+        chunks = []
+        for i in range(0, doc_pages, chunk_size):
+            chunks.append(list(range(i, min(i + chunk_size, doc_pages))))
+
+        actual_workers = min(len(chunks), max_workers)
         page_mds = [None] * doc_pages
-        completed_count = 0
+        completed_pages = 0
 
         # Protect process-wide env var during child process spawn
         with _pdf_env_lock:
             os.environ["LOCAL_ANONYMIZER_PDF_WORKER"] = "1"
             try:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_idx = {}
-                    for page_idx in range(doc_pages):
-                        if include_headers_footers:
-                            margins = (0, 0, 0, 0)
-                        else:
-                            margins = (0, 0, 0, 50) if page_idx == 0 else (0, 50, 0, 50)
+                with concurrent.futures.ProcessPoolExecutor(max_workers=actual_workers) as executor:
+                    futures = [
+                        executor.submit(_extract_pages_chunk_worker, raw_bytes, chunk, include_headers_footers)
+                        for chunk in chunks
+                    ]
 
-                        fut = executor.submit(_extract_single_page_worker, raw_bytes, page_idx, margins)
-                        future_to_idx[fut] = page_idx
-
-                    for fut in concurrent.futures.as_completed(future_to_idx):
-                        p_idx = future_to_idx[fut]
+                    for fut in concurrent.futures.as_completed(futures):
                         try:
-                            page_text = fut.result()
+                            chunk_results = fut.result()
+                            for p_idx, page_text in chunk_results:
+                                page_mds[p_idx] = page_text
+                                completed_pages += 1
                         except Exception as ex:
-                            page_text = f"[Hinweis: Seite {p_idx + 1} konnte nicht extrahiert werden: {ex}]"
+                            logging.error(f"PDF extraction worker error: {ex}")
 
-                        page_mds[p_idx] = page_text
-                        completed_count += 1
                         if progress_callback:
                             progress_callback(
-                                completed_count,
+                                completed_pages,
                                 doc_pages,
-                                f"PDF-Seite {completed_count} von {doc_pages} extrahiert...",
+                                f"PDF-Seite {completed_pages} von {doc_pages} extrahiert...",
                             )
             finally:
                 os.environ.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
