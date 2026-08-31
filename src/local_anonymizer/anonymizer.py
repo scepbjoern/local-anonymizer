@@ -342,9 +342,26 @@ class LocalAnonymizer:
 
         class ValidatedPhoneRecognizer(PhoneRecognizer):
             def analyze(self, text, entities=None, nlp_artifacts=None):
+                import phonenumbers
                 results = super().analyze(text, entities, nlp_artifacts)
                 for r in results:
-                    r.score = 1.0
+                    candidate = text[r.start:r.end]
+                    validated = False
+                    for region in self.supported_regions:
+                        try:
+                            parsed = phonenumbers.parse(candidate, region)
+                            if phonenumbers.is_valid_number(parsed):
+                                r.score = 1.0
+                                validated = True
+                                break
+                            elif phonenumbers.is_possible_number(parsed):
+                                r.score = 0.80
+                                validated = True
+                                break
+                        except Exception:
+                            continue
+                    if not validated:
+                        r.score = 0.40
                 return results
 
         self.phone_recognizer = ValidatedPhoneRecognizer(

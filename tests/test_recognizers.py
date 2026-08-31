@@ -471,3 +471,87 @@ def test_eupii_subtoken_span_score_aggregation():
     assert res.score >= 0.50
 
 
+def test_is_model_cached_offline_check(monkeypatch):
+    """Verify is_model_cached correctly checks local cache without triggering downloads."""
+    import transformers
+    from local_anonymizer.recognizers import is_model_cached
+
+    # Case 1: When local_files_only succeeds
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: "dummy_tok")
+    monkeypatch.setattr(transformers.AutoModelForTokenClassification, "from_pretrained", lambda *args, **kwargs: "dummy_model")
+    assert is_model_cached("dummy/model", "transformers") is True
+
+    # Case 2: When local_files_only raises (cache miss)
+    def fail_load(*args, **kwargs):
+        raise OSError("Model not found in cache")
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", fail_load)
+    assert is_model_cached("dummy/model", "transformers") is False
+
+
+def test_eupii_load_lifecycle_cache_download_and_error(monkeypatch):
+    """Verify EUPiiRecognizer.load() handles Cache-Hit, Online-Download, and Download-Error."""
+    import pytest
+    import transformers
+    from local_anonymizer.recognizers import EUPiiRecognizer, _EUPII_MODEL_CACHE
+
+    test_model_id = "test/eupii-lifecycle-model"
+    for k in list(_EUPII_MODEL_CACHE.keys()):
+        if test_model_id in k:
+            _EUPII_MODEL_CACHE.pop(k, None)
+
+    dummy_model = type("DummyModel", (), {
+        "config": type("Cfg", (), {"id2label": {1: "O"}})(),
+        "eval": lambda self: None,
+    })()
+
+    # 1. Test Cache-Hit (offline load succeeds directly)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: "tok_offline")
+    monkeypatch.setattr(transformers.AutoModelForTokenClassification, "from_pretrained", lambda *args, **kwargs: dummy_model)
+    rec1 = EUPiiRecognizer(model_name=test_model_id)
+    rec1.load()
+    assert rec1.tokenizer == "tok_offline"
+    assert rec1.model is dummy_model
+
+    for k in list(_EUPII_MODEL_CACHE.keys()):
+        if test_model_id in k:
+            _EUPII_MODEL_CACHE.pop(k, None)
+
+    # 2. Test Online-Download Fallback (offline fails, online succeeds)
+    call_counts = {"offline": 0, "online": 0}
+
+    def mock_tok_from_pretrained(*args, **kwargs):
+        if kwargs.get("local_files_only"):
+            call_counts["offline"] += 1
+            raise OSError("Not in cache")
+        call_counts["online"] += 1
+        return "tok_online"
+
+    def mock_model_from_pretrained(*args, **kwargs):
+        if kwargs.get("local_files_only"):
+            raise OSError("Not in cache")
+        return dummy_model
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", mock_tok_from_pretrained)
+    monkeypatch.setattr(transformers.AutoModelForTokenClassification, "from_pretrained", mock_model_from_pretrained)
+
+    rec2 = EUPiiRecognizer(model_name=test_model_id)
+    rec2.load()
+    assert rec2.tokenizer == "tok_online"
+    assert call_counts["offline"] >= 1
+    assert call_counts["online"] >= 1
+
+    for k in list(_EUPII_MODEL_CACHE.keys()):
+        if test_model_id in k:
+            _EUPII_MODEL_CACHE.pop(k, None)
+
+    # 3. Test Download Failure (both offline and online fail)
+    def mock_fail_all(*args, **kwargs):
+        raise ConnectionError("No internet connection")
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", mock_fail_all)
+    rec3 = EUPiiRecognizer(model_name=test_model_id)
+    with pytest.raises(RuntimeError) as exc_info:
+        rec3.load()
+    assert "1.07 GB" in str(exc_info.value)
+    assert "konnte weder aus dem lokalen Cache noch online heruntergeladen werden" in str(exc_info.value)

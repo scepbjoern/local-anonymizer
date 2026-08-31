@@ -22,8 +22,15 @@ TEMP_UPLOADS_DIR = CONFIG_DIR / "temp_uploads"
 TEMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def is_pdf_worker() -> bool:
+    """Returns True if the current process is a spawned PDF extraction worker sub-process."""
+    return os.environ.get("LOCAL_ANONYMIZER_PDF_WORKER") == "1"
+
+
 def cleanup_extraction_temp_files():
     """Clean up any stale temporary PDF extraction files from ~/.local-anonymizer/temp_uploads."""
+    if is_pdf_worker():
+        return
     try:
         if TEMP_UPLOADS_DIR.exists():
             for f in TEMP_UPLOADS_DIR.glob("*.pdf"):
@@ -35,9 +42,9 @@ def cleanup_extraction_temp_files():
         pass
 
 
-if os.environ.get("LOCAL_ANONYMIZER_PDF_WORKER") != "1":
+if not is_pdf_worker():
     cleanup_extraction_temp_files()
-atexit.register(cleanup_extraction_temp_files)
+    atexit.register(cleanup_extraction_temp_files)
 
 
 class UnsupportedFileFormatError(ValueError):
@@ -713,6 +720,7 @@ def extract_text_from_pdf_bytes(
 
         try:
             with _pdf_env_lock:
+                prev_worker_env = os.environ.get("LOCAL_ANONYMIZER_PDF_WORKER")
                 os.environ["LOCAL_ANONYMIZER_PDF_WORKER"] = "1"
                 try:
                     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -747,7 +755,10 @@ def extract_text_from_pdf_bytes(
                                     f"PDF-Seite {completed_pages} von {doc_pages} extrahiert...",
                                 )
                 finally:
-                    os.environ.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
+                    if prev_worker_env is None:
+                        os.environ.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
+                    else:
+                        os.environ["LOCAL_ANONYMIZER_PDF_WORKER"] = prev_worker_env
         finally:
             try:
                 os.remove(tmp_path)

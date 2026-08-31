@@ -331,7 +331,13 @@ class GLiNERRecognizer(EntityRecognizer):
 
             if self.model is None:
                 with set_huggingface_offline_mode(False):
-                    self.model = GLiNER.from_pretrained(self.model_name)
+                    try:
+                        self.model = GLiNER.from_pretrained(self.model_name)
+                    except Exception as ex:
+                        raise RuntimeError(
+                            f"GLiNER Modell '{self.model_name}' (ca. 1.10 GB) konnte weder aus dem lokalen Cache noch online heruntergeladen werden: {ex}. "
+                            f"Bitte überprüfe deine Internetverbindung oder verwende das Tool im reinen Regex- bzw. Glossar-Modus."
+                        ) from ex
 
             device = get_optimal_device()
             if device != "cpu":
@@ -774,25 +780,33 @@ class UIDNumberRecognizer(ChecksumPatternRecognizer):
 _EUPII_MODEL_CACHE: Dict[str, Tuple[Any, Any]] = {}
 _eupii_lock = threading.Lock()
 
+GLINER_MODEL_NAME = "urchade/gliner_multi_pii-v1"
+GLINER_MODEL_SIZE_MB = 1102  # ~1.10 GB download size
+EUPII_MODEL_NAME = "bardsai/eu-pii-anonimization-multilang"
+EUPII_MODEL_SIZE_MB = 1075  # ~1.07 GB download size (safetensors + tokenizer)
 
-def _is_valid_iban(iban: str) -> bool:
-    """Validate an IBAN string using the official Modulo-97 algorithm."""
-    clean = re.sub(r"\s+", "", iban).upper()
-    if not re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{1,30}", clean):
-        return False
-    reordered = clean[4:] + clean[:4]
-    numeric = ""
-    for ch in reordered:
-        if ch.isdigit():
-            numeric += ch
-        elif "A" <= ch <= "Z":
-            numeric += str(ord(ch) - 55)
+
+def is_model_cached(model_name: str, model_type: str = "transformers") -> bool:
+    """
+    Checks if model weights are available in the local HuggingFace cache without network access.
+    Returns True if cached and loadable offline, False otherwise.
+    """
+    with set_huggingface_offline_mode(True):
+        if model_type == "gliner":
+            try:
+                from gliner import GLiNER
+                GLiNER.from_pretrained(model_name, local_files_only=True)
+                return True
+            except Exception:
+                return False
         else:
-            return False
-    try:
-        return int(numeric) % 97 == 1
-    except Exception:
-        return False
+            try:
+                from transformers import AutoTokenizer, AutoModelForTokenClassification
+                AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+                AutoModelForTokenClassification.from_pretrained(model_name, local_files_only=True)
+                return True
+            except Exception:
+                return False
 
 
 EU_PII_CATEGORY_MAPPING: Dict[str, str] = {
@@ -907,7 +921,8 @@ class EUPiiRecognizer(EntityRecognizer):
                         model = AutoModelForTokenClassification.from_pretrained(self.model_name)
                     except Exception as ex:
                         raise RuntimeError(
-                            f"EU-PII Modell '{self.model_name}' konnte weder lokal noch online geladen werden: {ex}"
+                            f"EU-PII Modell '{self.model_name}' (ca. 1.07 GB) konnte weder aus dem lokalen Cache noch online heruntergeladen werden: {ex}. "
+                            f"Bitte überprüfe deine Internetverbindung oder deaktiviere das EU-PII-Modell in den Einstellungen."
                         ) from ex
 
             model.eval()

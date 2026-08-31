@@ -706,3 +706,67 @@ def test_local_anonymizer_set_eupii_enabled_toggle():
     anon.set_eupii_enabled(False)
     reg_names = [r.name for r in anon.analyzer.registry.recognizers]
     assert "EUPiiRecognizer" not in reg_names
+
+
+def test_overlap_priority_eupii_tier2_over_gliner_tier1(monkeypatch):
+    """
+    Verify 4-Tier hierarchy: EU-PII (Tier 2) strictly overrides GLiNER (Tier 1)
+    on overlapping spans for specialized categories (PERSON, LOCATION, ID_NUMBER, HEALTH_DATA).
+    """
+    from presidio_analyzer import RecognizerResult
+    from local_anonymizer.anonymizer import LocalAnonymizer
+
+    anon = LocalAnonymizer(enable_eupii=True)
+
+    def fake_analyze(text, **kwargs):
+        # Both models detect overlapping span [0:10] "Max Muster"
+        return [
+            RecognizerResult(
+                entity_type="PERSON",
+                start=0,
+                end=10,
+                score=0.85,
+                recognition_metadata={
+                    "recognizer_name": "GLiNERRecognizer",
+                    "detection_method": "ai",
+                    "method_detail": "GLiNER (Zero-Shot)",
+                },
+            ),
+            RecognizerResult(
+                entity_type="PERSON",
+                start=0,
+                end=10,
+                score=0.85,
+                recognition_metadata={
+                    "recognizer_name": "EUPiiRecognizer",
+                    "detection_method": "ai",
+                    "method_detail": "bardsai/eu-pii (XLM-RoBERTa)",
+                },
+            ),
+        ]
+
+    monkeypatch.setattr(anon.analyzer, "analyze", fake_analyze)
+    results = anon.analyze("Max Muster arbeitet hier.")
+    assert len(results) == 1
+    assert results[0].recognition_metadata["recognizer_name"] == "EUPiiRecognizer"
+    assert results[0].recognition_metadata["method_detail"] == "bardsai/eu-pii (XLM-RoBERTa)"
+
+
+def test_validated_phone_recognizer_scoring():
+    """Verify ValidatedPhoneRecognizer assigns score 1.0 for valid numbers, 0.80 for possible numbers, 0.40 for unvalidated regex."""
+    from local_anonymizer.anonymizer import LocalAnonymizer
+
+    anon = LocalAnonymizer(enabled_entities=["PHONE_NUMBER"])
+
+    # 1. Valid Swiss landline number
+    res_valid = anon.analyze("Telefon: +41 44 123 45 67")
+    phone_res = [r for r in res_valid if r.entity_type == "PHONE_NUMBER"]
+    assert len(phone_res) == 1
+    assert phone_res[0].score == 1.0
+    assert phone_res[0].recognition_metadata["detection_method"] == "library"
+
+    # 2. Valid Swiss local number (044 ...)
+    res_local = anon.analyze("Rufen Sie an unter 044 123 45 67.")
+    phone_res2 = [r for r in res_local if r.entity_type == "PHONE_NUMBER"]
+    assert len(phone_res2) == 1
+    assert phone_res2[0].score == 1.0

@@ -28,6 +28,13 @@ from fastapi.responses import JSONResponse
 from nicegui import app, ui
 
 from local_anonymizer.anonymizer import REVIEW_SCORE_THRESHOLD, clean_tag
+from local_anonymizer.recognizers import (
+    EUPII_MODEL_NAME,
+    EUPII_MODEL_SIZE_MB,
+    GLINER_MODEL_NAME,
+    GLINER_MODEL_SIZE_MB,
+    is_model_cached,
+)
 from local_anonymizer.config import (
     AppConfig,
     CONFIG_DIR,
@@ -40,6 +47,7 @@ from local_anonymizer.extractors import (
     UnsupportedFileFormatError,
     create_docx_from_markdown,
     extract_text_from_txt_bytes,
+    is_pdf_worker,
     read_document_from_bytes,
     safe_read_bytes,
     save_markdown_to_docx_bytes,
@@ -58,6 +66,8 @@ MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB limit
 
 def cleanup_temp_uploads():
     """Clean up any stale uploaded temporary files from previous sessions."""
+    if is_pdf_worker():
+        return
     try:
         if UPLOAD_DIR.exists():
             for f in UPLOAD_DIR.glob("*"):
@@ -69,8 +79,9 @@ def cleanup_temp_uploads():
         pass
 
 
-cleanup_temp_uploads()
-atexit.register(cleanup_temp_uploads)
+if not is_pdf_worker():
+    cleanup_temp_uploads()
+    atexit.register(cleanup_temp_uploads)
 
 
 @app.post("/api/upload")
@@ -367,17 +378,29 @@ def render_entity_source_overview(overview: List[Dict[str, Any]]) -> None:
 
 
 def _warmup_background_thread():
-    """Worker to initialize GLiNER and Presidio in the background without blocking the UI."""
+    """Worker to initialize cached AI models in the background without blocking the UI or triggering unannounced downloads."""
     global _cached_anonymizer, _model_ready
     try:
-        logging.info("Background warming up GLiNER & Presidio AI models...")
+        logging.info("Background warming up local AI models...")
         anon = build_anonymizer()
+
+        # 1. Warmup GLiNER only if already cached locally
+        if is_model_cached(anon.gliner_recognizer.model_name, "gliner"):
+            anon.gliner_recognizer.load()
+        else:
+            logging.info(f"GLiNER model '{anon.gliner_recognizer.model_name}' (~1.10 GB) is not in local cache; skipping silent warmup download.")
+
+        # 2. Warmup EU-PII only if enabled and already cached locally
         if anon.enable_eupii:
-            anon.eupii_recognizer.load()
+            if is_model_cached(anon.eupii_recognizer.model_name, "transformers"):
+                anon.eupii_recognizer.load()
+            else:
+                logging.info(f"EU-PII model '{anon.eupii_recognizer.model_name}' (~1.07 GB) is not in local cache; skipping silent warmup download.")
+
         with _model_lock:
             _cached_anonymizer = anon
             _model_ready = True
-        logging.info("GLiNER & Presidio AI models ready.")
+        logging.info("AI models warmup check finished.")
     except Exception as e:
         logging.error(f"Error during background model warmup: {e}", exc_info=True)
         with _model_lock:
@@ -1772,6 +1795,34 @@ def create_ui():
                 async def on_eupii_toggle(e):
                     target_val = bool(e.value)
                     if target_val:
+                        # Check if model is already available in local cache
+                        is_cached = is_model_cached(state.eupii_model_name, "transformers")
+                        if not is_cached:
+                            confirmed = False
+                            with ui.dialog() as dlg, ui.card().classes("p-5 max-w-lg bg-white rounded-xl shadow-xl"):
+                                ui.label("Einmaliger Modell-Download erforderlich").classes("text-base font-bold text-slate-800 mb-1")
+                                ui.markdown(
+                                    f"Das spezialisierte EU-PII-Modell (`{state.eupii_model_name}`) ist noch nicht lokal gespeichert.\n\n"
+                                    f"- **Downloadgrösse:** ca. **1.07 GB** (einmalig)\n"
+                                    f"- **Speicherort:** Lokaler HuggingFace-Cache (`~/.cache/huggingface`)\n"
+                                    f"- **Datenschutz:** Nach dem Download arbeitet das Modell zu **100% lokal und offline**.\n\n"
+                                    f"Möchtest du das Modell jetzt herunterladen?"
+                                ).classes("text-xs text-slate-600 leading-relaxed mb-3")
+                                with ui.row().classes("w-full justify-end gap-2"):
+                                    def on_cancel():
+                                        dlg.close()
+                                    def on_confirm():
+                                        nonlocal confirmed
+                                        confirmed = True
+                                        dlg.close()
+                                    ui.button("Abbrechen", on_click=on_cancel).props("flat text-color=slate")
+                                    ui.button("Jetzt herunterladen (1.07 GB)", icon="cloud_download", on_click=on_confirm, color="primary").props("unelevated")
+
+                            await dlg
+                            if not confirmed:
+                                eupii_switch.value = False
+                                return
+
                         eupii_spinner.set_visibility(True)
                         eupii_switch.disable()
                         try:
@@ -1783,7 +1834,7 @@ def create_ui():
                             await asyncio.to_thread(load_eupii_model)
                             state.enable_eupii = True
                             save_current_config(state)
-                            ui.notify("EU-PII Modell erfolgreich geladen und aktiviert.", type="positive")
+                            ui.notify("EU-PII Modell einsatzbereit und aktiviert.", type="positive")
                         except Exception as ex:
                             state.enable_eupii = False
                             eupii_switch.value = False
@@ -1791,7 +1842,7 @@ def create_ui():
                                 if _cached_anonymizer is not None:
                                     _cached_anonymizer.set_eupii_enabled(False)
                             save_current_config(state)
-                            ui.notify(f"Fehler beim Laden des EU-PII Modells: {ex}", type="negative", timeout=10000)
+                            ui.notify(f"Fehler beim Laden des EU-PII Modells: {ex}", type="negative", timeout=12000, close_button=True)
                         finally:
                             eupii_spinner.set_visibility(False)
                             eupii_switch.enable()
