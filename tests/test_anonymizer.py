@@ -239,7 +239,7 @@ def test_entity_linking_reversibility():
     entity_links = {
         "julia meier": ("", "VOLLNAME"),
         "julia": ("julia meier", "VORNAME"),
-        "frau meier": ("julia meier", "ANREDE"),
+        "meier": ("julia meier", "NACHNAME"),
     }
 
     res = anonymizer.anonymize(
@@ -251,7 +251,7 @@ def test_entity_linking_reversibility():
 
     assert "[PERSON_1_STUDENT_VOLLNAME]" in res.anonymized_text
     assert "[PERSON_1_STUDENT_VORNAME]" in res.anonymized_text
-    assert "[PERSON_1_STUDENT_ANREDE]" in res.anonymized_text
+    assert "[PERSON_1_STUDENT_NACHNAME]" in res.anonymized_text
 
     # Verify all map back exactly to their surface forms
     restored = LocalAnonymizer.de_anonymize(res.anonymized_text, res.mapping)

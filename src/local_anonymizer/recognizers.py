@@ -1048,16 +1048,8 @@ class EUPiiRecognizer(EntityRecognizer):
                         current_entity = None
                     continue
 
-                if prefix == "B" or (current_entity and current_entity["type"] != std_type):
-                    if current_entity:
-                        raw_candidates.append(current_entity)
-                    current_entity = {
-                        "type": std_type,
-                        "start": start_char,
-                        "end": end_char,
-                        "scores": [score],
-                    }
-                elif prefix == "I" and current_entity and current_entity["type"] == std_type:
+                # If subtoken continuation of current entity (no whitespace between tokens) or I-tag continuation
+                if current_entity and current_entity["type"] == std_type and (current_entity["end"] == start_char or prefix == "I"):
                     current_entity["end"] = end_char
                     current_entity["scores"].append(score)
                 else:

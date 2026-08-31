@@ -745,7 +745,7 @@ class LocalAnonymizer:
             rec_name = meta.get("recognizer_name", "")
             method = meta.get("detection_method", "")
             if rec_name == "FuzzyGlossaryRecognizer" or method == "glossary":
-                return 3
+                return 4
             if method in ("regex", "library") or rec_name in (
                 "AHVNumberRecognizer",
                 "UIDNumberRecognizer",
@@ -753,11 +753,14 @@ class LocalAnonymizer:
                 "IbanRecognizer",
                 "EmailRecognizer",
                 "PhoneRecognizer",
+                "ValidatedPhoneRecognizer",
                 "UrlRecognizer",
                 "DateRecognizer",
             ):
-                return 2
-            return 1  # Local AI models (GLiNER, EUPii)
+                return 3
+            if method == "eupii" or rec_name == "EUPiiRecognizer":
+                return 2  # EU-PII specialized model takes precedence over GLiNER in its 4 categories
+            return 1  # GLiNER zero-shot model
 
         # Sort by: Source Priority (Glossary > Deterministic > ML), Span length desc, Score desc
         filtered_results.sort(
