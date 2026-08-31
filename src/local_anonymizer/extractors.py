@@ -595,16 +595,17 @@ def extract_text_from_pdf_bytes(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     include_headers_footers: bool = False,
     extract_picture_text: bool = True,
-    use_markdown_tables: bool = False,
 ) -> str:
     """
-    Extract text from PDF bytes.
-    By default (use_markdown_tables=False), uses raw PyMuPDF text extraction to perfectly preserve reading order for NER.
-    If use_markdown_tables=True, uses pymupdf4llm to reconstruct Markdown tables (can cause torn words on invoices).
+    Extract structured Markdown text from PDF bytes using PyMuPDF's RAG layout engine.
+    Preserves headings, lists, tables, and bold/italic styles while maintaining intact word and sentence structure.
     Supports optional progress_callback(current_page, total_pages, status_text) for large PDFs.
+    Preserves document title on page 1 while suppressing running headers/footers on subsequent pages when include_headers_footers=False.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
     import pymupdf
+    import pymupdf4llm.helpers.pymupdf_rag as rag
+
     doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
     doc_pages = doc.page_count
 
@@ -619,59 +620,29 @@ def extract_text_from_pdf_bytes(
 
     try:
         page_mds = []
-        if use_markdown_tables:
-            import pymupdf4llm
-            for page_idx in range(doc_pages):
-                if progress_callback:
-                    progress_callback(
-                        page_idx + 1,
-                        doc_pages,
-                        f"PDF-Seite {page_idx + 1} von {doc_pages} wird formatiert..."
-                    )
-                if include_headers_footers:
-                    use_h, use_f = True, True
-                    margins = (0, 0, 0, 0)
+        for page_idx in range(doc_pages):
+            if progress_callback:
+                progress_callback(
+                    page_idx + 1,
+                    doc_pages,
+                    f"PDF-Seite {page_idx + 1} von {doc_pages} wird extrahiert..."
+                )
+            if include_headers_footers:
+                margins = (0, 0, 0, 0)
+            else:
+                if page_idx == 0:
+                    margins = (0, 0, 0, 50)
                 else:
-                    if page_idx == 0:
-                        use_h, use_f = True, False
-                        margins = (0, 0, 0, 40)
-                    else:
-                        use_h, use_f = False, False
-                        margins = (0, 40, 0, 40)
-                try:
-                    p_md = pymupdf4llm.to_markdown(
-                        doc,
-                        pages=[page_idx],
-                        header=use_h,
-                        footer=use_f,
-                        margins=margins,
-                    )
-                    page_mds.append(p_md.strip())
-                except Exception:
-                    page_mds.append(doc[page_idx].get_text().strip())
-        else:
-            # Robust, standard text extraction for Named Entity Recognition (preserves line reading order perfectly)
-            for page_idx in range(doc_pages):
-                if progress_callback:
-                    progress_callback(
-                        page_idx + 1,
-                        doc_pages,
-                        f"PDF-Seite {page_idx + 1} von {doc_pages} wird extrahiert..."
-                    )
-                page = doc[page_idx]
-                if include_headers_footers:
-                    clip_rect = page.rect
-                else:
-                    r = page.rect
-                    if page_idx == 0:
-                        # Page 1: Keep top title, suppress bottom footer margin
-                        clip_rect = pymupdf.Rect(r.x0, r.y0, r.x1, r.y1 - 50)
-                    else:
-                        # Subsequent pages: Suppress running headers and footers
-                        clip_rect = pymupdf.Rect(r.x0, r.y0 + 50, r.x1, r.y1 - 50)
-                
-                page_text = page.get_text("text", clip=clip_rect).strip()
-                page_mds.append(page_text)
+                    margins = (0, 50, 0, 50)
+            try:
+                p_md = rag.to_markdown(
+                    doc,
+                    pages=[page_idx],
+                    margins=margins,
+                )
+                page_mds.append(p_md.strip())
+            except Exception:
+                page_mds.append(doc[page_idx].get_text().strip())
 
         md_text = "\n\n".join(p for p in page_mds if p)
     except Exception:
@@ -688,10 +659,9 @@ def extract_text_from_pdf(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     include_headers_footers: bool = False,
     extract_picture_text: bool = True,
-    use_markdown_tables: bool = False,
 ) -> str:
     """
-    Extract structured Markdown text from PDF files.
+    Extract structured Markdown text from PDF files using pymupdf RAG layout engine.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
     p = Path(path)
@@ -704,7 +674,6 @@ def extract_text_from_pdf(
         progress_callback=progress_callback,
         include_headers_footers=include_headers_footers,
         extract_picture_text=extract_picture_text,
-        use_markdown_tables=use_markdown_tables,
     )
 
 
@@ -714,7 +683,6 @@ def read_document_from_bytes(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     include_headers_footers: bool = False,
     extract_picture_text: bool = True,
-    use_markdown_tables: bool = False,
 ) -> str:
     """Unified document reader from in-memory bytes with optional progress callback and extraction options."""
     ext = Path(filename).suffix.lower()
@@ -742,7 +710,6 @@ def read_document_from_bytes(
             progress_callback=progress_callback,
             include_headers_footers=include_headers_footers,
             extract_picture_text=extract_picture_text,
-            use_markdown_tables=use_markdown_tables,
         )
     else:
         raise UnsupportedFileFormatError(
@@ -755,7 +722,6 @@ def read_document(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     include_headers_footers: bool = False,
     extract_picture_text: bool = True,
-    use_markdown_tables: bool = False,
 ) -> str:
     """Unified document reader supporting .txt, .md, .json, .csv, .docx, and .pdf."""
     path = Path(file_path)
@@ -769,5 +735,4 @@ def read_document(
         progress_callback=progress_callback,
         include_headers_footers=include_headers_footers,
         extract_picture_text=extract_picture_text,
-        use_markdown_tables=use_markdown_tables,
     )

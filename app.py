@@ -186,7 +186,6 @@ class AppState:
         # Document extraction settings
         self.include_headers_footers: bool = False
         self.extract_picture_text: bool = True
-        self.use_markdown_tables: bool = False
         self.last_raw_bytes: Optional[bytes] = None
 
 
@@ -801,7 +800,6 @@ def create_ui():
                 progress_cb,
                 state.include_headers_footers,
                 state.extract_picture_text,
-                state.use_markdown_tables,
             )
             load_content_into_workspace(text, filename)
         except Exception as ex:
@@ -1904,10 +1902,6 @@ def create_ui():
                                 state.extract_picture_text = bool(e.value)
                                 await on_extraction_opt_change()
 
-                            async def on_toggle_markdown_tables(e):
-                                state.use_markdown_tables = bool(e.value)
-                                await on_extraction_opt_change()
-
                             ui.checkbox(
                                 "Kopf- und Fußzeilen einbeziehen",
                                 value=state.include_headers_footers,
@@ -1927,21 +1921,6 @@ def create_ui():
                                             "Lineare PDF-Parser lesen Text zeilenweise von links nach rechts über die gesamte Seite. "
                                             "Bei mehrspaltigen **2D-Organigrammen, Stammbäumen oder Flussdiagrammen** werden dadurch Boxen quer durcheinandergewürfelt und Vor- bzw. Nachnamen verschiedener Personen vertauscht. "
                                             "Deaktivieren Sie diese Option, um solche Diagramme sauber zu überspringen."
-                                        )
-
-                            with ui.row().classes("items-center gap-1"):
-                                ui.checkbox(
-                                    "PDF-Tabellen als Markdown rekonstruieren (experimentell)",
-                                    value=state.use_markdown_tables,
-                                    on_change=on_toggle_markdown_tables,
-                                ).props("dense size=sm").tooltip("Rechtwinklige Tabellen als Markdown (| Spalte 1 | Spalte 2 |) ableiten. Standard: Aus (Rohtext-Modus empfohlen zur Vermeidung zerrissener Wörter).")
-                                with ui.button(icon="help_outline").props("flat round dense size=xs color=grey").classes("p-0 min-h-0 min-w-0"):
-                                    with ui.tooltip().classes("bg-slate-900 text-white text-xs max-w-md p-2.5 leading-relaxed shadow-lg rounded-lg"):
-                                        ui.markdown(
-                                            "**Warum standardmässig aus?**\n\n"
-                                            "Die Standard-Textextraktion (Rohtext) liest PDFs in der natürlichen, linearen Lesereihenfolge aus und schützt davor, "
-                                            "dass Wörter bei rahmenlosen Tabellen (z. B. Rechnungen oder Honorarabrechnungen) fälschlicherweise in Spalten zerschnitten werden. "
-                                            "Aktivieren Sie diese Option nur, wenn das Ziel-LLM explizit tabellarische Markdown-Gitter benötigt."
                                         )
 
                     # Live extraction progress card (for large PDF/Docx files)

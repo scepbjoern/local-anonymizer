@@ -14,12 +14,11 @@ Upload-Bereich. Unterstützt werden insbesondere:
 - Markdown und Text (`.md`, `.txt`);
 - CSV- und JSON-Dateien.
 
-Bei PDFs liest der Standardmodus den Text zeilenweise in der natürlichen Lesereihenfolge (Rohtext) ein. Dies garantiert eine maximale Genauigkeit für die nachfolgende Anonymisierung (NER) und verhindert, dass Wörter bei rahmenlosen Dokumenten (wie z. B. Rechnungen) versehentlich getrennt werden.
+Bei PDFs werden Formatierungen, Überschriften (`#`), Listen (`-`), Tabellen und Fettungen (`**`) strukturiert als Markdown extrahiert. Die Engine liest Textblöcke präzise in der natürlichen Lesereihenfolge ein und verhindert, dass Namen oder Adressen in Tabellen zerschnitten werden.
 
-Über die **Erweiterten Extraktions-Optionen** direkt unter der Dokumentablage kannst du das Verhalten anpassen:
+Über die **Erweiterten Extraktions-Optionen** direkt unter der Dokumentablage kannst du das Verhalten bei Bedarf anpassen:
 - **Kopf- und Fußzeilen einbeziehen**: Liest wiederkehrende Kopf-/Fusszeilen (z. B. Seitenzahlen) mit ein (Standard: *Aus*).
 - **Text aus PDF-Bildern & Grafiken extrahieren**: Liest Textboxen in Diagrammen und Vektorgrafiken aus (Standard: *Ein*).
-- **PDF-Tabellen als Markdown rekonstruieren (experimentell)**: Versucht, rechtwinklige Tabellenstrukturen im Markdown-Format (`| Spalte 1 | Spalte 2 |`) abzuleiten. Standardmässig *Aus*, da reine Fließtext-Extraktion für LLMs robuster ist.
 
 Ein reiner Scan ohne Textschicht benötigt OCR; dieser Pfad ist in der aktuellen Version noch nicht Bestandteil des Standardablaufs.
 
