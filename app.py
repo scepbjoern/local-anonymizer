@@ -301,6 +301,7 @@ def get_synced_cached_anonymizer(app_state: "AppState"):
 
 _SOURCE_KIND_LABELS: Dict[str, Tuple[str, str]] = {
     "prompt": ("🤖 KI-Prompt", "blue"),
+    "model": ("🤖 KI-Modell", "indigo"),
     "regex": ("🔤 Regex", "purple"),
     "library": ("📚 Bibliothek", "grey-7"),
     "glossary": ("📖 Begriffsliste", "teal"),
@@ -338,6 +339,12 @@ def render_entity_source_overview(overview: List[Dict[str, Any]]) -> None:
                         ui.badge(kind_label, color=kind_color).props("dense outline")
                         if src["kind"] == "prompt":
                             ui.label(", ".join(f'"{p}"' for p in src["prompts"])).classes(
+                                "text-xs text-slate-600 font-mono"
+                            )
+                        elif src["kind"] == "model":
+                            rec_name = src.get("recognizer", "EUPiiRecognizer")
+                            thresh = src.get("threshold", 0.5)
+                            ui.label(f'Modell: {rec_name} (Schwellenwert: {thresh:.2f})').classes(
                                 "text-xs text-slate-600 font-mono"
                             )
                         elif src["kind"] == "regex":
@@ -425,17 +432,24 @@ def entity_mode_classes(mode: str) -> str:
     return f"w-44 text-xs {ENTITY_MODE_COLORS.get(mode, ENTITY_MODE_COLORS[ENTITY_MODE_OFF])}"
 
 RECOGNIZER_METHODS: Dict[str, str] = {
-    "GLiNERRecognizer": "ai",
-    "EUPiiRecognizer": "ai",
+    "GLiNERRecognizer": "gliner",
+    "EUPiiRecognizer": "eupii",
     "AddressPatternRecognizer": "regex",
     "AHVNumberRecognizer": "regex",
     "UIDNumberRecognizer": "regex",
+    "IbanRecognizer": "regex",
+    "EmailRecognizer": "regex",
+    "UrlRecognizer": "regex",
+    "DateRecognizer": "regex",
+    "PhoneRecognizer": "library",
 }
 
 METHOD_DISPLAY: Dict[str, Tuple[str, str, str]] = {
-    "ai": ("🤖 KI", "blue", "Durch den lokalen KI-Erkenner gefunden"),
+    "gliner": ("🤖 GLiNER", "blue", "Durch das lokale GLiNER-Zero-Shot-Modell gefunden"),
+    "eupii": ("🤖 EU-PII", "indigo", "Durch das lokale EU-PII-Token-Klassifikationsmodell gefunden"),
+    "ai": ("🤖 KI", "blue", "Durch ein lokales KI-Modell gefunden"),
     "regex": ("🔤 Regex", "purple", "Durch einen regulären Ausdruck gefunden"),
-    "library": ("📚 Bibliothek", "grey-7", "Durch eine lokale Bibliotheks-Erkennung gefunden"),
+    "library": ("📚 Bibliothek", "grey-7", "Durch eine lokale Presidio-/Python-Bibliothek (z. B. phonenumbers für Telefon) gefunden"),
     "glossary_direct": ("📖 Glossar · direkt", "teal", "Direkter Treffer in der eigenen Begriffsliste"),
     "glossary_fuzzy": ("📖 Glossar · Fuzzy", "orange", "Ähnlichkeitstreffer in der eigenen Begriffsliste"),
     "manual": ("✍ Manuell", "green", "Manuell für diesen Durchlauf markiert"),

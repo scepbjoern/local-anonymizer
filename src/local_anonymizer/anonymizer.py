@@ -289,7 +289,7 @@ class LocalAnonymizer:
         fuzzy_review_threshold: float = 75.0,
         enabled_entities: Optional[Sequence[str]] = None,
         enabled_glossary_entities: Optional[Sequence[str]] = None,
-        enable_eupii: bool = False,
+        enable_eupii: bool = True,
         eupii_threshold: float = 0.50,
         eupii_model: str = "bardsai/eu-pii-anonimization-multilang",
     ):
@@ -436,19 +436,26 @@ class LocalAnonymizer:
     def _annotate_detection_methods(self, results: List[RecognizerResult]) -> None:
         """Attach a stable source label to every result for transparent review display."""
         method_by_recognizer: Dict[str, str] = {
-            "GLiNERRecognizer": "ai",
-            "EUPiiRecognizer": "ai",
+            "GLiNERRecognizer": "gliner",
+            "EUPiiRecognizer": "eupii",
             "FuzzyGlossaryRecognizer": "glossary",
             "AddressPatternRecognizer": "regex",
             "AHVNumberRecognizer": "regex",
             "UIDNumberRecognizer": "regex",
+            "IbanRecognizer": "regex",
+            "EmailRecognizer": "regex",
+            "UrlRecognizer": "regex",
+            "DateRecognizer": "regex",
+            "PhoneRecognizer": "library",
         }
         for recognizer in self.analyzer.registry.get_recognizers(
             language=self.language,
             all_fields=True,
         ):
-            if recognizer.name in ("GLiNERRecognizer", "EUPiiRecognizer"):
-                method_by_recognizer[recognizer.name] = "ai"
+            if recognizer.name == "GLiNERRecognizer":
+                method_by_recognizer[recognizer.name] = "gliner"
+            elif recognizer.name == "EUPiiRecognizer":
+                method_by_recognizer[recognizer.name] = "eupii"
             elif recognizer.name == "FuzzyGlossaryRecognizer":
                 method_by_recognizer[recognizer.name] = "glossary"
             elif getattr(recognizer, "patterns", None):

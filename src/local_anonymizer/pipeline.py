@@ -33,7 +33,7 @@ class AnonymizationPipeline:
         gliner_model: str = "urchade/gliner_multi_pii-v1",
         gliner_threshold: float = 0.55,
         enabled_glossary_entities: Optional[Sequence[str]] = None,
-        enable_eupii: bool = False,
+        enable_eupii: bool = True,
         eupii_threshold: float = 0.50,
         eupii_model: str = "bardsai/eu-pii-anonimization-multilang",
     ):

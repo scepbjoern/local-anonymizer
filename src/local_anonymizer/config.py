@@ -54,7 +54,7 @@ class AppConfig:
         # the UI derives the initial modes from active_entities when no mapping exists yet.
         self.entity_modes: Dict[str, str] = {}
         self.gliner_threshold: float = 0.55
-        self.enable_eupii: bool = False
+        self.enable_eupii: bool = True
         self.eupii_threshold: float = 0.50
         self.eupii_model_name: str = "bardsai/eu-pii-anonimization-multilang"
         self.ignore_terms: str = "CAS, DAS, MAS, BSc, MSc, PhD, MBA, Studierende, Studierenden, Dozent, Dozenten, Lehrperson, Berater, Aufgabensteller"
