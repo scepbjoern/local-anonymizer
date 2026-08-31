@@ -14,12 +14,16 @@ Upload-Bereich. Unterstützt werden insbesondere:
 - Markdown und Text (`.md`, `.txt`);
 - CSV- und JSON-Dateien.
 
-Bei PDFs werden Text, Listen und Tabellen strukturiert extrahiert. Ein reiner
-Scan ohne Textschicht benötigt OCR; dieser Pfad ist in der aktuellen Version
-noch nicht Bestandteil des Standardablaufs.
+Bei PDFs liest der Standardmodus den Text zeilenweise in der natürlichen Lesereihenfolge (Rohtext) ein. Dies garantiert eine maximale Genauigkeit für die nachfolgende Anonymisierung (NER) und verhindert, dass Wörter bei rahmenlosen Dokumenten (wie z. B. Rechnungen) versehentlich getrennt werden.
 
-Nach dem Laden kannst du den extrahierten Originaltext anzeigen und bei Bedarf
-direkt bearbeiten.
+Über die **Erweiterten Extraktions-Optionen** direkt unter der Dokumentablage kannst du das Verhalten anpassen:
+- **Kopf- und Fußzeilen einbeziehen**: Liest wiederkehrende Kopf-/Fusszeilen (z. B. Seitenzahlen) mit ein (Standard: *Aus*).
+- **Text aus PDF-Bildern & Grafiken extrahieren**: Liest Textboxen in Diagrammen und Vektorgrafiken aus (Standard: *Ein*).
+- **PDF-Tabellen als Markdown rekonstruieren (experimentell)**: Versucht, rechtwinklige Tabellenstrukturen im Markdown-Format (`| Spalte 1 | Spalte 2 |`) abzuleiten. Standardmässig *Aus*, da reine Fließtext-Extraktion für LLMs robuster ist.
+
+Ein reiner Scan ohne Textschicht benötigt OCR; dieser Pfad ist in der aktuellen Version noch nicht Bestandteil des Standardablaufs.
+
+Nach dem Laden kannst du den extrahierten Originaltext anzeigen und bei Bedarf direkt bearbeiten.
 
 ## 2. Erkennung konfigurieren
 

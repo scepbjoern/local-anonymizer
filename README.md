@@ -24,7 +24,7 @@ Für die praktische Nutzung steht ein deutschsprachiger [Benutzerleitfaden](docs
 - **🇨🇭 Deterministic Swiss/CH-PII Detection:** Recognizes Swiss/German addresses plus checksum-validated AHV and CHE/UID numbers; internal IT systems are supported through the glossary and GLiNER safety-net prompts.
 - **🔎 Transparent Review Sources:** Each finding shows whether it came from AI, Regex, a local library, the glossary (direct or fuzzy), or a manual marking. Icon actions can ignore a group, add it permanently to the glossary, or mark it only for the current run.
 - **📄 Multi-Format Document Support:** Structured text and Markdown extraction for Word `.docx`, `.pdf`, `.csv`, `.json`, `.txt`, and `.md` with robust multi-encoding fallback (`utf-8-sig`, `cp1252`, `iso-8859-15`).
-- **📊 Advanced PDF-to-Markdown Extraction:** Powered by `pymupdf4llm` with table structure cleanup, broken hyphenation repair, picture text extraction toggle, and recurring header/footer suppression with Page-1 title protection.
+- **📊 Robust PDF Text & Optional Table Extraction:** High-speed text extraction powered by `pymupdf` (preserving natural reading order for maximum NER accuracy), with optional experimental Markdown table reconstruction via `pymupdf4llm`, picture text toggle, and recurring header/footer suppression with Page-1 title protection.
 - **🖥️ Native Desktop GUI:** Responsive, instant-startup NiceGUI interface running as a native desktop window (with `--browser` option for web workflows).
 - **⚡ Lightweight & No-Admin:** Optimized for CPU-only laptops without requiring administrative privileges (installable via `uv` or `pip`).
 

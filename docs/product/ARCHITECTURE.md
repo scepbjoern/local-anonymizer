@@ -75,7 +75,7 @@
 ## 2. Kernkomponenten im Detail
 
 ### 2.1 Extraktoren (`extractors.py`)
-- **`extract_text_from_pdf_bytes`:** Nutzt `pymupdf4llm` zur Umwandlung von PDF-Seiten in semantisch strukturiertes Markdown (inklusive Tabellenbereinigung, Trennung von Bildtext und wiederkehrenden Kopf-/Fußzeilen-Filtern mit Seite-1-Titelschutz).
+- **`extract_text_from_pdf_bytes`:** Nutzt standardmässig natives `pymupdf` zur linearen, zeilenweisen Rohtext-Extraktion (perfekt für NER-Pipelines, verhindert das Zerschneiden von Wörtern in rahmenlosen Tabellen). Optional kann über `use_markdown_tables=True` die experimentelle Markdown-Tabellenrekonstruktion via `pymupdf4llm` aktiviert werden. Unterstützt Bildtext-Filterung und geometrische Kopf-/Fußzeilen-Filterung (Clip) mit Seite-1-Titelschutz.
 - **In-Memory & Streaming-Puffer:** Sämtliche Extraktoren und NLP-Analysen arbeiten nativ auf `bytes` (`read_document_from_bytes`). Beim Drag-and-Drop im GUI wird zur zuverlässigen Übertragung großer Dokumente (bis 50 MB) ein temporärer HTTP-Streaming-Puffer (`~/.local-anonymizer/temp_uploads`) verwendet, der per `try...finally` sofort nach dem RAM-Ladevorgang sowie über `atexit` beim Session-Ende bereinigt wird.
 - **Fehlerbehandlung:** Bildbasierte PDFs ohne Textlayer werden über `doc.page_count > 0 and not pages_text` erkannt und werfen `ValueError` mit klarer OCR-Hinweismeldung.
 
