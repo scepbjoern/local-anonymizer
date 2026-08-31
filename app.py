@@ -2526,4 +2526,5 @@ def main():
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    main()
+    if os.environ.get("LOCAL_ANONYMIZER_PDF_WORKER") != "1":
+        main()

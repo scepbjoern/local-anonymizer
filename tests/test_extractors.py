@@ -482,5 +482,83 @@ def test_clean_extracted_pdf_markdown_toc_table_healing():
     assert "Anh | ang" not in cleaned
 
 
+def test_pdf_parallel_extraction_ordering():
+    """Verify that multi-page PDF multiprocessing extraction returns pages in exact numerical order and handles margins."""
+    import pymupdf
+    from local_anonymizer.extractors import extract_text_from_pdf_bytes
+
+    doc = pymupdf.open()
+    for i in range(1, 11):
+        page = doc.new_page(width=595, height=842)
+        if i == 1:
+            page.insert_text((50, 30), "Document Title Page 1", fontsize=16)
+        else:
+            page.insert_text((50, 30), f"Header Page {i}", fontsize=9)
+        page.insert_text((50, 200), f"Unique Content Section Page {i}", fontsize=12)
+        page.insert_text((50, 810), f"Footer Page {i}", fontsize=9)
+
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    progress_steps = []
+    def on_progress(curr, total, msg):
+        progress_steps.append((curr, total))
+
+    extracted = extract_text_from_pdf_bytes(pdf_bytes, progress_callback=on_progress)
+
+    # 1. Verify exact page ordering
+    last_pos = -1
+    for i in range(1, 11):
+        needle = f"Unique Content Section Page {i}"
+        pos = extracted.find(needle)
+        assert pos != -1, f"Page {i} content missing!"
+        assert pos > last_pos, f"Page {i} appeared out of order!"
+        last_pos = pos
+
+    # 2. Verify Page 1 title preserved, while Page 2-10 running headers and footers are filtered
+    assert "Document Title Page 1" in extracted
+    assert "Header Page 2" not in extracted
+    assert "Header Page 10" not in extracted
+    assert "Footer Page 1" not in extracted
+    assert "Footer Page 5" not in extracted
+
+    # 3. Verify progress callback was triggered up to 10/10
+    assert len(progress_steps) == 10
+    assert (10, 10) in progress_steps
+
+
+def test_pdf_parallel_extraction_corrupted_page_resilience(monkeypatch):
+    """Verify that a failure on a single page falls back gracefully without aborting the entire document."""
+    import pymupdf
+    import pymupdf4llm.helpers.pymupdf_rag as rag
+    from local_anonymizer.extractors import extract_text_from_pdf_bytes
+
+    doc = pymupdf.open()
+    for i in range(1, 5):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 200), f"Resilient Section {i}", fontsize=12)
+
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    original_to_markdown = rag.to_markdown
+
+    def faulty_to_markdown(doc, pages=None, **kwargs):
+        if pages and pages[0] == 1:  # Page 2 (0-indexed 1) fails in markdown parser
+            raise RuntimeError("Simulated broken layout on page 2")
+        return original_to_markdown(doc, pages=pages, **kwargs)
+
+    monkeypatch.setattr(rag, "to_markdown", faulty_to_markdown)
+
+    extracted = extract_text_from_pdf_bytes(pdf_bytes)
+
+    # Page 1, 3, 4 extracted normally
+    assert "Resilient Section 1" in extracted
+    assert "Resilient Section 3" in extracted
+    assert "Resilient Section 4" in extracted
+    # Page 2 still has text via stage 2 plain-text fallback!
+    assert "Resilient Section 2" in extracted
+
+
 
 
