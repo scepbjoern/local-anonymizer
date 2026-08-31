@@ -550,13 +550,6 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
     lines = text.splitlines()
     cleaned_lines = []
     
-    excluded_suffixes = {
-        "kg", "ml", "km", "cm", "mm", 
-        "stk", "stk.", "chf", "eur", "fr.", "rp.", "rp",
-        "mwst", "mwst.", "inkl", "exkl", "inkl.", "exkl.",
-        "alter", "age", "datum", "date", "name", "vorname", "ort", "plz", "tel", "fax", "email", "e-mail"
-    }
-
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 3:
@@ -578,73 +571,9 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
                 ):
                     cleaned_cells = [col0, "", col1 + col2, col3]
 
-            # Heal horizontally torn words across columns (e.g. "Rechn CHF" | "ungsbetrag")
-            for i in range(len(cleaned_cells) - 2, -1, -1):
-                if not cleaned_cells[i] or not cleaned_cells[i+1]:
-                    continue
-                    
-                c1 = cleaned_cells[i].strip()
-                c2 = cleaned_cells[i+1].strip()
-                    
-                words2 = c2.split()
-                first_word2 = words2[0] if words2 else ""
-                clean_first2 = first_word2.strip("*_")
-                
-                is_lower_frag = bool(re.match(r"^[a-zäöüß]+[\.\:\,\;\!\?]?$", clean_first2))
-                is_upper_frag = bool(re.match(r"^[A-ZÄÖÜ]+[\.\:\,\;\!\?]?$", clean_first2)) and len(clean_first2) <= 6
-                
-                if clean_first2.lower().strip(".:,;!?") in excluded_suffixes:
-                    continue
-                    
-                if is_lower_frag or is_upper_frag:
-                    words1 = c1.split()
-                    if not words1:
-                        continue
-                        
-                    last_word1 = words1[-1]
-                    injected_unit = ""
-                    target_word = last_word1
-                    
-                    if last_word1.strip("*_") in ["CHF", "EUR", "Fr.", "Stk.", "Stk", "%"]:
-                        if len(words1) >= 2:
-                            injected_unit = " " + last_word1
-                            target_word = words1[-2]
-                            words1.pop()
-                        else:
-                            continue
-                            
-                    clean_target = target_word.strip("*_")
-                            
-                    can_merge = False
-                    if is_lower_frag and (clean_target.islower() or clean_target.istitle() or clean_target.isupper()):
-                        can_merge = True
-                    elif is_upper_frag and clean_target.isupper():
-                        can_merge = True
-                        
-                    if can_merge:
-                        # Reconstruct the merged word, ensuring markdown tags wrap the combined word correctly
-                        # E.g. **Grundversi** + **cherung** -> **Grundversicherung**
-                        # Remove trailing ** from target and leading ** from first_word2 if they match
-                        if target_word.endswith("**") and first_word2.startswith("**"):
-                            target_word = target_word[:-2]
-                            first_word2 = first_word2[2:]
-                        elif target_word.endswith("*") and first_word2.startswith("*"):
-                            target_word = target_word[:-1]
-                            first_word2 = first_word2[1:]
-                        elif target_word.endswith("__") and first_word2.startswith("__"):
-                            target_word = target_word[:-2]
-                            first_word2 = first_word2[2:]
-                        elif target_word.endswith("_") and first_word2.startswith("_"):
-                            target_word = target_word[:-1]
-                            first_word2 = first_word2[1:]
-                            
-                        words1[-1] = target_word + first_word2
-                        cleaned_cells[i] = " ".join(words1) + injected_unit
-                        words2.pop(0)
-                        cleaned_cells[i+1] = " ".join(words2)
-
-            cleaned_lines.append("| " + " | ".join(c.strip() for c in cleaned_cells) + " |")
+            cleaned_lines.append("| " + " | ".join(cleaned_cells) + " |")
         else:
+            # Outside tables: convert any remaining <br> to newlines, but DO NOT run PascalCase separation on normal text!
             l = re.sub(r"<br\s*/?>", "\n", stripped, flags=re.IGNORECASE)
             cleaned_lines.append(l)
 
@@ -666,16 +595,16 @@ def extract_text_from_pdf_bytes(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     include_headers_footers: bool = False,
     extract_picture_text: bool = True,
+    use_markdown_tables: bool = False,
 ) -> str:
     """
-    Extract structured Markdown text from PDF bytes using pymupdf4llm.
-    Preserves headings, lists, tables, and bold/italic styles.
+    Extract text from PDF bytes.
+    By default (use_markdown_tables=False), uses raw PyMuPDF text extraction to perfectly preserve reading order for NER.
+    If use_markdown_tables=True, uses pymupdf4llm to reconstruct Markdown tables (can cause torn words on invoices).
     Supports optional progress_callback(current_page, total_pages, status_text) for large PDFs.
-    Preserves document title on page 1 while suppressing running headers/footers on subsequent pages when include_headers_footers=False.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
     import pymupdf
-    import pymupdf4llm
     doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
     doc_pages = doc.page_count
 
@@ -689,25 +618,24 @@ def extract_text_from_pdf_bytes(
         )
 
     try:
-        if doc_pages > 1:
-            page_mds = []
+        page_mds = []
+        if use_markdown_tables:
+            import pymupdf4llm
             for page_idx in range(doc_pages):
                 if progress_callback:
                     progress_callback(
                         page_idx + 1,
                         doc_pages,
-                        f"PDF-Seite {page_idx + 1} von {doc_pages} wird extrahiert..."
+                        f"PDF-Seite {page_idx + 1} von {doc_pages} wird formatiert..."
                     )
                 if include_headers_footers:
                     use_h, use_f = True, True
                     margins = (0, 0, 0, 0)
                 else:
                     if page_idx == 0:
-                        # Page 1: Keep top title, suppress bottom footer margin
                         use_h, use_f = True, False
                         margins = (0, 0, 0, 40)
                     else:
-                        # Subsequent pages: Suppress running headers and footers
                         use_h, use_f = False, False
                         margins = (0, 40, 0, 40)
                 try:
@@ -721,22 +649,31 @@ def extract_text_from_pdf_bytes(
                     page_mds.append(p_md.strip())
                 except Exception:
                     page_mds.append(doc[page_idx].get_text().strip())
-            md_text = "\n\n".join(p for p in page_mds if p)
         else:
-            if progress_callback:
-                progress_callback(1, 1, "PDF-Inhalt wird extrahiert...")
-            use_h = True
-            use_f = include_headers_footers
-            margins = (0, 0, 0, 0) if include_headers_footers else (0, 0, 0, 40)
-            md_text = pymupdf4llm.to_markdown(
-                doc,
-                header=use_h,
-                footer=use_f,
-                margins=margins,
-            )
+            # Robust, standard text extraction for Named Entity Recognition (preserves line reading order perfectly)
+            for page_idx in range(doc_pages):
+                if progress_callback:
+                    progress_callback(
+                        page_idx + 1,
+                        doc_pages,
+                        f"PDF-Seite {page_idx + 1} von {doc_pages} wird extrahiert..."
+                    )
+                page = doc[page_idx]
+                if include_headers_footers:
+                    clip_rect = page.rect
+                else:
+                    r = page.rect
+                    if page_idx == 0:
+                        # Page 1: Keep top title, suppress bottom footer margin
+                        clip_rect = pymupdf.Rect(r.x0, r.y0, r.x1, r.y1 - 50)
+                    else:
+                        # Subsequent pages: Suppress running headers and footers
+                        clip_rect = pymupdf.Rect(r.x0, r.y0 + 50, r.x1, r.y1 - 50)
+                
+                page_text = page.get_text("text", clip=clip_rect).strip()
+                page_mds.append(page_text)
 
-        if not md_text.strip() and has_text:
-            md_text = pymupdf4llm.to_markdown(doc, header=True, footer=True)
+        md_text = "\n\n".join(p for p in page_mds if p)
     except Exception:
         pages_text = [page.get_text().strip() for page in doc if page.get_text().strip()]
         md_text = "\n\n--- Page Break ---\n\n".join(pages_text)
@@ -751,9 +688,10 @@ def extract_text_from_pdf(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     include_headers_footers: bool = False,
     extract_picture_text: bool = True,
+    use_markdown_tables: bool = False,
 ) -> str:
     """
-    Extract structured Markdown text from PDF files using pymupdf4llm.
+    Extract structured Markdown text from PDF files.
     Raises ValueError if PDF contains pages but zero extractable text (e.g. scanned image PDF).
     """
     p = Path(path)
@@ -766,6 +704,7 @@ def extract_text_from_pdf(
         progress_callback=progress_callback,
         include_headers_footers=include_headers_footers,
         extract_picture_text=extract_picture_text,
+        use_markdown_tables=use_markdown_tables,
     )
 
 
@@ -775,6 +714,7 @@ def read_document_from_bytes(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     include_headers_footers: bool = False,
     extract_picture_text: bool = True,
+    use_markdown_tables: bool = False,
 ) -> str:
     """Unified document reader from in-memory bytes with optional progress callback and extraction options."""
     ext = Path(filename).suffix.lower()
@@ -802,6 +742,7 @@ def read_document_from_bytes(
             progress_callback=progress_callback,
             include_headers_footers=include_headers_footers,
             extract_picture_text=extract_picture_text,
+            use_markdown_tables=use_markdown_tables,
         )
     else:
         raise UnsupportedFileFormatError(
@@ -814,6 +755,7 @@ def read_document(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     include_headers_footers: bool = False,
     extract_picture_text: bool = True,
+    use_markdown_tables: bool = False,
 ) -> str:
     """Unified document reader supporting .txt, .md, .json, .csv, .docx, and .pdf."""
     path = Path(file_path)
@@ -827,4 +769,5 @@ def read_document(
         progress_callback=progress_callback,
         include_headers_footers=include_headers_footers,
         extract_picture_text=extract_picture_text,
+        use_markdown_tables=use_markdown_tables,
     )

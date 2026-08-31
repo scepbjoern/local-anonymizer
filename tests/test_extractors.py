@@ -253,9 +253,9 @@ def test_read_document_from_bytes_with_progress():
 
     doc = pymupdf.open()
     p1 = doc.new_page()
-    p1.insert_text((50, 50), "Page 1 Content")
+    p1.insert_text((50, 150), "Page 1 Content")
     p2 = doc.new_page()
-    p2.insert_text((50, 50), "Page 2 Content")
+    p2.insert_text((50, 150), "Page 2 Content")
     pdf_bytes = doc.tobytes()
     doc.close()
 
