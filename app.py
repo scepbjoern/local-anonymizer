@@ -367,6 +367,8 @@ def _warmup_background_thread():
     try:
         logging.info("Background warming up GLiNER & Presidio AI models...")
         anon = build_anonymizer()
+        if anon.enable_eupii:
+            anon.eupii_recognizer.load()
         with _model_lock:
             _cached_anonymizer = anon
             _model_ready = True

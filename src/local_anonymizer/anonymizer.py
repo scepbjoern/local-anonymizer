@@ -334,12 +334,20 @@ class LocalAnonymizer:
             supported_languages=["de", "en"],
         )
 
-        # Reconfigure PhoneRecognizer with explicit Swiss and international region support
+        # Reconfigure PhoneRecognizer with explicit Swiss and international region support and authoritative score
         try:
             self.analyzer.registry.remove_recognizer("PhoneRecognizer")
         except Exception:
             pass
-        self.phone_recognizer = PhoneRecognizer(
+
+        class ValidatedPhoneRecognizer(PhoneRecognizer):
+            def analyze(self, text, entities=None, nlp_artifacts=None):
+                results = super().analyze(text, entities, nlp_artifacts)
+                for r in results:
+                    r.score = 1.0
+                return results
+
+        self.phone_recognizer = ValidatedPhoneRecognizer(
             supported_language=language,
             supported_regions=["CH", "DE", "AT", "US", "GB", "FR", "IT"],
         )
