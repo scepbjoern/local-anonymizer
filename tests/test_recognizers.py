@@ -1,3 +1,4 @@
+import os
 import re
 import pytest
 from local_anonymizer.recognizers import (
@@ -156,3 +157,234 @@ def test_gliner_does_not_merge_a_whitespace_separated_name_list():
         "Egzona Musliu",
         "Christoph Jampen",
     ]
+
+
+def test_set_huggingface_offline_mode_matrix_and_snapshot_restoration(monkeypatch):
+    """
+    Test all 6 combinations of initial state (None, '1') and loading path
+    (Cache Hit, Miss Success, Miss Error) to ensure exact snapshot restoration.
+    """
+    import os
+    import huggingface_hub.constants as hf_constants
+    from local_anonymizer.recognizers import set_huggingface_offline_mode
+
+    # Matrix: initial states to test
+    for init_env, init_const in [(None, False), ("1", True)]:
+        # 1. Cache Hit (local load in offline mode)
+        if init_env is None:
+            monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+        else:
+            monkeypatch.setenv("HF_HUB_OFFLINE", init_env)
+        monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", init_const)
+
+        with set_huggingface_offline_mode(True):
+            assert os.environ.get("HF_HUB_OFFLINE") == "1"
+            assert hf_constants.HF_HUB_OFFLINE is True
+
+        assert os.environ.get("HF_HUB_OFFLINE") == init_env
+        assert hf_constants.HF_HUB_OFFLINE is init_const
+
+        # 2. Miss Success (online fallback in online mode)
+        if init_env is None:
+            monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+        else:
+            monkeypatch.setenv("HF_HUB_OFFLINE", init_env)
+        monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", init_const)
+
+        with set_huggingface_offline_mode(False):
+            assert os.environ.get("HF_HUB_OFFLINE") is None
+            assert hf_constants.HF_HUB_OFFLINE is False
+
+        assert os.environ.get("HF_HUB_OFFLINE") == init_env
+        assert hf_constants.HF_HUB_OFFLINE is init_const
+
+        # 3. Miss Error (exception raised during online load)
+        if init_env is None:
+            monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+        else:
+            monkeypatch.setenv("HF_HUB_OFFLINE", init_env)
+        monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", init_const)
+
+        with pytest.raises(RuntimeError):
+            with set_huggingface_offline_mode(False):
+                assert os.environ.get("HF_HUB_OFFLINE") is None
+                assert hf_constants.HF_HUB_OFFLINE is False
+                raise RuntimeError("Simulated network timeout")
+
+        assert os.environ.get("HF_HUB_OFFLINE") == init_env
+        assert hf_constants.HF_HUB_OFFLINE is init_const
+
+
+def test_eupii_cli_subprocess_import_isolation():
+    """
+    Subprocess test: Verifies that when HF_HUB_OFFLINE=1 is present in the environment
+    prior to any python library imports, set_huggingface_offline_mode correctly synchronizes
+    both os.environ and huggingface_hub.constants at runtime without network calls.
+    """
+    import subprocess
+    import sys
+
+    code = """
+import os
+import sys
+
+# Ensure env var is set before import
+assert os.environ.get("HF_HUB_OFFLINE") == "1", "HF_HUB_OFFLINE must be 1"
+
+import huggingface_hub.constants as hf_constants
+from local_anonymizer.recognizers import set_huggingface_offline_mode
+
+# Before context manager: initial state
+assert os.environ.get("HF_HUB_OFFLINE") == "1"
+assert hf_constants.HF_HUB_OFFLINE is True
+
+# Online fallback simulation
+with set_huggingface_offline_mode(False):
+    assert os.environ.get("HF_HUB_OFFLINE") is None, "env must be cleared"
+    assert hf_constants.HF_HUB_OFFLINE is False, "constant must be False"
+
+# After context manager: restored state
+assert os.environ.get("HF_HUB_OFFLINE") == "1", "env must be restored to 1"
+assert hf_constants.HF_HUB_OFFLINE is True, "constant must be restored to True"
+print("SUBPROCESS_TEST_OK")
+"""
+    env = os.environ.copy()
+    env["HF_HUB_OFFLINE"] = "1"
+    env["PYTHONPATH"] = "src"
+
+    res = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, f"Subprocess failed with stderr: {res.stderr}\nstdout: {res.stdout}"
+    assert "SUBPROCESS_TEST_OK" in res.stdout
+
+
+def test_eupii_deterministic_suppression_full_and_partial_spans():
+    """
+    Test that EUPiiRecognizer pre-computes full-text protected deterministic spans (AHV, UID,
+    IBAN, Phone, Email, Address, URL, Date) and strictly rejects ANY overlapping ML candidate spans,
+    whether the candidate covers the full span or only a sub-span.
+    """
+    import torch
+    from local_anonymizer.recognizers import EUPiiRecognizer
+
+    # Synthetic text containing various deterministic entities + valid PII (Person, Location, Health)
+    text = (
+        "Patientin Dr. Beatrix Meier wohnt an der Musterstrasse 12, 8001 Zürich. "
+        "AHV: 756.9217.0769.85, UID: CHE-105.816.788, IBAN: CH9300762011623852957. "
+        "Tel: +41 79 123 45 67, Mail: test.user@beispiel.ch, Web: https://example.ch/privacy am 15.03.2024. "
+        "Diagnose: Diabetes mellitus Typ 2 in Bern."
+    )
+
+    rec = EUPiiRecognizer()
+
+    # Pre-computed protected spans must cover all deterministic items
+    prot_spans = rec._get_protected_deterministic_spans(text)
+    assert len(prot_spans) >= 8
+
+    # Create dummy tokenizer and model double returning candidates
+    class DummyTokenizer:
+        def __call__(self, t, **kwargs):
+            class DummyBatch(dict):
+                def to(self, device):
+                    return self
+            # Return dummy offset mapping covering the tokens we want to test
+            offsets = [
+                (0, 0),  # CLS
+                (text.find("Beatrix Meier"), text.find("Beatrix Meier") + len("Beatrix Meier")),  # PERSON -> KEEP
+                (text.find("8001 Zürich"), text.find("8001 Zürich") + len("8001 Zürich")),  # Sub-span of ADDRESS -> SUPPRESS
+                (text.find("756.9217.0769.85"), text.find("756.9217.0769.85") + 16),  # Full AHV -> SUPPRESS
+                (text.find("105.816.788"), text.find("105.816.788") + 11),  # Partial UID -> SUPPRESS
+                (text.find("7620116238"), text.find("7620116238") + 10),  # Partial IBAN -> SUPPRESS
+                (text.find("123 45 67"), text.find("123 45 67") + 9),  # Partial Phone -> SUPPRESS
+                (text.find("beispiel.ch"), text.find("beispiel.ch") + 11),  # Partial Email -> SUPPRESS
+                (text.find("https://example.ch"), text.find("https://example.ch") + 18),  # Partial URL -> SUPPRESS
+                (text.find("15.03.2024"), text.find("15.03.2024") + 10),  # Date -> SUPPRESS
+                (text.find("Diabetes mellitus Typ 2"), text.find("Diabetes mellitus Typ 2") + len("Diabetes mellitus Typ 2")),  # HEALTH -> KEEP
+                (text.find("Bern"), text.find("Bern") + 4),  # LOCATION -> KEEP
+                (0, 0),  # SEP
+            ]
+            batch = DummyBatch({
+                "input_ids": torch.tensor([[1] * len(offsets)]),
+                "attention_mask": torch.tensor([[1] * len(offsets)]),
+                "offset_mapping": [offsets],
+            })
+            return batch
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = type("Config", (), {
+                "id2label": {
+                    0: "O",
+                    1: "B-PERSON_NAME",
+                    2: "B-LOCATION",
+                    3: "B-DOCUMENT_IDENTIFIER",
+                    4: "B-HEALTH_DATA",
+                }
+            })()
+
+        def forward(self, **kwargs):
+            # Class logits for each token
+            num_tokens = 13
+            # logits: (1, num_tokens, 5 classes)
+            logits = torch.full((1, num_tokens, 5), -10.0)
+            logits[0, 1, 1] = 10.0  # Beatrix Meier -> PERSON
+            logits[0, 2, 2] = 10.0  # 8001 Zürich -> LOCATION (partial address)
+            logits[0, 3, 3] = 10.0  # AHV -> ID_NUMBER
+            logits[0, 4, 3] = 10.0  # Partial UID -> ID_NUMBER
+            logits[0, 5, 3] = 10.0  # Partial IBAN -> ID_NUMBER
+            logits[0, 6, 3] = 10.0  # Partial Phone -> ID_NUMBER
+            logits[0, 7, 3] = 10.0  # Partial Email -> ID_NUMBER
+            logits[0, 8, 3] = 10.0  # Partial URL -> ID_NUMBER
+            logits[0, 9, 3] = 10.0  # Date -> ID_NUMBER
+            logits[0, 10, 4] = 10.0  # Diabetes mellitus Typ 2 -> HEALTH_DATA
+            logits[0, 11, 2] = 10.0  # Bern -> LOCATION
+
+            return type("Outputs", (), {"logits": logits})()
+
+    rec.tokenizer = DummyTokenizer()
+    rec.model = DummyModel()
+    rec.id2label = rec.model.config.id2label
+    rec.device = "cpu"
+
+    results = rec.analyze(text)
+
+    # Verify: All overlapping deterministic spans were suppressed!
+    detected_texts = [text[r.start:r.end] for r in results]
+    assert "Beatrix Meier" in detected_texts
+    assert "Diabetes mellitus Typ 2" in detected_texts
+    assert "Bern" in detected_texts
+
+    assert "8001 Zürich" not in detected_texts
+    assert "756.9217.0769.85" not in detected_texts
+    assert "105.816.788" not in detected_texts
+    assert "7620116238" not in detected_texts
+    assert "123 45 67" not in detected_texts
+    assert "beispiel.ch" not in detected_texts
+    assert "https://example.ch" not in detected_texts
+    assert "15.03.2024" not in detected_texts
+
+    # Check method metadata
+    for r in results:
+        assert r.recognition_metadata["detection_method"] == "ai"
+        assert r.recognition_metadata["recognizer_name"] == "EUPiiRecognizer"
+
+
+def test_eupii_cache_isolation():
+    """Verify _EUPII_MODEL_CACHE retains loaded models and serves them without reload."""
+    from local_anonymizer.recognizers import EUPiiRecognizer, _EUPII_MODEL_CACHE, get_optimal_device
+
+    device = get_optimal_device()
+    dummy_tok = "dummy_tok"
+    dummy_model = type("DummyModel", (), {"config": type("Cfg", (), {"id2label": {1: "O"}})()})()
+    _EUPII_MODEL_CACHE[f"dummy/test-model_{device}"] = (dummy_tok, dummy_model)
+
+    rec = EUPiiRecognizer(model_name="dummy/test-model")
+    rec.load()
+    assert rec.tokenizer == "dummy_tok"
+    assert rec.model is dummy_model
+

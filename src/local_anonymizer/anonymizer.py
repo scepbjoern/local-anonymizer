@@ -289,10 +289,16 @@ class LocalAnonymizer:
         fuzzy_review_threshold: float = 75.0,
         enabled_entities: Optional[Sequence[str]] = None,
         enabled_glossary_entities: Optional[Sequence[str]] = None,
+        enable_eupii: bool = False,
+        eupii_threshold: float = 0.50,
+        eupii_model: str = "bardsai/eu-pii-anonimization-multilang",
     ):
         self.language = language
         self.glossary = glossary or {}
         self.gliner_threshold = gliner_threshold
+        self.enable_eupii = enable_eupii
+        self.eupii_threshold = eupii_threshold
+        self.eupii_model = eupii_model
 
         # Keep built-in safeguards separate from user terms: deliberate user ignores must take
         # precedence over glossary entries, while an explicit glossary entry may still override
@@ -311,9 +317,11 @@ class LocalAnonymizer:
 
         # Setup Presidio AnalyzerEngine with lightweight blank NLP engine
         from presidio_analyzer import AnalyzerEngine, RecognizerResult
+        from presidio_analyzer.predefined_recognizers import PhoneRecognizer
         from local_anonymizer.recognizers import (
             AHVNumberRecognizer,
             AddressPatternRecognizer,
+            EUPiiRecognizer,
             FuzzyGlossaryRecognizer,
             GLiNERRecognizer,
             UIDNumberRecognizer,
@@ -325,6 +333,17 @@ class LocalAnonymizer:
             nlp_engine=nlp_engine,
             supported_languages=["de", "en"],
         )
+
+        # Reconfigure PhoneRecognizer with explicit Swiss and international region support
+        try:
+            self.analyzer.registry.remove_recognizer("PhoneRecognizer")
+        except Exception:
+            pass
+        self.phone_recognizer = PhoneRecognizer(
+            supported_language=language,
+            supported_regions=["CH", "DE", "AT", "US", "GB", "FR", "IT"],
+        )
+        self.analyzer.registry.add_recognizer(self.phone_recognizer)
 
         # Add custom recognizers
         self.gliner_recognizer = GLiNERRecognizer(
@@ -342,12 +361,19 @@ class LocalAnonymizer:
         self.address_recognizer = AddressPatternRecognizer(supported_language=language)
         self.ahv_recognizer = AHVNumberRecognizer(supported_language=language)
         self.uid_recognizer = UIDNumberRecognizer(supported_language=language)
+        self.eupii_recognizer = EUPiiRecognizer(
+            model_name=eupii_model,
+            threshold=eupii_threshold,
+            supported_language=language,
+        )
 
         self.analyzer.registry.add_recognizer(self.address_recognizer)
         self.analyzer.registry.add_recognizer(self.ahv_recognizer)
         self.analyzer.registry.add_recognizer(self.uid_recognizer)
         self.analyzer.registry.add_recognizer(self.gliner_recognizer)
         self.analyzer.registry.add_recognizer(self.fuzzy_recognizer)
+        if self.enable_eupii:
+            self.analyzer.registry.add_recognizer(self.eupii_recognizer)
 
         # Remove Presidio's default SpacyRecognizer: it requires a full spaCy NER model, but we
         # intentionally use a blank (tokenizer-only) spaCy engine for fast startup and low
@@ -390,14 +416,38 @@ class LocalAnonymizer:
         self.user_ignore_terms = list(ignore_terms or [])
         self.ignore_terms = list(dict.fromkeys(self.default_ignore_terms + self.user_ignore_terms))
 
+    def set_eupii_enabled(self, enabled: bool, threshold: Optional[float] = None) -> None:
+        """Enable or disable EUPiiRecognizer in the active Presidio analyzer registry."""
+        self.enable_eupii = enabled
+        if threshold is not None:
+            self.eupii_threshold = threshold
+            self.eupii_recognizer.threshold = threshold
+
+        if enabled:
+            existing = [r for r in self.analyzer.registry.recognizers if r.name == "EUPiiRecognizer"]
+            if not existing:
+                self.analyzer.registry.add_recognizer(self.eupii_recognizer)
+        else:
+            try:
+                self.analyzer.registry.remove_recognizer("EUPiiRecognizer")
+            except Exception:
+                pass
+
     def _annotate_detection_methods(self, results: List[RecognizerResult]) -> None:
         """Attach a stable source label to every result for transparent review display."""
-        method_by_recognizer: Dict[str, str] = {}
+        method_by_recognizer: Dict[str, str] = {
+            "GLiNERRecognizer": "ai",
+            "EUPiiRecognizer": "ai",
+            "FuzzyGlossaryRecognizer": "glossary",
+            "AddressPatternRecognizer": "regex",
+            "AHVNumberRecognizer": "regex",
+            "UIDNumberRecognizer": "regex",
+        }
         for recognizer in self.analyzer.registry.get_recognizers(
             language=self.language,
             all_fields=True,
         ):
-            if recognizer.name == "GLiNERRecognizer":
+            if recognizer.name in ("GLiNERRecognizer", "EUPiiRecognizer"):
                 method_by_recognizer[recognizer.name] = "ai"
             elif recognizer.name == "FuzzyGlossaryRecognizer":
                 method_by_recognizer[recognizer.name] = "glossary"
@@ -457,6 +507,16 @@ class LocalAnonymizer:
                 "prompts": sorted(prompts),
             })
 
+        # EUPii: list if active
+        if self.enable_eupii and self.eupii_recognizer:
+            for category in self.eupii_recognizer.supported_entities:
+                add_source(category, {
+                    "kind": "model",
+                    "recognizer": "EUPiiRecognizer",
+                    "model_name": self.eupii_recognizer.model_name,
+                    "threshold": self.eupii_recognizer.threshold,
+                })
+
         # Glossary: count configured entries per category. A category with zero current entries
         # still shows up (it's "supported", just empty) so users see it's glossary-driven.
         glossary_counts: Dict[str, int] = {}
@@ -474,7 +534,7 @@ class LocalAnonymizer:
         # package) expose none, so they're labelled as an external library instead of showing an
         # empty regex field.
         for r in recognizers:
-            if r.name in ("GLiNERRecognizer", "FuzzyGlossaryRecognizer"):
+            if r.name in ("GLiNERRecognizer", "EUPiiRecognizer", "FuzzyGlossaryRecognizer"):
                 continue
             patterns = getattr(r, "patterns", None)
             for category in r.supported_entities:
@@ -665,7 +725,30 @@ class LocalAnonymizer:
         union_results.extend(m for m in other_hits if id(m) not in absorbed_container_ids)
         filtered_results = union_results
 
-        filtered_results.sort(key=lambda r: (r.end - r.start, _is_glossary_result(r), r.score), reverse=True)
+        def _get_source_priority(r: "RecognizerResult") -> int:
+            meta = r.recognition_metadata or {}
+            rec_name = meta.get("recognizer_name", "")
+            method = meta.get("detection_method", "")
+            if rec_name == "FuzzyGlossaryRecognizer" or method == "glossary":
+                return 3
+            if method in ("regex", "library") or rec_name in (
+                "AHVNumberRecognizer",
+                "UIDNumberRecognizer",
+                "AddressPatternRecognizer",
+                "IbanRecognizer",
+                "EmailRecognizer",
+                "PhoneRecognizer",
+                "UrlRecognizer",
+                "DateRecognizer",
+            ):
+                return 2
+            return 1  # Local AI models (GLiNER, EUPii)
+
+        # Sort by: Source Priority (Glossary > Deterministic > ML), Span length desc, Score desc
+        filtered_results.sort(
+            key=lambda r: (_get_source_priority(r), r.end - r.start, r.score),
+            reverse=True,
+        )
         accepted: List[RecognizerResult] = []
         accepted_spans: List[Tuple[int, int]] = []
 

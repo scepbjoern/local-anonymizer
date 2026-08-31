@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional
 
 # Suppress background library warnings to keep CLI output clean
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore")
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -52,6 +51,11 @@ def handle_anonymize(args: argparse.Namespace) -> None:
     threshold = config.get("threshold", 0.55)
     model = args.model or config.get("model", "urchade/gliner_multi_pii-v1")
 
+    # EU-PII parameters: CLI explicit flag > config > default False
+    enable_eupii = args.enable_eupii if getattr(args, "enable_eupii", None) is not None else config.get("enable_eupii", False)
+    eupii_threshold = args.eupii_threshold if getattr(args, "eupii_threshold", None) is not None else config.get("eupii_threshold", 0.50)
+    eupii_model = args.eupii_model or config.get("eupii_model_name", "bardsai/eu-pii-anonimization-multilang")
+
     print("=" * 70)
     print("🔒 LOCAL ANONYMIZER - PII SCRUBBING")
     print("=" * 70)
@@ -59,6 +63,8 @@ def handle_anonymize(args: argparse.Namespace) -> None:
     print(f"🌐 Language   : {language}")
     print(f"🤖 Model      : {model}")
     print(f"🎯 Threshold  : {threshold}")
+    if enable_eupii:
+        print(f"⚡ EU-PII Mod : {eupii_model} (Threshold: {eupii_threshold})")
     print(f"🔄 Reversible : {'No (--no-mapping enabled: permanent redaction)' if args.no_mapping else 'Yes (mapping table saved)'}")
 
     if glossary:
@@ -91,6 +97,9 @@ def handle_anonymize(args: argparse.Namespace) -> None:
             gliner_threshold=threshold,
             gliner_model=model,
             enabled_glossary_entities=enabled_glossary_entities,
+            enable_eupii=enable_eupii,
+            eupii_threshold=eupii_threshold,
+            eupii_model=eupii_model,
         )
 
         result = pipeline.process_file(
@@ -181,6 +190,10 @@ def main():
     anon_parser.add_argument("--config", "-c", default=None, help="Path to config.json (glossary, ignore terms, entity filters)")
     anon_parser.add_argument("--language", "-l", default=None, help="Language code (default: de)")
     anon_parser.add_argument("--model", "-m", default=None, help="GLiNER model identifier")
+    anon_parser.add_argument("--enable-eupii", action="store_true", default=None, help="Enable EU-PII multilingual model (XLM-RoBERTa)")
+    anon_parser.add_argument("--no-enable-eupii", action="store_false", dest="enable_eupii", help="Disable EU-PII multilingual model")
+    anon_parser.add_argument("--eupii-threshold", type=float, default=None, help="Confidence threshold for EU-PII (default: 0.50)")
+    anon_parser.add_argument("--eupii-model", type=str, default=None, help="EU-PII model identifier")
     anon_parser.add_argument("--no-mapping", action="store_true", help="Scrub PII permanently without saving mapping table")
 
     # Command: restore

@@ -12,6 +12,8 @@ dependencies = [
     "pymupdf4llm>=0.0.17",
     "python-docx>=1.2.0",
     "rapidfuzz>=3.14.5",
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
 ]
 
 [project.optional-dependencies]
@@ -27,3 +29,7 @@ gui = [
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "integration: marks tests as integration tests requiring local model cache or downloads (deselect with '-m \"not integration\"')",
+]
+addopts = "-m 'not integration'"

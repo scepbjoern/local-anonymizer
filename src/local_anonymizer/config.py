@@ -54,6 +54,9 @@ class AppConfig:
         # the UI derives the initial modes from active_entities when no mapping exists yet.
         self.entity_modes: Dict[str, str] = {}
         self.gliner_threshold: float = 0.55
+        self.enable_eupii: bool = False
+        self.eupii_threshold: float = 0.50
+        self.eupii_model_name: str = "bardsai/eu-pii-anonimization-multilang"
         self.ignore_terms: str = "CAS, DAS, MAS, BSc, MSc, PhD, MBA, Studierende, Studierenden, Dozent, Dozenten, Lehrperson, Berater, Aufgabensteller"
         self.glossary: str = "ZHAW: ORGANIZATION\nHWZ: ORGANIZATION\nUZH: ORGANIZATION\nETH: ORGANIZATION"
         self.export_format: str = "txt"
@@ -64,6 +67,9 @@ class AppConfig:
             "active_entities": self.active_entities,
             "entity_modes": self.entity_modes,
             "gliner_threshold": self.gliner_threshold,
+            "enable_eupii": self.enable_eupii,
+            "eupii_threshold": self.eupii_threshold,
+            "eupii_model_name": self.eupii_model_name,
             "ignore_terms": self.ignore_terms,
             "glossary": self.glossary,
             "export_format": self.export_format,
@@ -82,6 +88,9 @@ class AppConfig:
                 if str(mode) in VALID_ENTITY_MODES
             }
         config.gliner_threshold = data.get("gliner_threshold", config.gliner_threshold)
+        config.enable_eupii = bool(data.get("enable_eupii", config.enable_eupii))
+        config.eupii_threshold = float(data.get("eupii_threshold", config.eupii_threshold))
+        config.eupii_model_name = str(data.get("eupii_model_name", config.eupii_model_name))
         config.ignore_terms = data.get("ignore_terms", config.ignore_terms)
         config.glossary = data.get("glossary", config.glossary)
         config.export_format = data.get("export_format", config.export_format)

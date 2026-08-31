@@ -168,6 +168,9 @@ class AppState:
         self.format_mode: str = self.config.format_mode  # "numbered", "numbered_role", "role_only"
         self.export_format: str = self.config.export_format  # "txt", "md"
         self.gliner_threshold: float = self.config.gliner_threshold
+        self.enable_eupii: bool = self.config.enable_eupii
+        self.eupii_threshold: float = self.config.eupii_threshold
+        self.eupii_model_name: str = self.config.eupii_model_name
         self.sort_by: str = "Alphabetisch (A–Z)"  # Default alphabetical
         self.ignore_terms_text: str = self.config.ignore_terms
         self.glossary_text: str = self.config.glossary
@@ -244,6 +247,9 @@ def build_anonymizer(app_state: Optional[AppState] = None):
             enabled_entities=general_entities,
             enabled_glossary_entities=glossary_entities,
             gliner_threshold=app_state.gliner_threshold,
+            enable_eupii=app_state.enable_eupii,
+            eupii_threshold=app_state.eupii_threshold,
+            eupii_model=app_state.eupii_model_name,
         )
     else:
         cfg = AppConfig.load()
@@ -256,6 +262,9 @@ def build_anonymizer(app_state: Optional[AppState] = None):
             enabled_entities=general_entities,
             enabled_glossary_entities=glossary_entities,
             gliner_threshold=cfg.gliner_threshold,
+            enable_eupii=cfg.enable_eupii,
+            eupii_threshold=cfg.eupii_threshold,
+            eupii_model=cfg.eupii_model_name,
         )
 
 
@@ -273,6 +282,7 @@ def sync_cached_anonymizer_settings(anon, app_state: "AppState") -> None:
     anon.enabled_entities = general_entities
     anon.enabled_glossary_entities = glossary_entities
     anon.gliner_recognizer.threshold = app_state.gliner_threshold
+    anon.set_eupii_enabled(app_state.enable_eupii, app_state.eupii_threshold)
     anon.set_ignore_terms(parse_ignore_terms(app_state.ignore_terms_text))
     new_glossary = parse_glossary(app_state.glossary_text)
     anon.set_glossary(new_glossary)
@@ -416,6 +426,7 @@ def entity_mode_classes(mode: str) -> str:
 
 RECOGNIZER_METHODS: Dict[str, str] = {
     "GLiNERRecognizer": "ai",
+    "EUPiiRecognizer": "ai",
     "AddressPatternRecognizer": "regex",
     "AHVNumberRecognizer": "regex",
     "UIDNumberRecognizer": "regex",
@@ -500,6 +511,9 @@ def save_current_config(st: AppState):
         entity for entity, mode in st.entity_modes.items() if mode == ENTITY_MODE_ALL
     ]
     st.config.gliner_threshold = st.gliner_threshold
+    st.config.enable_eupii = st.enable_eupii
+    st.config.eupii_threshold = st.eupii_threshold
+    st.config.eupii_model_name = st.eupii_model_name
     st.config.ignore_terms = st.ignore_terms_text
     st.config.glossary = st.glossary_text
     st.config.export_format = st.export_format
@@ -1684,14 +1698,74 @@ def create_ui():
 
             ui.separator().classes("my-2")
 
-            ui.label("Erkennungs-Schwellenwert:").classes("text-xs font-semibold text-slate-700")
+            ui.label("Erkennungs-Schwellenwert (GLiNER):").classes("text-xs font-semibold text-slate-700")
             def on_thresh_change(e):
                 state.gliner_threshold = e.value
                 save_current_config(state)
                 if state.entity_groups and reanalysis_warning_card is not None:
                     reanalysis_warning_card.set_visibility(True)
             thresh_slider = ui.slider(min=0.20, max=0.95, step=0.05, value=state.gliner_threshold, on_change=on_thresh_change)
-            ui.label().bind_text_from(thresh_slider, "value", lambda v: f"Schwellenwert: {v:.2f}").classes("text-xs text-slate-500 mb-2")
+            ui.label().bind_text_from(thresh_slider, "value", lambda v: f"GLiNER Schwellenwert: {v:.2f}").classes("text-xs text-slate-500 mb-2")
+
+            ui.separator().classes("my-2")
+
+            # EU-PII Multilingual Model Toggle & Threshold
+            ui.label("EU-PII Multilingual Modell:").classes("text-xs font-semibold text-slate-700")
+            with ui.row().classes("w-full items-center justify-between gap-1 mb-1"):
+                eupii_spinner = ui.spinner(size="xs", color="primary")
+                eupii_spinner.set_visibility(False)
+
+                async def on_eupii_toggle(e):
+                    target_val = bool(e.value)
+                    if target_val:
+                        eupii_spinner.set_visibility(True)
+                        eupii_switch.disable()
+                        try:
+                            def load_eupii_model():
+                                with _model_lock:
+                                    anon = get_synced_cached_anonymizer(state)
+                                    anon.set_eupii_enabled(True, state.eupii_threshold)
+                                    anon.eupii_recognizer.load()
+                            await asyncio.to_thread(load_eupii_model)
+                            state.enable_eupii = True
+                            save_current_config(state)
+                            ui.notify("EU-PII Modell erfolgreich geladen und aktiviert.", type="positive")
+                        except Exception as ex:
+                            state.enable_eupii = False
+                            eupii_switch.value = False
+                            with _model_lock:
+                                if _cached_anonymizer is not None:
+                                    _cached_anonymizer.set_eupii_enabled(False)
+                            save_current_config(state)
+                            ui.notify(f"Fehler beim Laden des EU-PII Modells: {ex}", type="negative", timeout=10000)
+                        finally:
+                            eupii_spinner.set_visibility(False)
+                            eupii_switch.enable()
+                    else:
+                        state.enable_eupii = False
+                        with _model_lock:
+                            if _cached_anonymizer is not None:
+                                _cached_anonymizer.set_eupii_enabled(False)
+                        save_current_config(state)
+                        ui.notify("EU-PII Modell deaktiviert.", type="info")
+
+                    if state.entity_groups and reanalysis_warning_card is not None:
+                        reanalysis_warning_card.set_visibility(True)
+
+                eupii_switch = ui.switch("EU-PII Modell aktivieren", value=state.enable_eupii, on_change=on_eupii_toggle).props("dense").classes("text-xs")
+                eupii_switch.tooltip("Aktiviert das spezialisierte Token-Klassifikationsmodell bardsai/eu-pii für erweiterte Erkennung von Personen, Orten, IDs und Gesundheitsdaten.")
+
+            def on_eupii_thresh_change(e):
+                state.eupii_threshold = e.value
+                save_current_config(state)
+                with _model_lock:
+                    if _cached_anonymizer is not None:
+                        _cached_anonymizer.set_eupii_enabled(state.enable_eupii, state.eupii_threshold)
+                if state.entity_groups and reanalysis_warning_card is not None:
+                    reanalysis_warning_card.set_visibility(True)
+
+            eupii_slider = ui.slider(min=0.20, max=0.95, step=0.05, value=state.eupii_threshold, on_change=on_eupii_thresh_change)
+            ui.label().bind_text_from(eupii_slider, "value", lambda v: f"EU-PII Schwellenwert: {v:.2f}").classes("text-xs text-slate-500 mb-2")
 
             ui.separator().classes("my-2")
 

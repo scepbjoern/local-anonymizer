@@ -611,3 +611,98 @@ def test_entity_source_overview_reflects_glossary_master_switch():
 
     assert overview["IT_SYSTEM"]["active"] is False
     assert overview["IT_SYSTEM"]["mode"] == "off"
+
+
+def test_overlap_priority_hierarchy_glossary_over_deterministic_over_ai(monkeypatch):
+    """
+    Verify the 3-tier overlap hierarchy:
+    Tier 3 (Glossar) > Tier 2 (Deterministisch: AHV/UID/IBAN/etc.) > Tier 1 (Lokale KI: GLiNER/EU-PII)
+    """
+    from presidio_analyzer import RecognizerResult
+
+    anon = LocalAnonymizer(
+        glossary={"Spezialprojekt": "ORGANIZATION"},
+        enabled_entities=["ORGANIZATION", "AHV_NUMBER", "ID_NUMBER"],
+    )
+
+    # 1. Deterministic (AHV) vs AI (GLiNER / EU-PII with higher score or longer subspan)
+    def fake_analyze_det_vs_ai(text, **kwargs):
+        return [
+            RecognizerResult(
+                entity_type="ID_NUMBER",
+                start=0,
+                end=16,
+                score=0.99,
+                recognition_metadata={"recognizer_name": "EUPiiRecognizer", "detection_method": "ai"},
+            ),
+            RecognizerResult(
+                entity_type="AHV_NUMBER",
+                start=0,
+                end=16,
+                score=0.80,
+                recognition_metadata={"recognizer_name": "AHVNumberRecognizer", "detection_method": "regex"},
+            ),
+        ]
+
+    monkeypatch.setattr(anon.analyzer, "analyze", fake_analyze_det_vs_ai)
+    results = anon.analyze("756.9217.0769.85")
+    assert len(results) == 1
+    assert results[0].entity_type == "AHV_NUMBER"
+    assert results[0].recognition_metadata["detection_method"] == "regex"
+
+    # 2. Glossary vs Deterministic vs AI
+    def fake_analyze_glossary_vs_det(text, **kwargs):
+        return [
+            RecognizerResult(
+                entity_type="ORGANIZATION",
+                start=0,
+                end=14,
+                score=1.0,
+                recognition_metadata={"recognizer_name": "FuzzyGlossaryRecognizer", "detection_method": "glossary"},
+            ),
+            RecognizerResult(
+                entity_type="ID_NUMBER",
+                start=0,
+                end=14,
+                score=1.0,
+                recognition_metadata={"recognizer_name": "UIDNumberRecognizer", "detection_method": "regex"},
+            ),
+        ]
+
+    monkeypatch.setattr(anon.analyzer, "analyze", fake_analyze_glossary_vs_det)
+    results2 = anon.analyze("Spezialprojekt")
+    assert len(results2) == 1
+    assert results2[0].entity_type == "ORGANIZATION"
+    assert results2[0].recognition_metadata["recognizer_name"] == "FuzzyGlossaryRecognizer"
+
+
+def test_eupii_transparency_overview_and_metadata():
+    """Verify get_entity_source_overview includes EUPiiRecognizer when enabled."""
+    anon = LocalAnonymizer(enable_eupii=True, eupii_threshold=0.52)
+    overview = anon.get_entity_source_overview()
+    by_category = {row["category"]: row for row in overview}
+
+    # Categories supported by EUPii
+    for cat in ["PERSON", "LOCATION", "ID_NUMBER", "HEALTH_DATA"]:
+        assert cat in by_category
+        sources = by_category[cat]["sources"]
+        eupii_src = next((s for s in sources if s.get("recognizer") == "EUPiiRecognizer"), None)
+        assert eupii_src is not None
+        assert eupii_src["kind"] == "model"
+        assert eupii_src["threshold"] == 0.52
+
+
+def test_local_anonymizer_set_eupii_enabled_toggle():
+    """Verify dynamic enable and disable of EUPiiRecognizer on LocalAnonymizer."""
+    anon = LocalAnonymizer(enable_eupii=False)
+    reg_names = [r.name for r in anon.analyzer.registry.recognizers]
+    assert "EUPiiRecognizer" not in reg_names
+
+    anon.set_eupii_enabled(True, threshold=0.60)
+    reg_names = [r.name for r in anon.analyzer.registry.recognizers]
+    assert "EUPiiRecognizer" in reg_names
+    assert anon.eupii_recognizer.threshold == 0.60
+
+    anon.set_eupii_enabled(False)
+    reg_names = [r.name for r in anon.analyzer.registry.recognizers]
+    assert "EUPiiRecognizer" not in reg_names

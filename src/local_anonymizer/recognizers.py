@@ -1,7 +1,7 @@
-"""Custom Presidio recognizers: GLiNER zero-shot PII recognizer and RapidFuzz fuzzy glossary recognizer."""
-
+import contextlib
 import os
 import re
+import threading
 import unicodedata
 import warnings
 
@@ -19,10 +19,48 @@ try:
 except ImportError:
     pass
 
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from presidio_analyzer import EntityRecognizer, Pattern, PatternRecognizer, RecognizerResult
 from gliner import GLiNER
 from rapidfuzz import fuzz
+
+_HF_HUB_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def set_huggingface_offline_mode(offline: bool):
+    """
+    Thread-safe context manager to synchronize HuggingFace offline mode across both
+    os.environ and imported huggingface_hub runtime constants.
+    """
+    with _HF_HUB_LOCK:
+        prev_env = os.environ.get("HF_HUB_OFFLINE")
+        prev_const = None
+        hf_constants = None
+        try:
+            import huggingface_hub.constants as hf_constants
+            prev_const = getattr(hf_constants, "HF_HUB_OFFLINE", None)
+        except ImportError:
+            pass
+
+        try:
+            if offline:
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                if hf_constants is not None:
+                    hf_constants.HF_HUB_OFFLINE = True
+            else:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+                if hf_constants is not None:
+                    hf_constants.HF_HUB_OFFLINE = False
+            yield
+        finally:
+            if prev_env is not None:
+                os.environ["HF_HUB_OFFLINE"] = prev_env
+            else:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+
+            if hf_constants is not None and prev_const is not None:
+                hf_constants.HF_HUB_OFFLINE = prev_const
 
 
 # Common abbreviations in German and English texts that should not trigger sentence boundaries
@@ -285,13 +323,15 @@ class GLiNERRecognizer(EntityRecognizer):
                 self.model = self._MODEL_CACHE[self.model_name]
                 return
 
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            try:
-                self.model = GLiNER.from_pretrained(self.model_name, local_files_only=True)
-            except Exception:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-                self.model = GLiNER.from_pretrained(self.model_name)
-                os.environ["HF_HUB_OFFLINE"] = "1"
+            with set_huggingface_offline_mode(True):
+                try:
+                    self.model = GLiNER.from_pretrained(self.model_name, local_files_only=True)
+                except Exception:
+                    self.model = None
+
+            if self.model is None:
+                with set_huggingface_offline_mode(False):
+                    self.model = GLiNER.from_pretrained(self.model_name)
 
             device = get_optimal_device()
             if device != "cpu":
@@ -729,3 +769,358 @@ class UIDNumberRecognizer(ChecksumPatternRecognizer):
             name=name,
             supported_language=supported_language,
         )
+
+
+_EUPII_MODEL_CACHE: Dict[str, Tuple[Any, Any]] = {}
+_eupii_lock = threading.Lock()
+
+
+def _is_valid_iban(iban: str) -> bool:
+    """Validate an IBAN string using the official Modulo-97 algorithm."""
+    clean = re.sub(r"\s+", "", iban).upper()
+    if not re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{1,30}", clean):
+        return False
+    reordered = clean[4:] + clean[:4]
+    numeric = ""
+    for ch in reordered:
+        if ch.isdigit():
+            numeric += ch
+        elif "A" <= ch <= "Z":
+            numeric += str(ord(ch) - 55)
+        else:
+            return False
+    try:
+        return int(numeric) % 97 == 1
+    except Exception:
+        return False
+
+
+EU_PII_CATEGORY_MAPPING: Dict[str, str] = {
+    "PERSON_NAME": "PERSON",
+    "PROPER_NAME": "PERSON",
+    "PERSON_ALIAS": "PERSON",
+    "LOCATION": "LOCATION",
+    "POSTAL_ADDRESS": "LOCATION",
+    "GEO_LOCATION": "LOCATION",
+    "DOCUMENT_IDENTIFIER": "ID_NUMBER",
+    "DOCUMENT_REFERENCE": "ID_NUMBER",
+    "PERSON_IDENTIFIER": "ID_NUMBER",
+    "BANK_ACCOUNT_IDENTIFIER": "ID_NUMBER",
+    "ACCOUNT_IDENTIFIER": "ID_NUMBER",
+    "HEALTH_DATA": "HEALTH_DATA",
+}
+
+
+class EUPiiRecognizer(EntityRecognizer):
+    """
+    Presidio EntityRecognizer wrapping the multilingual XLM-RoBERTa token classification model
+    (bardsai/eu-pii-anonimization-multilang) with Fast Tokenizer overflow, sub-token span merging,
+    and canonical deterministic span suppression.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "bardsai/eu-pii-anonimization-multilang",
+        threshold: float = 0.50,
+        supported_language: str = "de",
+        name: str = "EUPiiRecognizer",
+    ):
+        self.model_name = model_name
+        self.threshold = threshold
+        self.tokenizer = None
+        self.model = None
+        self.id2label: Dict[int, str] = {}
+        self.device = get_optimal_device()
+
+        # Dedicated canonical recognizers for pre-computing protected deterministic spans
+        from presidio_analyzer.predefined_recognizers import (
+            DateRecognizer,
+            EmailRecognizer,
+            IbanRecognizer,
+            PhoneRecognizer,
+            UrlRecognizer,
+        )
+
+        self._ahv_rec = AHVNumberRecognizer(supported_language=supported_language)
+        self._uid_rec = UIDNumberRecognizer(supported_language=supported_language)
+        self._addr_rec = AddressPatternRecognizer(supported_language=supported_language)
+        self._iban_rec = IbanRecognizer(supported_language=supported_language)
+        self._email_rec = EmailRecognizer(supported_language=supported_language)
+        self._phone_rec = PhoneRecognizer(
+            supported_language=supported_language,
+            supported_regions=["CH", "DE", "AT", "US", "GB", "FR", "IT"],
+        )
+        self._url_rec = UrlRecognizer(supported_language=supported_language)
+        self._date_rec = DateRecognizer(supported_language=supported_language)
+
+        supported_entities = sorted(list(set(EU_PII_CATEGORY_MAPPING.values())))
+        self._is_initializing = True
+        super().__init__(
+            supported_entities=supported_entities,
+            supported_language=supported_language,
+            name=name,
+        )
+        self._is_initializing = False
+
+    def load(self) -> None:
+        """Load tokenizer and model with offline-first attempt and authorized first-run download fallback."""
+        cache_key = f"{self.model_name}_{self.device}"
+        if self._is_initializing:
+            with _eupii_lock:
+                if cache_key in _EUPII_MODEL_CACHE:
+                    self.tokenizer, self.model = _EUPII_MODEL_CACHE[cache_key]
+                    self.id2label = getattr(self.model.config, "id2label", {})
+            return
+
+        if self.model is not None and self.tokenizer is not None:
+            return
+
+        import torch
+        from transformers import AutoModelForTokenClassification, AutoTokenizer
+
+        with _eupii_lock:
+            if cache_key in _EUPII_MODEL_CACHE:
+                self.tokenizer, self.model = _EUPII_MODEL_CACHE[cache_key]
+                self.id2label = getattr(self.model.config, "id2label", {})
+                return
+
+            tokenizer = None
+            model = None
+
+            # 1. Offline-first attempt using local files only
+            with set_huggingface_offline_mode(True):
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(self.model_name, local_files_only=True)
+                    model = AutoModelForTokenClassification.from_pretrained(self.model_name, local_files_only=True)
+                except Exception:
+                    tokenizer = None
+                    model = None
+
+            # 2. Online download attempt on cache miss (authorized by explicit enable_eupii=True)
+            if tokenizer is None or model is None:
+                with set_huggingface_offline_mode(False):
+                    try:
+                        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                        model = AutoModelForTokenClassification.from_pretrained(self.model_name)
+                    except Exception as ex:
+                        raise RuntimeError(
+                            f"EU-PII Modell '{self.model_name}' konnte weder lokal noch online geladen werden: {ex}"
+                        ) from ex
+
+            model.eval()
+            if self.device != "cpu":
+                try:
+                    model.to(self.device)
+                except Exception:
+                    pass
+
+            _EUPII_MODEL_CACHE[cache_key] = (tokenizer, model)
+            self.tokenizer, self.model = tokenizer, model
+            self.id2label = getattr(self.model.config, "id2label", {})
+
+    def _get_protected_deterministic_spans(self, text: str) -> List[Tuple[int, int]]:
+        """Pre-compute all canonical deterministic spans from the entire text to suppress ML false positives."""
+        if not text or not text.strip():
+            return []
+        spans: List[Tuple[int, int]] = []
+
+        try:
+            for res in self._ahv_rec.analyze(text, entities=["AHV_NUMBER"]):
+                spans.append((res.start, res.end))
+        except Exception:
+            pass
+
+        try:
+            for res in self._uid_rec.analyze(text, entities=["UID_NUMBER"]):
+                spans.append((res.start, res.end))
+        except Exception:
+            pass
+
+        try:
+            for res in self._addr_rec.analyze(text, entities=["ADDRESS"]):
+                spans.append((res.start, res.end))
+        except Exception:
+            pass
+
+        try:
+            for res in self._iban_rec.analyze(text, entities=["IBAN_CODE"]):
+                spans.append((res.start, res.end))
+        except Exception:
+            pass
+
+        try:
+            for res in self._email_rec.analyze(text, entities=["EMAIL_ADDRESS"]):
+                spans.append((res.start, res.end))
+        except Exception:
+            pass
+
+        try:
+            for res in self._phone_rec.analyze(text, entities=["PHONE_NUMBER"]):
+                spans.append((res.start, res.end))
+        except Exception:
+            pass
+
+        try:
+            for res in self._url_rec.analyze(text, entities=["URL"]):
+                spans.append((res.start, res.end))
+        except Exception:
+            pass
+
+        try:
+            for res in self._date_rec.analyze(text, entities=["DATE_TIME"]):
+                spans.append((res.start, res.end))
+        except Exception:
+            pass
+
+        return spans
+
+    def analyze(
+        self,
+        text: str,
+        entities: Optional[Sequence[str]] = None,
+        nlp_artifacts: Any = None,
+    ) -> List[RecognizerResult]:
+        """Analyze text using fast tokenizer overflow, BIO tag aggregation, and canonical span suppression."""
+        if not text or not text.strip():
+            return []
+
+        if self.model is None or self.tokenizer is None:
+            self.load()
+
+        assert self.model is not None and self.tokenizer is not None
+
+        # 1. Pre-compute protected spans on full text
+        protected_spans = self._get_protected_deterministic_spans(text)
+
+        # 2. Fast Tokenizer Overflow encoding
+        import torch
+
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+            return_overflowing_tokens=True,
+            stride=64,
+            max_length=384,
+            truncation=True,
+            padding=True,
+        )
+        offset_mapping = inputs.pop("offset_mapping")  # (num_windows, seq_len, 2)
+        inputs.pop("overflow_to_sample_mapping", None)
+
+        if self.device != "cpu":
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            logits = outputs.logits  # (num_windows, seq_len, num_classes)
+            probabilities = torch.softmax(logits, dim=-1)
+            pred_scores, pred_ids = torch.max(probabilities, dim=-1)
+
+        raw_candidates: List[Dict[str, Any]] = []
+
+        num_windows = logits.shape[0]
+        for w_idx in range(num_windows):
+            w_scores = pred_scores[w_idx].tolist() if hasattr(pred_scores[w_idx], "tolist") else list(pred_scores[w_idx])
+            w_ids = pred_ids[w_idx].tolist() if hasattr(pred_ids[w_idx], "tolist") else list(pred_ids[w_idx])
+            w_offsets = offset_mapping[w_idx].tolist() if hasattr(offset_mapping[w_idx], "tolist") else list(offset_mapping[w_idx])
+
+            current_entity: Optional[Dict[str, Any]] = None
+
+            for token_id, score, (start_char, end_char) in zip(w_ids, w_scores, w_offsets):
+                # Skip special tokens (e.g. CLS, SEP, PAD with 0, 0 offsets)
+                if start_char == end_char:
+                    continue
+
+                label = self.id2label.get(token_id, "O")
+                if score < self.threshold or label == "O":
+                    if current_entity:
+                        raw_candidates.append(current_entity)
+                        current_entity = None
+                    continue
+
+                prefix, _, tag = label.partition("-")
+                std_type = EU_PII_CATEGORY_MAPPING.get(tag)
+                if not std_type:
+                    # Ignore categories not mapped in EU-PII selective activation
+                    if current_entity:
+                        raw_candidates.append(current_entity)
+                        current_entity = None
+                    continue
+
+                if prefix == "B" or (current_entity and current_entity["type"] != std_type):
+                    if current_entity:
+                        raw_candidates.append(current_entity)
+                    current_entity = {
+                        "type": std_type,
+                        "start": start_char,
+                        "end": end_char,
+                        "scores": [score],
+                    }
+                elif prefix == "I" and current_entity and current_entity["type"] == std_type:
+                    current_entity["end"] = end_char
+                    current_entity["scores"].append(score)
+                else:
+                    if current_entity:
+                        raw_candidates.append(current_entity)
+                    current_entity = {
+                        "type": std_type,
+                        "start": start_char,
+                        "end": end_char,
+                        "scores": [score],
+                    }
+
+            if current_entity:
+                raw_candidates.append(current_entity)
+
+        # 3. Deduplicate overlapping candidates across windows (keep highest score, then longest span)
+        raw_candidates.sort(
+            key=lambda c: (sum(c["scores"]) / len(c["scores"]), c["end"] - c["start"]),
+            reverse=True,
+        )
+        accepted_candidates: List[Dict[str, Any]] = []
+        accepted_spans: List[Tuple[int, int]] = []
+
+        for cand in raw_candidates:
+            c_start = cand["start"]
+            c_end = cand["end"]
+            overlaps_accepted = any(
+                not (c_end <= a_start or c_start >= a_end)
+                for a_start, a_end in accepted_spans
+            )
+            if not overlaps_accepted:
+                accepted_spans.append((c_start, c_end))
+                accepted_candidates.append(cand)
+
+        # 4. Strict Overlap Rejection against protected deterministic spans
+        results: List[RecognizerResult] = []
+        for cand in accepted_candidates:
+            c_start = cand["start"]
+            c_end = cand["end"]
+            overlaps_protected = any(
+                not (c_end <= p_start or c_start >= p_end)
+                for p_start, p_end in protected_spans
+            )
+            if overlaps_protected:
+                continue
+
+            std_type = cand["type"]
+            if entities is not None and std_type not in entities:
+                continue
+
+            avg_score = round(sum(cand["scores"]) / len(cand["scores"]), 3)
+            results.append(
+                RecognizerResult(
+                    entity_type=std_type,
+                    start=c_start,
+                    end=c_end,
+                    score=avg_score,
+                    recognition_metadata={
+                        "recognizer_name": self.name,
+                        "detection_method": "ai",
+                        "method_detail": "bardsai/eu-pii (XLM-RoBERTa)",
+                    },
+                )
+            )
+
+        return results

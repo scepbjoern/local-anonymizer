@@ -1116,6 +1116,8 @@ dependencies = [
     { name = "pymupdf4llm" },
     { name = "python-docx" },
     { name = "rapidfuzz" },
+    { name = "torch" },
+    { name = "transformers" },
 ]
 
 [package.optional-dependencies]
@@ -1141,6 +1143,8 @@ requires-dist = [
     { name = "python-docx", specifier = ">=1.2.0" },
     { name = "pywebview", marker = "extra == 'gui'", specifier = ">=5.0.0" },
     { name = "rapidfuzz", specifier = ">=3.14.5" },
+    { name = "torch", specifier = ">=2.0.0" },
+    { name = "transformers", specifier = ">=4.40.0" },
 ]
 
 [[package]]

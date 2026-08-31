@@ -33,6 +33,9 @@ class AnonymizationPipeline:
         gliner_model: str = "urchade/gliner_multi_pii-v1",
         gliner_threshold: float = 0.55,
         enabled_glossary_entities: Optional[Sequence[str]] = None,
+        enable_eupii: bool = False,
+        eupii_threshold: float = 0.50,
+        eupii_model: str = "bardsai/eu-pii-anonimization-multilang",
     ):
         self.anonymizer = LocalAnonymizer(
             language=language,
@@ -43,6 +46,9 @@ class AnonymizationPipeline:
             gliner_model=gliner_model,
             gliner_threshold=gliner_threshold,
             enabled_glossary_entities=enabled_glossary_entities,
+            enable_eupii=enable_eupii,
+            eupii_threshold=eupii_threshold,
+            eupii_model=eupii_model,
         )
 
     def process_file(
