@@ -388,3 +388,86 @@ def test_eupii_cache_isolation():
     assert rec.tokenizer == "dummy_tok"
     assert rec.model is dummy_model
 
+
+def test_eupii_subtoken_span_score_aggregation():
+    """Verify that multi-subtoken tokens (e.g. 13 + 890 + 39) are aggregated as a whole span even if token 1 is low."""
+    import torch
+    from local_anonymizer.recognizers import EUPiiRecognizer
+
+    rec = EUPiiRecognizer(threshold=0.50)
+    text = "Versicherten-Nr. 1389039 abgeschlossen."
+
+    class DummyBatch(dict):
+        def pop(self, key, default=None):
+            return super().pop(key, default)
+
+    class DummyTokenizer:
+        def __call__(self, text, **kwargs):
+            # Token offsets:
+            # 0: [0, 16] "Versicherten-Nr." -> O
+            # 1: [16, 17] " " -> O
+            # 2: [17, 19] "13" -> B-DOCUMENT_IDENTIFIER (score 0.45)
+            # 3: [19, 22] "890" -> I-DOCUMENT_IDENTIFIER (score 0.95)
+            # 4: [22, 24] "39" -> I-DOCUMENT_IDENTIFIER (score 0.95)
+            # 5: [24, 25] " " -> O
+            # 6: [25, 38] "abgeschlossen" -> O
+            # 7: [38, 39] "." -> O
+            offsets = [
+                (0, 16),
+                (16, 17),
+                (17, 19),
+                (19, 22),
+                (22, 24),
+                (24, 25),
+                (25, 38),
+                (38, 39),
+            ]
+            batch = DummyBatch({
+                "input_ids": torch.tensor([[1] * len(offsets)]),
+                "attention_mask": torch.tensor([[1] * len(offsets)]),
+                "offset_mapping": [offsets],
+            })
+            return batch
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = type("Config", (), {
+                "id2label": {
+                    0: "O",
+                    1: "B-DOCUMENT_IDENTIFIER",
+                    2: "I-DOCUMENT_IDENTIFIER",
+                }
+            })()
+
+        def forward(self, **kwargs):
+            num_tokens = 8
+            logits = torch.full((1, num_tokens, 3), -10.0)
+            logits[0, 0, 0] = 10.0
+            logits[0, 1, 0] = 10.0
+            # Token 2: 13 with argmax B-DOCUMENT_IDENTIFIER (class 1) but score ~0.40 (< 0.50 threshold)
+            logits[0, 2, 0] = -0.5
+            logits[0, 2, 1] = 0.0
+            logits[0, 2, 2] = -0.1
+            # Token 3: 890 with score ~0.95
+            logits[0, 3, 2] = 10.0
+            # Token 4: 39 with score ~0.95
+            logits[0, 4, 2] = 10.0
+            logits[0, 5, 0] = 10.0
+            logits[0, 6, 0] = 10.0
+            logits[0, 7, 0] = 10.0
+            return type("Outputs", (), {"logits": logits})()
+
+    rec.tokenizer = DummyTokenizer()
+    rec.model = DummyModel()
+    rec.id2label = rec.model.config.id2label
+    rec.device = "cpu"
+
+    results = rec.analyze(text)
+    assert len(results) == 1
+    res = results[0]
+    assert res.entity_type == "ID_NUMBER"
+    assert text[res.start:res.end] == "1389039"
+    assert res.score >= 0.50
+
+

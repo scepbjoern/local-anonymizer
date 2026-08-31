@@ -807,6 +807,9 @@ EU_PII_CATEGORY_MAPPING: Dict[str, str] = {
     "PERSON_IDENTIFIER": "ID_NUMBER",
     "BANK_ACCOUNT_IDENTIFIER": "ID_NUMBER",
     "ACCOUNT_IDENTIFIER": "ID_NUMBER",
+    "ORGANIZATION_IDENTIFIER": "ID_NUMBER",
+    "DEVICE_IDENTIFIER": "ID_NUMBER",
+    "VEHICLE_IDENTIFIER": "ID_NUMBER",
     "HEALTH_DATA": "HEALTH_DATA",
 }
 
@@ -815,7 +818,7 @@ class EUPiiRecognizer(EntityRecognizer):
     """
     Presidio EntityRecognizer wrapping the multilingual XLM-RoBERTa token classification model
     (bardsai/eu-pii-anonimization-multilang) with Fast Tokenizer overflow, sub-token span merging,
-    and canonical deterministic span suppression.
+    whole-span score aggregation, and canonical deterministic span suppression.
     """
 
     def __init__(
@@ -919,74 +922,60 @@ class EUPiiRecognizer(EntityRecognizer):
             self.id2label = getattr(self.model.config, "id2label", {})
 
     def _get_protected_deterministic_spans(self, text: str) -> List[Tuple[int, int]]:
-        """Pre-compute all canonical deterministic spans from the entire text to suppress ML false positives."""
-        if not text or not text.strip():
-            return []
-        spans: List[Tuple[int, int]] = []
+        """
+        Runs canonical deterministic recognizers on the full text and collects all protected spans
+        to prevent EU-PII from generating partial overlaps.
+        """
+        protected_spans: List[Tuple[int, int]] = []
 
-        try:
-            for res in self._ahv_rec.analyze(text, entities=["AHV_NUMBER"]):
-                spans.append((res.start, res.end))
-        except Exception:
-            pass
+        # 1. AHV
+        for r in self._ahv_rec.analyze(text, entities=["ID_NUMBER"]):
+            protected_spans.append((r.start, r.end))
 
-        try:
-            for res in self._uid_rec.analyze(text, entities=["UID_NUMBER"]):
-                spans.append((res.start, res.end))
-        except Exception:
-            pass
+        # 2. UID
+        for r in self._uid_rec.analyze(text, entities=["ID_NUMBER"]):
+            protected_spans.append((r.start, r.end))
 
-        try:
-            for res in self._addr_rec.analyze(text, entities=["ADDRESS"]):
-                spans.append((res.start, res.end))
-        except Exception:
-            pass
+        # 3. Address
+        for r in self._addr_rec.analyze(text, entities=["LOCATION"]):
+            protected_spans.append((r.start, r.end))
 
-        try:
-            for res in self._iban_rec.analyze(text, entities=["IBAN_CODE"]):
-                spans.append((res.start, res.end))
-        except Exception:
-            pass
+        # 4. IBAN
+        for r in self._iban_rec.analyze(text, entities=["IBAN_CODE"]):
+            protected_spans.append((r.start, r.end))
 
-        try:
-            for res in self._email_rec.analyze(text, entities=["EMAIL_ADDRESS"]):
-                spans.append((res.start, res.end))
-        except Exception:
-            pass
+        # 5. Email
+        for r in self._email_rec.analyze(text, entities=["EMAIL_ADDRESS"]):
+            protected_spans.append((r.start, r.end))
 
-        try:
-            for res in self._phone_rec.analyze(text, entities=["PHONE_NUMBER"]):
-                spans.append((res.start, res.end))
-        except Exception:
-            pass
+        # 6. Phone
+        for r in self._phone_rec.analyze(text, entities=["PHONE_NUMBER"]):
+            protected_spans.append((r.start, r.end))
 
-        try:
-            for res in self._url_rec.analyze(text, entities=["URL"]):
-                spans.append((res.start, res.end))
-        except Exception:
-            pass
+        # 7. URL
+        for r in self._url_rec.analyze(text, entities=["URL"]):
+            protected_spans.append((r.start, r.end))
 
-        try:
-            for res in self._date_rec.analyze(text, entities=["DATE_TIME"]):
-                spans.append((res.start, res.end))
-        except Exception:
-            pass
+        # 8. Date
+        for r in self._date_rec.analyze(text, entities=["DATE_TIME"]):
+            protected_spans.append((r.start, r.end))
 
-        return spans
+        return protected_spans
 
     def analyze(
         self,
         text: str,
-        entities: Optional[Sequence[str]] = None,
-        nlp_artifacts: Any = None,
+        entities: Optional[List[str]] = None,
+        nlp_artifacts: Optional[Any] = None,
     ) -> List[RecognizerResult]:
-        """Analyze text using fast tokenizer overflow, BIO tag aggregation, and canonical span suppression."""
+        """
+        Executes token classification over sliding windows with whole-span score aggregation,
+        deduplication, and canonical overlap suppression.
+        """
         if not text or not text.strip():
             return []
 
-        if self.model is None or self.tokenizer is None:
-            self.load()
-
+        self.load()
         assert self.model is not None and self.tokenizer is not None
 
         # 1. Pre-compute protected spans on full text
@@ -1027,34 +1016,46 @@ class EUPiiRecognizer(EntityRecognizer):
 
             current_entity: Optional[Dict[str, Any]] = None
 
+            def flush_entity() -> None:
+                nonlocal current_entity
+                if current_entity:
+                    mean_score = sum(current_entity["scores"]) / len(current_entity["scores"])
+                    if mean_score >= self.threshold:
+                        raw_candidates.append({
+                            "type": current_entity["type"],
+                            "start": current_entity["start"],
+                            "end": current_entity["end"],
+                            "scores": current_entity["scores"],
+                            "score": mean_score,
+                        })
+                    current_entity = None
+
             for token_id, score, (start_char, end_char) in zip(w_ids, w_scores, w_offsets):
                 # Skip special tokens (e.g. CLS, SEP, PAD with 0, 0 offsets)
                 if start_char == end_char:
                     continue
 
                 label = self.id2label.get(token_id, "O")
-                if score < self.threshold or label == "O":
-                    if current_entity:
-                        raw_candidates.append(current_entity)
-                        current_entity = None
+                if label == "O":
+                    flush_entity()
                     continue
 
                 prefix, _, tag = label.partition("-")
                 std_type = EU_PII_CATEGORY_MAPPING.get(tag)
                 if not std_type:
                     # Ignore categories not mapped in EU-PII selective activation
-                    if current_entity:
-                        raw_candidates.append(current_entity)
-                        current_entity = None
+                    flush_entity()
                     continue
 
-                # If subtoken continuation of current entity (no whitespace between tokens) or I-tag continuation
-                if current_entity and current_entity["type"] == std_type and (current_entity["end"] == start_char or prefix == "I"):
+                # Subtoken continuation (no whitespace between tokens) or I-tag continuation
+                is_subtoken = current_entity is not None and current_entity["end"] == start_char
+                is_i_tag = prefix == "I"
+
+                if current_entity is not None and current_entity["type"] == std_type and (is_subtoken or is_i_tag):
                     current_entity["end"] = end_char
                     current_entity["scores"].append(score)
                 else:
-                    if current_entity:
-                        raw_candidates.append(current_entity)
+                    flush_entity()
                     current_entity = {
                         "type": std_type,
                         "start": start_char,
@@ -1062,12 +1063,11 @@ class EUPiiRecognizer(EntityRecognizer):
                         "scores": [score],
                     }
 
-            if current_entity:
-                raw_candidates.append(current_entity)
+            flush_entity()
 
         # 3. Deduplicate overlapping candidates across windows (keep highest score, then longest span)
         raw_candidates.sort(
-            key=lambda c: (sum(c["scores"]) / len(c["scores"]), c["end"] - c["start"]),
+            key=lambda c: (c["score"], c["end"] - c["start"]),
             reverse=True,
         )
         accepted_candidates: List[Dict[str, Any]] = []
@@ -1076,12 +1076,25 @@ class EUPiiRecognizer(EntityRecognizer):
         for cand in raw_candidates:
             c_start = cand["start"]
             c_end = cand["end"]
+
+            # Trim leading/trailing whitespace if any
+            span_str = text[c_start:c_end]
+            l_strip = len(span_str) - len(span_str.lstrip())
+            r_strip = len(span_str) - len(span_str.rstrip())
+            c_start += l_strip
+            c_end -= r_strip
+
+            if c_start >= c_end:
+                continue
+
             overlaps_accepted = any(
                 not (c_end <= a_start or c_start >= a_end)
                 for a_start, a_end in accepted_spans
             )
             if not overlaps_accepted:
                 accepted_spans.append((c_start, c_end))
+                cand["start"] = c_start
+                cand["end"] = c_end
                 accepted_candidates.append(cand)
 
         # 4. Strict Overlap Rejection against protected deterministic spans
@@ -1100,7 +1113,7 @@ class EUPiiRecognizer(EntityRecognizer):
             if entities is not None and std_type not in entities:
                 continue
 
-            avg_score = round(sum(cand["scores"]) / len(cand["scores"]), 3)
+            avg_score = round(cand["score"], 3)
             results.append(
                 RecognizerResult(
                     entity_type=std_type,
