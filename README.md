@@ -34,6 +34,22 @@ Für die praktische Nutzung steht ein deutschsprachiger [Benutzerleitfaden](docs
 
 ### 1. Installation
 
+#### Option A: Automated Setup via Local AI Coding Assistant (Recommended for AI Workflows)
+
+If you use a local AI coding assistant with terminal and filesystem permissions (such as OpenAI Codex, Claude Code, Cursor, Windsurf, or Google Antigravity), you can delegate the complete installation with a single prompt:
+
+> **Agent Prompt:**
+> *"Klone das Repository https://github.com/scepbjoern/local-anonymizer in <Zielordner> und installiere die Applikation."*
+> *(Or in English: "Clone https://github.com/scepbjoern/local-anonymizer into <target_folder> and install the application.")*
+
+The AI assistant will inspect [`AGENTS.md`](AGENTS.md) and [`pyproject.toml`](pyproject.toml) to automatically handle environment setup, `uv sync --extra gui`, and verification tests.
+
+> [!NOTE]
+> **Empirical Verification & Security Disclosure:**
+> This automated installation path was empirically verified on Windows using OpenAI Codex ($n=1$). Delegating execution commands to an AI agent grants it local execution rights on your system. For users who prefer full transparency and step-by-step control, use the manual setup below.
+
+#### Option B: Manual Setup (Standard)
+
 Using [`uv`](https://github.com/astral-sh/uv) (recommended):
 
 ```bash
