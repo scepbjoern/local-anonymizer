@@ -75,9 +75,12 @@
 ## 2. Kernkomponenten im Detail
 
 ### 2.1 Extraktoren (`extractors.py`)
-- **`extract_text_from_pdf_bytes`:** Nutzt die erprobte RAG-Layout-Engine von PyMuPDF zur Umwandlung von PDF-Seiten in semantisch sauberes Markdown (erhält Überschriften, Listen, Fettungen und Tabellenstrukturen ohne Wörter in rahmenlosen Tabellen zu zerschneiden). Unterstützt Bildtext-Filterung und wiederkehrende Kopf-/Fußzeilen-Filterung mit Seite-1-Titelschutz.
-- **In-Memory & Streaming-Puffer:** Sämtliche Extraktoren und NLP-Analysen arbeiten nativ auf `bytes` (`read_document_from_bytes`). Beim Drag-and-Drop im GUI wird zur zuverlässigen Übertragung großer Dokumente (bis 50 MB) ein temporärer HTTP-Streaming-Puffer (`~/.local-anonymizer/temp_uploads`) verwendet, der per `try...finally` sofort nach dem RAM-Ladevorgang sowie über `atexit` beim Session-Ende bereinigt wird.
-- **Fehlerbehandlung:** Bildbasierte PDFs ohne Textlayer werden über `doc.page_count > 0 and not pages_text` erkannt und werfen `ValueError` mit klarer OCR-Hinweismeldung.
+- **`extract_text_from_pdf_bytes`:** Nutzt die erprobte RAG-Layout-Engine von PyMuPDF zur Umwandlung von PDF-Seiten in semantisch sauberes Markdown (erhält Überschriften, Listen, Fettungen und Tabellenstrukturen ohne Wörter in rahmenlosen Tabellen zu zerschneiden). Unterstützt Bildtext-Filterung, wiederkehrende Kopf-/Fußzeilen-Filterung mit Seite-1-Titelschutz sowie Multi-Core-Parallelisierung via `ProcessPoolExecutor`.
+- **In-Memory & Lokale Puffer-Bereinigung:** Sämtliche Extraktoren und NLP-Analysen arbeiten grundsätzlich auf In-Memory-`bytes` (`read_document_from_bytes`). Zwei spezifische Vorgänge nutzen das geschützte Anwendungsverzeichnis `~/.local-anonymizer/temp_uploads`:
+  1. *Drag-and-Drop im GUI:* Zur zuverlässigen Übertragung großer Dateien (bis 50 MB) ohne WebSocket-Limits als HTTP-Streaming-Puffer.
+  2. *Mehrseitige PDF-Extraktion:* Zur Vermeidung von Windows-IPC-Serialisierungs-Overhead bei Multiprocessing-Seiten-Dispatch als kurzzeitige geteilte Zwischendatei.
+  Beide Pfade sind durch `try...finally`-Sofortlöschung, Startup-Bereinigung (`cleanup_temp_uploads` / `cleanup_extraction_temp_files`) sowie `atexit`-Handler gegen verwaiste Dateien abgesichert.
+- **Fehlerbehandlung:** Bildbasierte PDFs ohne Textlayer werden über `doc.page_count > 0 and not pages_text` erkannt und werfen `ValueError` mit klarer OCR-Hinweismeldung. Bei mehrseitigen PDFs fängt eine 3-Stufen-Fehlerbehandlung Einzelseitenfehler ab, ohne das Gesamtdokument abzubrechen.
 
 ### 2.2 Presidio Analyzer & Custom Recognizers (`recognizers.py`)
 - **`GLiNERRecognizer`:**

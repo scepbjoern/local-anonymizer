@@ -560,5 +560,28 @@ def test_pdf_parallel_extraction_corrupted_page_resilience(monkeypatch):
     assert "Resilient Section 2" in extracted
 
 
+def test_pdf_temp_extraction_file_cleanup():
+    """Verify that multi-page PDF multiprocessing extraction cleans up its temp files in TEMP_UPLOADS_DIR."""
+    import pymupdf
+    from local_anonymizer.extractors import extract_text_from_pdf_bytes, TEMP_UPLOADS_DIR
+
+    doc = pymupdf.open()
+    for i in range(1, 4):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 200), f"Cleanup Page {i}", fontsize=12)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    # Pre-check: count existing PDF files in TEMP_UPLOADS_DIR
+    initial_pdfs = list(TEMP_UPLOADS_DIR.glob("*.pdf"))
+
+    text = extract_text_from_pdf_bytes(pdf_bytes)
+    assert "Cleanup Page 1" in text
+
+    # Post-check: ensure temp PDF was deleted in finally block
+    remaining_pdfs = list(TEMP_UPLOADS_DIR.glob("*.pdf"))
+    assert len(remaining_pdfs) == len(initial_pdfs)
+
+
 
 

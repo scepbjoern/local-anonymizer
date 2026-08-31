@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import concurrent.futures
 import csv
 import io
@@ -15,6 +16,28 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 _pdf_env_lock = threading.Lock()
+
+CONFIG_DIR = Path.home() / ".local-anonymizer"
+TEMP_UPLOADS_DIR = CONFIG_DIR / "temp_uploads"
+TEMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_extraction_temp_files():
+    """Clean up any stale temporary PDF extraction files from ~/.local-anonymizer/temp_uploads."""
+    try:
+        if TEMP_UPLOADS_DIR.exists():
+            for f in TEMP_UPLOADS_DIR.glob("*.pdf"):
+                try:
+                    f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+if os.environ.get("LOCAL_ANONYMIZER_PDF_WORKER") != "1":
+    cleanup_extraction_temp_files()
+atexit.register(cleanup_extraction_temp_files)
 
 
 class UnsupportedFileFormatError(ValueError):
@@ -683,7 +706,8 @@ def extract_text_from_pdf_bytes(
         page_mds = [None] * doc_pages
         completed_pages = 0
 
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        TEMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(suffix=".pdf", dir=TEMP_UPLOADS_DIR, delete=False) as tmp:
             tmp.write(raw_bytes)
             tmp_path = tmp.name
 
