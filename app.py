@@ -338,13 +338,14 @@ def render_entity_source_overview(overview: List[Dict[str, Any]]) -> None:
                     with ui.row().classes("items-start gap-2 flex-wrap"):
                         ui.badge(kind_label, color=kind_color).props("dense outline")
                         if src["kind"] == "prompt":
-                            ui.label(", ".join(f'"{p}"' for p in src["prompts"])).classes(
+                            prompts_str = ", ".join(f'"{p}"' for p in src["prompts"])
+                            ui.label(f"GLiNER Zero-Shot: {prompts_str}").classes(
                                 "text-xs text-slate-600 font-mono"
                             )
                         elif src["kind"] == "model":
-                            rec_name = src.get("recognizer", "EUPiiRecognizer")
+                            model_name = src.get("model_name", "bardsai/eu-pii-anonimization-multilang")
                             thresh = src.get("threshold", 0.5)
-                            ui.label(f'Modell: {rec_name} (Schwellenwert: {thresh:.2f})').classes(
+                            ui.label(f"EU-PII Token-Klassifikator ({model_name}, Schwellenwert: {thresh:.2f})").classes(
                                 "text-xs text-slate-600 font-mono"
                             )
                         elif src["kind"] == "regex":
@@ -358,7 +359,11 @@ def render_entity_source_overview(overview: List[Dict[str, Any]]) -> None:
                             noun = "Eintrag" if count == 1 else "Einträge"
                             ui.label(f"{count} {noun} in deiner Begriffsliste").classes("text-xs text-slate-600")
                         elif src["kind"] == "library":
-                            ui.label(f'externe Bibliothek ({src["recognizer"]})').classes("text-xs text-slate-600")
+                            rec_name = src.get("recognizer", "")
+                            if "Phone" in rec_name:
+                                ui.label("Google phonenumbers (libphonenumber für CH/intl. Rufnummern)").classes("text-xs text-slate-600")
+                            else:
+                                ui.label(f'externe Bibliothek ({rec_name})').classes("text-xs text-slate-600")
 
 
 def _warmup_background_thread():
@@ -2550,15 +2555,17 @@ def create_ui():
                 with ui.tab_panel(tab_transparency):
                     ui.label("Wie werden Entitäten erkannt?").classes("text-base font-bold text-slate-800 mb-1")
                     ui.label(
-                        "Pro Kategorie: ob sie aktuell aktiv ist, und über welchen Mechanismus sie erkannt wird -- "
-                        "ein KI-Prompt an das Zero-Shot-Modell, ein regulärer Ausdruck, eine externe Bibliothek, "
-                        "oder deine eigene Begriffsliste. Reine Anzeige, hier wird nichts verändert."
+                        "Pro Kategorie: ob sie aktuell aktiv ist, und über welche Mechanismen sie erkannt wird -- "
+                        "Zero-Shot-Prompts via GLiNER, das spezialisierte EU-PII-Klassifikationsmodell "
+                        "(selektiv für Personen, Orte, IDs und Gesundheitsdaten), reguläre Ausdrücke (z. B. AHV, UID, IBAN), "
+                        "externe Bibliotheken (z. B. Google phonenumbers) oder deine eigene Begriffsliste. "
+                        "Reine Anzeige, hier wird nichts verändert."
                     ).classes("text-xs text-slate-500 mb-1")
                     ui.label(
-                        "Hat eine Kategorie mehrere Quellen (z. B. KI-Prompt + Regex), arbeiten sie ergänzend "
-                        "zusammen statt sich zu widersprechen: alle Kandidaten werden gesammelt, und bei "
-                        "überlappenden Funden gewinnt der längere Fund -- bei gleicher Länge dein Glossar vor "
-                        "allen anderen Quellen, sonst der höhere Konfidenzwert."
+                        "Hat eine Kategorie mehrere Quellen (z. B. GLiNER-Prompt + EU-PII-Modell + Regex), arbeiten sie "
+                        "ergänzend zusammen: Alle Treffer werden gesammelt. Bei Überlappungen gewinnt die Hierarchie "
+                        "Begriffsliste (3) > Deterministisch / Bibliothek / Regex (2) > Lokale KI-Modelle (1). "
+                        "Innerhalb der KI-Modelle gewinnt der längere Trefferspan oder der höhere Konfidenzwert."
                     ).classes("text-xs text-slate-400 italic mb-3")
 
                     ui.button("🔄 Aktualisieren", on_click=lambda: load_transparency_view()).props("outline dense size=sm").classes("mb-2")
