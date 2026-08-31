@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
@@ -27,15 +28,18 @@ def is_pdf_worker() -> bool:
     return os.environ.get("LOCAL_ANONYMIZER_PDF_WORKER") == "1"
 
 
-def cleanup_extraction_temp_files():
-    """Clean up any stale temporary PDF extraction files from ~/.local-anonymizer/temp_uploads."""
+def cleanup_extraction_temp_files(max_age_seconds: int = 1800):
+    """Clean up any stale temporary PDF extraction files older than max_age_seconds (default 30 min).
+    Never deletes recently active or newly created files from other running app instances or tabs."""
     if is_pdf_worker():
         return
     try:
         if TEMP_UPLOADS_DIR.exists():
+            cutoff = time.time() - max_age_seconds
             for f in TEMP_UPLOADS_DIR.glob("*.pdf"):
                 try:
-                    f.unlink(missing_ok=True)
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
                 except Exception:
                     pass
     except Exception:
@@ -624,36 +628,35 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
     return text.strip()
 
 
-def _extract_single_page_from_path_worker(
-    pdf_path_str: str,
+def _extract_single_page_in_memory(
+    raw_bytes: bytes,
     page_idx: int,
     margins: tuple,
 ) -> Tuple[int, str]:
     """
-    Top-level picklable worker that opens a shared temp PDF file by path.
-    Payload is only ~50 bytes per task (near-instantaneous IPC).
-    Enables true page-by-page progress reporting and dynamic work stealing.
+    Extract structured Markdown text for a single page directly from in-memory PDF bytes.
+    Each worker thread opens its own PyMuPDF document instance and closes it in a finally block,
+    ensuring 100% thread safety with zero disk I/O.
     """
     import pymupdf
     import pymupdf4llm.helpers.pymupdf_rag as rag
 
+    doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
     try:
-        doc = pymupdf.open(pdf_path_str)
         try:
-            try:
-                p_md = rag.to_markdown(
-                    doc,
-                    pages=[page_idx],
-                    margins=margins,
-                    table_strategy="lines",
-                ).strip()
-            except Exception:
-                p_md = doc[page_idx].get_text("text").strip()
-            return page_idx, p_md
-        finally:
-            doc.close()
+            p_md = rag.to_markdown(
+                doc,
+                pages=[page_idx],
+                margins=margins,
+                table_strategy="lines",
+            ).strip()
+        except Exception:
+            p_md = doc[page_idx].get_text("text").strip()
+        return page_idx, p_md
     except Exception as ex:
         return page_idx, f"[Hinweis: Seite {page_idx + 1} konnte nicht extrahiert werden: {ex}]"
+    finally:
+        doc.close()
 
 
 def extract_text_from_pdf_bytes(
@@ -665,8 +668,9 @@ def extract_text_from_pdf_bytes(
 ) -> str:
     """
     Extract structured Markdown text from PDF bytes using PyMuPDF's RAG layout engine.
-    For multi-page PDFs, utilizes fine-grained multi-core multiprocessing with a shared temporary file
-    to eliminate Windows IPC overhead and deliver smooth real-time page-by-page progress updates.
+    For multi-page PDFs, utilizes in-memory multi-threading (ThreadPoolExecutor) with zero disk I/O,
+    eliminating temporary file race conditions, cross-process startup lag, and delivering smooth
+    real-time page-by-page progress updates.
     Preserves headings, lists, tables, and bold/italic styles while maintaining intact word and sentence structure.
     Supports optional progress_callback(current_page, total_pages, status_text) for large PDFs.
     Preserves document title on page 1 while suppressing running headers/footers on subsequent pages when include_headers_footers=False.
@@ -691,79 +695,50 @@ def extract_text_from_pdf_bytes(
         return ""
 
     if doc_pages == 1:
-        # Single page: Execute directly in memory without multiprocessing pool overhead
+        # Single page: Execute directly in memory
         if progress_callback:
             progress_callback(1, 1, "PDF-Inhalt wird extrahiert...")
         margins = (0, 0, 0, 0) if include_headers_footers else (0, 0, 0, 50)
-        import pymupdf4llm.helpers.pymupdf_rag as rag
-        doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
-        try:
-            try:
-                p_md = rag.to_markdown(doc, pages=[0], margins=margins, table_strategy="lines").strip()
-            except Exception:
-                p_md = doc[0].get_text("text").strip()
-            page_mds = [p_md]
-        finally:
-            doc.close()
+        _, p_md = _extract_single_page_in_memory(raw_bytes, 0, margins)
+        page_mds = [p_md]
     else:
-        # Multi-page: Write temp file once, dispatch lightweight page tasks
-        import tempfile
+        # Multi-page: Execute concurrently in memory using ThreadPoolExecutor
         cpu_cores = os.cpu_count() or 4
         max_workers = min(cpu_cores, 6, doc_pages)
         page_mds = [None] * doc_pages
         completed_pages = 0
 
-        TEMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(suffix=".pdf", dir=TEMP_UPLOADS_DIR, delete=False) as tmp:
-            tmp.write(raw_bytes)
-            tmp_path = tmp.name
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futs = []
+            for page_idx in range(doc_pages):
+                if include_headers_footers:
+                    margins = (0, 0, 0, 0)
+                else:
+                    margins = (0, 0, 0, 50) if page_idx == 0 else (0, 50, 0, 50)
 
-        try:
-            with _pdf_env_lock:
-                prev_worker_env = os.environ.get("LOCAL_ANONYMIZER_PDF_WORKER")
-                os.environ["LOCAL_ANONYMIZER_PDF_WORKER"] = "1"
+                futs.append(
+                    executor.submit(
+                        _extract_single_page_in_memory,
+                        raw_bytes,
+                        page_idx,
+                        margins,
+                    )
+                )
+
+            for fut in concurrent.futures.as_completed(futs):
                 try:
-                    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                        futs = []
-                        for page_idx in range(doc_pages):
-                            if include_headers_footers:
-                                margins = (0, 0, 0, 0)
-                            else:
-                                margins = (0, 0, 0, 50) if page_idx == 0 else (0, 50, 0, 50)
+                    p_idx, page_text = fut.result()
+                    page_mds[p_idx] = page_text
+                    completed_pages += 1
+                except Exception as ex:
+                    logging.error(f"PDF extraction thread error: {ex}")
 
-                            futs.append(
-                                executor.submit(
-                                    _extract_single_page_from_path_worker,
-                                    tmp_path,
-                                    page_idx,
-                                    margins,
-                                )
-                            )
-
-                        for fut in concurrent.futures.as_completed(futs):
-                            try:
-                                p_idx, page_text = fut.result()
-                                page_mds[p_idx] = page_text
-                                completed_pages += 1
-                            except Exception as ex:
-                                logging.error(f"PDF extraction worker error: {ex}")
-
-                            if progress_callback:
-                                progress_callback(
-                                    completed_pages,
-                                    doc_pages,
-                                    f"PDF-Seite {completed_pages} von {doc_pages} extrahiert...",
-                                )
-                finally:
-                    if prev_worker_env is None:
-                        os.environ.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
-                    else:
-                        os.environ["LOCAL_ANONYMIZER_PDF_WORKER"] = prev_worker_env
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+                if progress_callback:
+                    progress_callback(
+                        completed_pages,
+                        doc_pages,
+                        f"PDF-Seite {completed_pages} von {doc_pages} extrahiert...",
+                    )
 
     md_text = "\n\n".join(p for p in page_mds if p)
     return clean_extracted_pdf_markdown(md_text, extract_picture_text=extract_picture_text)

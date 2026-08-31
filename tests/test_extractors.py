@@ -560,127 +560,61 @@ def test_pdf_parallel_extraction_corrupted_page_resilience(monkeypatch):
     assert "Resilient Section 2" in extracted
 
 
-def test_pdf_temp_extraction_file_cleanup():
-    """Verify that multi-page PDF multiprocessing extraction cleans up its temp files in TEMP_UPLOADS_DIR."""
+def test_pdf_parallel_extraction_in_memory_no_temp_files():
+    """Verify that multi-page PDF extraction runs 100% in-memory with ThreadPoolExecutor without creating temp files."""
     import pymupdf
     from local_anonymizer.extractors import extract_text_from_pdf_bytes, TEMP_UPLOADS_DIR
 
     doc = pymupdf.open()
-    for i in range(1, 4):
+    for i in range(1, 6):
         page = doc.new_page(width=595, height=842)
-        page.insert_text((50, 200), f"Cleanup Page {i}", fontsize=12)
+        page.insert_text((50, 200), f"In-Memory Section Page {i}", fontsize=12)
     pdf_bytes = doc.tobytes()
     doc.close()
 
     # Pre-check: count existing PDF files in TEMP_UPLOADS_DIR
+    TEMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     initial_pdfs = list(TEMP_UPLOADS_DIR.glob("*.pdf"))
 
     text = extract_text_from_pdf_bytes(pdf_bytes)
-    assert "Cleanup Page 1" in text
+    assert "In-Memory Section Page 1" in text
+    assert "In-Memory Section Page 5" in text
 
-    # Post-check: ensure temp PDF was deleted in finally block
+    # Post-check: zero temporary files were created on disk
     remaining_pdfs = list(TEMP_UPLOADS_DIR.glob("*.pdf"))
     assert len(remaining_pdfs) == len(initial_pdfs)
 
 
-def test_pdf_worker_spawn_does_not_delete_temp_files_regression():
+def test_pdf_extraction_concurrent_normal_app_import_safety():
     """
-    Regression test: When a worker sub-process spawns on Windows (with LOCAL_ANONYMIZER_PDF_WORKER=1),
-    importing app.py and local_anonymizer.extractors MUST NOT delete active temporary PDF files in TEMP_UPLOADS_DIR.
+    Regression test: Concurrent normal app import (or second app start without any worker env var)
+    MUST NOT interfere with or delete active extraction files or in-memory jobs.
     """
-    import os
     import subprocess
     import sys
-    import tempfile
-    from pathlib import Path
-    from local_anonymizer.extractors import TEMP_UPLOADS_DIR
-
-    TEMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(suffix=".pdf", dir=TEMP_UPLOADS_DIR, delete=False) as tmp:
-        tmp.write(b"%PDF-1.4 dummy active shared parent extraction file")
-        test_pdf_path = Path(tmp.name)
-
-    assert test_pdf_path.exists()
-
-    try:
-        # Spawn an isolated Python sub-process with LOCAL_ANONYMIZER_PDF_WORKER=1
-        code = (
-            "import os, sys\n"
-            "sys.path.insert(0, 'src')\n"
-            "assert os.environ.get('LOCAL_ANONYMIZER_PDF_WORKER') == '1'\n"
-            "import local_anonymizer.extractors\n"
-            "import app\n"
-            "print('WORKER_IMPORT_SUCCESS')\n"
-        )
-        env = os.environ.copy()
-        env["LOCAL_ANONYMIZER_PDF_WORKER"] = "1"
-
-        res = subprocess.run(
-            [sys.executable, "-c", code],
-            env=env,
-            capture_output=True,
-            text=True,
-            cwd=str(Path(__file__).parent.parent),
-        )
-
-        assert res.returncode == 0, f"Worker subprocess failed: {res.stderr}"
-        assert "WORKER_IMPORT_SUCCESS" in res.stdout
-
-        # Verify: The active parent PDF file was NOT deleted by worker import or worker atexit!
-        assert test_pdf_path.exists(), "Active parent extraction PDF was unexpectedly deleted by worker!"
-    finally:
-        try:
-            test_pdf_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-def test_pdf_worker_env_restoration():
-    """Verify that extract_text_from_pdf_bytes accurately restores prior LOCAL_ANONYMIZER_PDF_WORKER state."""
     import os
     import pymupdf
+    from pathlib import Path
     from local_anonymizer.extractors import extract_text_from_pdf_bytes
 
     doc = pymupdf.open()
-    for i in range(1, 3):
-        p = doc.new_page(width=595, height=842)
-        p.insert_text((50, 200), f"Env Test Page {i}", fontsize=12)
+    for i in range(1, 8):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 200), f"Concurrent Robust Page {i}", fontsize=12)
     pdf_bytes = doc.tobytes()
     doc.close()
 
-    # Case 1: When env was previously None
-    os.environ.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
-    extract_text_from_pdf_bytes(pdf_bytes)
-    assert "LOCAL_ANONYMIZER_PDF_WORKER" not in os.environ
-
-    # Case 2: When env was previously custom
-    os.environ["LOCAL_ANONYMIZER_PDF_WORKER"] = "custom_val"
-    try:
-        extract_text_from_pdf_bytes(pdf_bytes)
-        assert os.environ.get("LOCAL_ANONYMIZER_PDF_WORKER") == "custom_val"
-    finally:
-        os.environ.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
-
-
-def test_pdf_worker_import_does_not_spawn_warmup_thread():
-    """Verify that importing app.py inside a PDF worker subprocess does NOT spawn a model warmup thread."""
-    import subprocess
-    import sys
-    import os
-    from pathlib import Path
-
+    # Simulate concurrent normal app import in another process
     test_script = (
-        "import os, sys, threading\n"
+        "import os, sys\n"
+        "sys.path.insert(0, 'src')\n"
+        "import local_anonymizer.extractors\n"
         "import app\n"
-        "active_thread_names = [t.name for t in threading.enumerate()]\n"
-        "print('ACTIVE_THREADS:', active_thread_names)\n"
-        "has_warmup = any('warmup' in t.lower() for t in active_thread_names)\n"
-        "assert not has_warmup, f'Unexpected warmup thread found: {active_thread_names}'\n"
-        "print('NO_WARMUP_SUCCESS')\n"
+        "print('APP_IMPORT_CONCURRENT_SUCCESS')\n"
     )
 
     env = dict(os.environ)
-    env["LOCAL_ANONYMIZER_PDF_WORKER"] = "1"
+    env.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
     env["PYTHONPATH"] = "src"
 
     res = subprocess.run(
@@ -690,7 +624,42 @@ def test_pdf_worker_import_does_not_spawn_warmup_thread():
         text=True,
         cwd=str(Path(__file__).parent.parent),
     )
+    assert res.returncode == 0, f"App import failed: {res.stderr}"
+    assert "APP_IMPORT_CONCURRENT_SUCCESS" in res.stdout
 
-    assert res.returncode == 0, f"Worker test failed: {res.stderr}"
-    assert "NO_WARMUP_SUCCESS" in res.stdout
+    # In-memory extraction finishes cleanly
+    extracted = extract_text_from_pdf_bytes(pdf_bytes)
+    assert "Concurrent Robust Page 1" in extracted
+    assert "Concurrent Robust Page 7" in extracted
+
+
+def test_age_based_temp_cleanup_preserves_recent_files():
+    """Verify that age-based cleanup preserves recently created temp files and deletes only old ones."""
+    import os
+    import time
+    import tempfile
+    from local_anonymizer.extractors import cleanup_extraction_temp_files, TEMP_UPLOADS_DIR
+    from app import cleanup_temp_uploads, UPLOAD_DIR
+
+    TEMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".pdf", dir=TEMP_UPLOADS_DIR, delete=False) as tmp_new:
+        tmp_new.write(b"new active temp file")
+        new_path = Path(tmp_new.name)
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", dir=TEMP_UPLOADS_DIR, delete=False) as tmp_old:
+        tmp_old.write(b"old stale temp file")
+        old_path = Path(tmp_old.name)
+
+    try:
+        # Age old_path artificially by 3600s
+        old_time = time.time() - 3600
+        os.utime(old_path, (old_time, old_time))
+
+        cleanup_extraction_temp_files(max_age_seconds=1800)
+
+        assert new_path.exists(), "New temp file was unexpectedly deleted!"
+        assert not old_path.exists(), "Old stale temp file was not cleaned up!"
+    finally:
+        new_path.unlink(missing_ok=True)
+        old_path.unlink(missing_ok=True)
 

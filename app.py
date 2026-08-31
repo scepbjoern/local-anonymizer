@@ -15,6 +15,7 @@ import re
 import atexit
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,15 +66,18 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB limit
 
 
-def cleanup_temp_uploads():
-    """Clean up any stale uploaded temporary files from previous sessions."""
+def cleanup_temp_uploads(max_age_seconds: int = 1800):
+    """Clean up any stale uploaded temporary files older than max_age_seconds (default 30 min).
+    Never deletes recently active or newly created files from other running app instances or tabs."""
     if is_pdf_worker():
         return
     try:
         if UPLOAD_DIR.exists():
+            cutoff = time.time() - max_age_seconds
             for f in UPLOAD_DIR.glob("*"):
                 try:
-                    f.unlink(missing_ok=True)
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
                 except Exception:
                     pass
     except Exception:
