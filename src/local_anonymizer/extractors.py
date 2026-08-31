@@ -30,7 +30,15 @@ def is_pdf_worker() -> bool:
 
 def cleanup_extraction_temp_files(max_age_seconds: int = 1800):
     """Clean up any stale temporary PDF extraction files older than max_age_seconds (default 30 min).
-    Never deletes recently active or newly created files from other running app instances or tabs."""
+    Never deletes recently active or newly created files from other running app instances or tabs.
+
+    Design decision (Betriebsgrenze): The 30-minute threshold is an accepted operational boundary
+    for this single-user local application. PDF extractions on typical documents complete well
+    within seconds to a few minutes. Ownership/Lease mechanisms are intentionally not implemented:
+    they would add significant Windows-specific complexity without practical benefit given the
+    expected workload. Any extraction running longer than 30 minutes would be an anomaly and
+    indicates a problem in the extraction pipeline rather than normal usage.
+    """
     if is_pdf_worker():
         return
     try:

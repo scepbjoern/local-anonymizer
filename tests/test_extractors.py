@@ -667,3 +667,213 @@ def test_age_based_temp_cleanup_preserves_recent_files():
         new_path.unlink(missing_ok=True)
         old_path.unlink(missing_ok=True)
 
+
+def test_app_cleanup_temp_uploads_age_based():
+    """
+    Directly verify app.cleanup_temp_uploads() age-based logic:
+    - A recently created file must not be deleted
+    - A file older than max_age_seconds must be deleted
+    Note: app.UPLOAD_DIR and extractors.TEMP_UPLOADS_DIR point to the same path.
+    """
+    import os
+    import time
+    import tempfile
+    from app import cleanup_temp_uploads, UPLOAD_DIR
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", dir=UPLOAD_DIR, delete=False) as tmp_new:
+        tmp_new.write(b"fresh active upload file")
+        new_path = Path(tmp_new.name)
+
+    with tempfile.NamedTemporaryFile(suffix=".bin", dir=UPLOAD_DIR, delete=False) as tmp_old:
+        tmp_old.write(b"stale binary upload chunk")
+        old_path = Path(tmp_old.name)
+
+    try:
+        # Mark old_path as 2 hours old
+        old_time = time.time() - 7200
+        os.utime(old_path, (old_time, old_time))
+
+        cleanup_temp_uploads(max_age_seconds=1800)
+
+        assert new_path.exists(), (
+            "app.cleanup_temp_uploads() deleted a recently created file — age-based guard broken!"
+        )
+        assert not old_path.exists(), (
+            "app.cleanup_temp_uploads() did not delete a stale file older than max_age_seconds!"
+        )
+    finally:
+        new_path.unlink(missing_ok=True)
+        old_path.unlink(missing_ok=True)
+
+
+def test_pdf_env_lock_parallel_sessions_env_restored():
+    """
+    Verify that _pdf_env_lock correctly serializes parallel PDF extractions from the same process
+    and always restores LOCAL_ANONYMIZER_PDF_WORKER to its prior value (even if extraction fails).
+
+    Strategy: Run two concurrent multi-page extractions in two threads.
+    After both complete, LOCAL_ANONYMIZER_PDF_WORKER must be absent (or match the pre-test value).
+    """
+    import os
+    import threading
+    import pymupdf
+    from local_anonymizer.extractors import extract_text_from_pdf_bytes
+
+    # Build a 3-page PDF
+    doc = pymupdf.open()
+    for i in range(1, 4):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 200), f"Lock Session Page {i}", fontsize=12)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    pre_test_env = os.environ.get("LOCAL_ANONYMIZER_PDF_WORKER")
+    results = []
+    errors = []
+
+    def run_extraction():
+        try:
+            text = extract_text_from_pdf_bytes(pdf_bytes)
+            results.append(text)
+        except Exception as ex:
+            errors.append(str(ex))
+
+    t1 = threading.Thread(target=run_extraction)
+    t2 = threading.Thread(target=run_extraction)
+    t1.start()
+    t2.start()
+    t1.join(timeout=120)
+    t2.join(timeout=120)
+
+    assert not errors, f"Parallel extraction raised errors: {errors}"
+    assert len(results) == 2, f"Expected 2 results, got {len(results)}"
+    for text in results:
+        assert "Lock Session Page 1" in text
+        assert "Lock Session Page 3" in text
+
+    # Env must be fully restored
+    post_test_env = os.environ.get("LOCAL_ANONYMIZER_PDF_WORKER")
+    assert post_test_env == pre_test_env, (
+        f"LOCAL_ANONYMIZER_PDF_WORKER was not restored after parallel extractions! "
+        f"Before: {pre_test_env!r}, After: {post_test_env!r}"
+    )
+
+
+def test_pdf_extraction_finally_cleanup_on_worker_error():
+    """
+    Verify that the temp file in TEMP_UPLOADS_DIR is deleted in the finally block
+    even when the ProcessPool workers raise exceptions on every page.
+    Simulates a pool error by patching _extract_single_page_from_path_worker to always raise.
+    """
+    import tempfile
+    import pymupdf
+    from unittest.mock import patch
+    from local_anonymizer.extractors import extract_text_from_pdf_bytes, TEMP_UPLOADS_DIR
+
+    doc = pymupdf.open()
+    for i in range(1, 3):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 200), f"Error Path Page {i}", fontsize=12)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    TEMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    initial_pdfs = set(TEMP_UPLOADS_DIR.glob("*.pdf"))
+
+    def always_raise(*args, **kwargs):
+        raise RuntimeError("Simulated worker failure for finally-cleanup test")
+
+    with patch(
+        "local_anonymizer.extractors._extract_single_page_from_path_worker",
+        side_effect=always_raise,
+    ):
+        # Extraction may return partial/empty result, but must not leave temp files
+        try:
+            extract_text_from_pdf_bytes(pdf_bytes)
+        except Exception:
+            pass  # Worker errors are logged; extraction may or may not raise depending on recovery
+
+    remaining_pdfs = set(TEMP_UPLOADS_DIR.glob("*.pdf"))
+    new_pdfs = remaining_pdfs - initial_pdfs
+    assert not new_pdfs, (
+        f"Temp PDF file(s) were not cleaned up after worker error in finally block: {new_pdfs}"
+    )
+
+
+def test_pdf_extraction_true_concurrent_import_during_live_extraction():
+    """
+    True concurrent-import regression test:
+    While a real multi-page PDF extraction is running in a background thread,
+    a concurrent normal app import subprocess is started (simulating second app start via VBScript).
+    Both must complete successfully:
+    - The active temp PDF file must survive (age-based protection) until extraction finishes
+    - All pages must be extracted correctly
+    """
+    import os
+    import threading
+    import subprocess
+    import sys
+    import pymupdf
+    from local_anonymizer.extractors import extract_text_from_pdf_bytes
+
+    # Build a 4-page PDF (enough pages to keep ProcessPool busy during subprocess launch)
+    doc = pymupdf.open()
+    for i in range(1, 5):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 200), f"Live Concurrent Page {i}", fontsize=12)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    extraction_result = []
+    extraction_error = []
+    subprocess_result = []
+
+    def run_extraction():
+        try:
+            text = extract_text_from_pdf_bytes(pdf_bytes)
+            extraction_result.append(text)
+        except Exception as ex:
+            extraction_error.append(str(ex))
+
+    extraction_thread = threading.Thread(target=run_extraction)
+    extraction_thread.start()
+
+    # Give the extraction a moment to create its temp file and start the ProcessPool
+    import time
+    time.sleep(0.5)
+
+    # Now launch a concurrent normal app import subprocess (no worker env)
+    test_script = (
+        "import os, sys\n"
+        "sys.path.insert(0, 'src')\n"
+        "import local_anonymizer.extractors\n"
+        "import app\n"
+        "print('CONCURRENT_IMPORT_OK')\n"
+    )
+    env = dict(os.environ)
+    env.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
+    env["PYTHONPATH"] = "src"
+
+    proc = subprocess.run(
+        [sys.executable, "-c", test_script],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parent.parent),
+        timeout=60,
+    )
+    subprocess_result.append(proc)
+
+    # Wait for extraction to finish
+    extraction_thread.join(timeout=120)
+
+    assert not extraction_error, f"Extraction failed during concurrent import: {extraction_error}"
+    assert extraction_result, "No extraction result collected"
+    assert "Live Concurrent Page 1" in extraction_result[0]
+    assert "Live Concurrent Page 4" in extraction_result[0]
+
+    assert proc.returncode == 0, f"Concurrent app import failed: {proc.stderr}"
+    assert "CONCURRENT_IMPORT_OK" in proc.stdout
+
