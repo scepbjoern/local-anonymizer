@@ -42,6 +42,10 @@ logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
 
 
 
+DEFAULT_GLINER_MODEL_NAME = "urchade/gliner_multi_pii-v1"
+DEFAULT_EUPII_MODEL_NAME = "bardsai/eu-pii-anonimization-multilang"
+
+
 class AppConfig:
     def __init__(self):
         self.format_mode: str = "numbered_role"
@@ -55,10 +59,11 @@ class AppConfig:
         # New source-aware setting. An empty mapping keeps older config files backward-compatible;
         # the UI derives the initial modes from active_entities when no mapping exists yet.
         self.entity_modes: Dict[str, str] = {}
+        self.gliner_model_name: str = DEFAULT_GLINER_MODEL_NAME
         self.gliner_threshold: float = 0.55
         self.enable_eupii: bool = True
         self.eupii_threshold: float = 0.50
-        self.eupii_model_name: str = "bardsai/eu-pii-anonimization-multilang"
+        self.eupii_model_name: str = DEFAULT_EUPII_MODEL_NAME
         self.ignore_terms: str = "CAS, DAS, MAS, BSc, MSc, PhD, MBA, Studierende, Studierenden, Dozent, Dozenten, Lehrperson, Berater, Aufgabensteller"
         self.glossary: str = "ZHAW: ORGANIZATION\nHWZ: ORGANIZATION\nUZH: ORGANIZATION\nETH: ORGANIZATION"
         self.export_format: str = "txt"
@@ -68,6 +73,7 @@ class AppConfig:
             "format_mode": self.format_mode,
             "active_entities": self.active_entities,
             "entity_modes": self.entity_modes,
+            "gliner_model_name": self.gliner_model_name,
             "gliner_threshold": self.gliner_threshold,
             "enable_eupii": self.enable_eupii,
             "eupii_threshold": self.eupii_threshold,
@@ -89,6 +95,7 @@ class AppConfig:
                 for entity, mode in raw_modes.items()
                 if str(mode) in VALID_ENTITY_MODES
             }
+        config.gliner_model_name = str(data.get("gliner_model_name", config.gliner_model_name))
         config.gliner_threshold = data.get("gliner_threshold", config.gliner_threshold)
         config.enable_eupii = bool(data.get("enable_eupii", config.enable_eupii))
         config.eupii_threshold = float(data.get("eupii_threshold", config.eupii_threshold))

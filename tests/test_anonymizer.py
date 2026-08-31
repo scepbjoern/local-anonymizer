@@ -887,3 +887,74 @@ def test_local_anonymizer_set_entity_modes_propagation():
     assert anon.entity_modes["PERSON"] == "explicit_eupii"
     assert anon.gliner_recognizer.entity_modes["PERSON"] == "explicit_eupii"
     assert anon.eupii_recognizer.entity_modes["PERSON"] == "explicit_eupii"
+
+
+def test_default_app_state_and_config_gliner_model_attribute():
+    """Regression test: verify gliner_model_name is properly defined on AppConfig and AppState."""
+    from local_anonymizer.config import AppConfig, DEFAULT_GLINER_MODEL_NAME
+    import app
+
+    cfg = AppConfig()
+    assert hasattr(cfg, "gliner_model_name")
+    assert cfg.gliner_model_name == DEFAULT_GLINER_MODEL_NAME
+
+    # Serialization roundtrip
+    d = cfg.to_dict()
+    assert "gliner_model_name" in d
+    assert d["gliner_model_name"] == DEFAULT_GLINER_MODEL_NAME
+
+    loaded = AppConfig.from_dict(d)
+    assert loaded.gliner_model_name == DEFAULT_GLINER_MODEL_NAME
+
+    # AppState attribute check
+    state = app.AppState()
+    assert hasattr(state, "gliner_model_name")
+    assert state.gliner_model_name == DEFAULT_GLINER_MODEL_NAME
+
+
+@pytest.mark.anyio
+async def test_ensure_models_downloaded_with_dialog_default_config_regression(monkeypatch):
+    """Regression test: verify ensure_models_downloaded_with_dialog does not raise AttributeError
+    when running on default configuration with GLiNER and EU-PII active."""
+    import app
+    import local_anonymizer.recognizers as rec_module
+
+    state = app.AppState()
+
+    # 1. When all models are cached -> returns True immediately without dialog
+    monkeypatch.setattr(app, "is_model_cached", lambda name, mtype: True)
+    monkeypatch.setattr(rec_module, "is_model_cached", lambda name, mtype: True)
+    ready = await app.ensure_models_downloaded_with_dialog(state)
+    assert ready is True
+
+    # 2. When models are not cached -> builds models_to_download list without AttributeError
+    monkeypatch.setattr(app, "is_model_cached", lambda name, mtype: False)
+    monkeypatch.setattr(rec_module, "is_model_cached", lambda name, mtype: False)
+
+    # Mock ui.dialog to auto-confirm without blocking
+    class DummyDialog:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def __await__(self):
+            async def _dummy():
+                return None
+            return _dummy().__await__()
+        def classes(self, *args, **kwargs):
+            return self
+        def props(self, *args, **kwargs):
+            return self
+
+    monkeypatch.setattr(app.ui, "dialog", lambda: DummyDialog())
+    monkeypatch.setattr(app.ui, "card", lambda: DummyDialog())
+    monkeypatch.setattr(app.ui, "label", lambda *a, **k: DummyDialog())
+    monkeypatch.setattr(app.ui, "markdown", lambda *a, **k: DummyDialog())
+    monkeypatch.setattr(app.ui, "row", lambda *a, **k: DummyDialog())
+    monkeypatch.setattr(app.ui, "button", lambda *a, **k: DummyDialog())
+    monkeypatch.setattr(app.ui, "notify", lambda *a, **k: None)
+
+    # ensure_models_downloaded_with_dialog should inspect state.gliner_model_name without crashing
+    # Note: since confirmed stays False in dummy context, it will return False cleanly
+    ready_miss = await app.ensure_models_downloaded_with_dialog(state)
+    assert ready_miss is False

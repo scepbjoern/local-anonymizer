@@ -180,6 +180,7 @@ class AppState:
         ]
         self.format_mode: str = self.config.format_mode  # "numbered", "numbered_role", "role_only"
         self.export_format: str = self.config.export_format  # "txt", "md"
+        self.gliner_model_name: str = getattr(self.config, "gliner_model_name", GLINER_MODEL_NAME)
         self.gliner_threshold: float = self.config.gliner_threshold
         self.enable_eupii: bool = self.config.enable_eupii
         self.eupii_threshold: float = self.config.eupii_threshold
@@ -259,6 +260,7 @@ def build_anonymizer(app_state: Optional[AppState] = None):
             ignore_terms=ignore_terms,
             enabled_entities=general_entities,
             enabled_glossary_entities=glossary_entities,
+            gliner_model=app_state.gliner_model_name,
             gliner_threshold=app_state.gliner_threshold,
             enable_eupii=app_state.enable_eupii,
             eupii_threshold=app_state.eupii_threshold,
@@ -275,6 +277,7 @@ def build_anonymizer(app_state: Optional[AppState] = None):
             ignore_terms=parse_ignore_terms(cfg.ignore_terms),
             enabled_entities=general_entities,
             enabled_glossary_entities=glossary_entities,
+            gliner_model=getattr(cfg, "gliner_model_name", GLINER_MODEL_NAME),
             gliner_threshold=cfg.gliner_threshold,
             enable_eupii=cfg.enable_eupii,
             eupii_threshold=cfg.eupii_threshold,
@@ -587,6 +590,7 @@ def save_current_config(st: AppState):
         entity for entity, mode in st.entity_modes.items()
         if mode in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
     ]
+    st.config.gliner_model_name = st.gliner_model_name
     st.config.gliner_threshold = st.gliner_threshold
     st.config.enable_eupii = st.enable_eupii
     st.config.eupii_threshold = st.eupii_threshold
