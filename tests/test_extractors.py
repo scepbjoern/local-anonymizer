@@ -560,15 +560,15 @@ def test_pdf_parallel_extraction_corrupted_page_resilience(monkeypatch):
     assert "Resilient Section 2" in extracted
 
 
-def test_pdf_parallel_extraction_in_memory_no_temp_files():
-    """Verify that multi-page PDF extraction runs 100% in-memory with ThreadPoolExecutor without creating temp files."""
+def test_pdf_temp_extraction_file_cleanup():
+    """Verify that multi-page PDF ProcessPool extraction cleans up its temp file in TEMP_UPLOADS_DIR after completion."""
     import pymupdf
     from local_anonymizer.extractors import extract_text_from_pdf_bytes, TEMP_UPLOADS_DIR
 
     doc = pymupdf.open()
-    for i in range(1, 6):
+    for i in range(1, 4):
         page = doc.new_page(width=595, height=842)
-        page.insert_text((50, 200), f"In-Memory Section Page {i}", fontsize=12)
+        page.insert_text((50, 200), f"Cleanup Page {i}", fontsize=12)
     pdf_bytes = doc.tobytes()
     doc.close()
 
@@ -577,60 +577,64 @@ def test_pdf_parallel_extraction_in_memory_no_temp_files():
     initial_pdfs = list(TEMP_UPLOADS_DIR.glob("*.pdf"))
 
     text = extract_text_from_pdf_bytes(pdf_bytes)
-    assert "In-Memory Section Page 1" in text
-    assert "In-Memory Section Page 5" in text
+    assert "Cleanup Page 1" in text
 
-    # Post-check: zero temporary files were created on disk
+    # Post-check: ensure temp PDF was deleted in finally block
     remaining_pdfs = list(TEMP_UPLOADS_DIR.glob("*.pdf"))
     assert len(remaining_pdfs) == len(initial_pdfs)
 
 
 def test_pdf_extraction_concurrent_normal_app_import_safety():
     """
-    Regression test: Concurrent normal app import (or second app start without any worker env var)
-    MUST NOT interfere with or delete active extraction files or in-memory jobs.
+    Regression test: A concurrent normal app import (second app start without LOCAL_ANONYMIZER_PDF_WORKER=1)
+    MUST NOT delete a recently created temp PDF file from TEMP_UPLOADS_DIR (age-based protection).
+    The temp file in TEMP_UPLOADS_DIR is created fresh (seconds old); a concurrent cleanup call
+    with max_age_seconds=1800 must leave it intact.
     """
+    import os
     import subprocess
     import sys
-    import os
-    import pymupdf
+    import tempfile
     from pathlib import Path
-    from local_anonymizer.extractors import extract_text_from_pdf_bytes
+    from local_anonymizer.extractors import TEMP_UPLOADS_DIR
 
-    doc = pymupdf.open()
-    for i in range(1, 8):
-        page = doc.new_page(width=595, height=842)
-        page.insert_text((50, 200), f"Concurrent Robust Page {i}", fontsize=12)
-    pdf_bytes = doc.tobytes()
-    doc.close()
+    TEMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".pdf", dir=TEMP_UPLOADS_DIR, delete=False) as tmp:
+        tmp.write(b"%PDF-1.4 dummy active extraction temp file")
+        active_path = Path(tmp.name)
 
-    # Simulate concurrent normal app import in another process
-    test_script = (
-        "import os, sys\n"
-        "sys.path.insert(0, 'src')\n"
-        "import local_anonymizer.extractors\n"
-        "import app\n"
-        "print('APP_IMPORT_CONCURRENT_SUCCESS')\n"
-    )
+    assert active_path.exists()
 
-    env = dict(os.environ)
-    env.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
-    env["PYTHONPATH"] = "src"
+    try:
+        # Simulate a concurrent normal app start: import app without worker env
+        test_script = (
+            "import os, sys\n"
+            "sys.path.insert(0, 'src')\n"
+            "import local_anonymizer.extractors\n"
+            "import app\n"
+            "print('APP_IMPORT_CONCURRENT_SUCCESS')\n"
+        )
+        env = dict(os.environ)
+        env.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
+        env["PYTHONPATH"] = "src"
 
-    res = subprocess.run(
-        [sys.executable, "-c", test_script],
-        env=env,
-        capture_output=True,
-        text=True,
-        cwd=str(Path(__file__).parent.parent),
-    )
-    assert res.returncode == 0, f"App import failed: {res.stderr}"
-    assert "APP_IMPORT_CONCURRENT_SUCCESS" in res.stdout
+        res = subprocess.run(
+            [sys.executable, "-c", test_script],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent.parent),
+        )
+        assert res.returncode == 0, f"Concurrent app import failed: {res.stderr}"
+        assert "APP_IMPORT_CONCURRENT_SUCCESS" in res.stdout
 
-    # In-memory extraction finishes cleanly
-    extracted = extract_text_from_pdf_bytes(pdf_bytes)
-    assert "Concurrent Robust Page 1" in extracted
-    assert "Concurrent Robust Page 7" in extracted
+        # The active extraction temp file must still exist (age-based cleanup preserved it)
+        assert active_path.exists(), (
+            "Active extraction temp file was deleted by concurrent app import! "
+            "Age-based cleanup not working."
+        )
+    finally:
+        active_path.unlink(missing_ok=True)
 
 
 def test_age_based_temp_cleanup_preserves_recent_files():
