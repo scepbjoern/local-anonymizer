@@ -549,6 +549,14 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
     # 3. Clean markdown tables specifically so cell linebreaks (<br>) and list bullets are preserved without breaking table rows
     lines = text.splitlines()
     cleaned_lines = []
+    
+    excluded_suffixes = {
+        "kg", "ml", "km", "cm", "mm", 
+        "stk", "stk.", "chf", "eur", "fr.", "rp.", "rp",
+        "mwst", "mwst.", "inkl", "exkl", "inkl.", "exkl.",
+        "alter", "age", "datum", "date", "name", "vorname", "ort", "plz", "tel", "fax", "email", "e-mail"
+    }
+
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 3:
@@ -560,7 +568,6 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
             cleaned_cells = [clean_markdown_table_cell(c) for c in cells]
 
             # Heal split table cells from indented TOC (Inhaltsverzeichnis) columns
-            # Pattern: 4 columns where col0 is chapter number, col1 is word prefix, col2 is word suffix starting with lowercase, col3 is page number
             if len(cleaned_cells) == 4:
                 col0, col1, col2, col3 = cleaned_cells
                 if (
@@ -571,9 +578,73 @@ def clean_extracted_pdf_markdown(md_text: str, extract_picture_text: bool = True
                 ):
                     cleaned_cells = [col0, "", col1 + col2, col3]
 
-            cleaned_lines.append("| " + " | ".join(cleaned_cells) + " |")
+            # Heal horizontally torn words across columns (e.g. "Rechn CHF" | "ungsbetrag")
+            for i in range(len(cleaned_cells) - 2, -1, -1):
+                if not cleaned_cells[i] or not cleaned_cells[i+1]:
+                    continue
+                    
+                c1 = cleaned_cells[i].strip()
+                c2 = cleaned_cells[i+1].strip()
+                    
+                words2 = c2.split()
+                first_word2 = words2[0] if words2 else ""
+                clean_first2 = first_word2.strip("*_")
+                
+                is_lower_frag = bool(re.match(r"^[a-zäöüß]+[\.\:\,\;\!\?]?$", clean_first2))
+                is_upper_frag = bool(re.match(r"^[A-ZÄÖÜ]+[\.\:\,\;\!\?]?$", clean_first2)) and len(clean_first2) <= 6
+                
+                if clean_first2.lower().strip(".:,;!?") in excluded_suffixes:
+                    continue
+                    
+                if is_lower_frag or is_upper_frag:
+                    words1 = c1.split()
+                    if not words1:
+                        continue
+                        
+                    last_word1 = words1[-1]
+                    injected_unit = ""
+                    target_word = last_word1
+                    
+                    if last_word1.strip("*_") in ["CHF", "EUR", "Fr.", "Stk.", "Stk", "%"]:
+                        if len(words1) >= 2:
+                            injected_unit = " " + last_word1
+                            target_word = words1[-2]
+                            words1.pop()
+                        else:
+                            continue
+                            
+                    clean_target = target_word.strip("*_")
+                            
+                    can_merge = False
+                    if is_lower_frag and (clean_target.islower() or clean_target.istitle() or clean_target.isupper()):
+                        can_merge = True
+                    elif is_upper_frag and clean_target.isupper():
+                        can_merge = True
+                        
+                    if can_merge:
+                        # Reconstruct the merged word, ensuring markdown tags wrap the combined word correctly
+                        # E.g. **Grundversi** + **cherung** -> **Grundversicherung**
+                        # Remove trailing ** from target and leading ** from first_word2 if they match
+                        if target_word.endswith("**") and first_word2.startswith("**"):
+                            target_word = target_word[:-2]
+                            first_word2 = first_word2[2:]
+                        elif target_word.endswith("*") and first_word2.startswith("*"):
+                            target_word = target_word[:-1]
+                            first_word2 = first_word2[1:]
+                        elif target_word.endswith("__") and first_word2.startswith("__"):
+                            target_word = target_word[:-2]
+                            first_word2 = first_word2[2:]
+                        elif target_word.endswith("_") and first_word2.startswith("_"):
+                            target_word = target_word[:-1]
+                            first_word2 = first_word2[1:]
+                            
+                        words1[-1] = target_word + first_word2
+                        cleaned_cells[i] = " ".join(words1) + injected_unit
+                        words2.pop(0)
+                        cleaned_cells[i+1] = " ".join(words2)
+
+            cleaned_lines.append("| " + " | ".join(c.strip() for c in cleaned_cells) + " |")
         else:
-            # Outside tables: convert any remaining <br> to newlines, but DO NOT run PascalCase separation on normal text!
             l = re.sub(r"<br\s*/?>", "\n", stripped, flags=re.IGNORECASE)
             cleaned_lines.append(l)
 
