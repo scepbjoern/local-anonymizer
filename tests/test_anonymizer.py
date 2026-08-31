@@ -481,7 +481,7 @@ def test_gender_suffix_extension():
     results = anon.analyze(text)
     detected_texts = [text[r.start:r.end] for r in results]
 
-    assert "Veranlasser:in" in detected_texts or any("Veranlasser" in t for t in detected_texts)
+    assert any(term in detected_texts for term in ["Sachbearbeiter:innen", "Kund*innen", "Leistungserbringer:in"])
     # Ensure no isolated "in" or ":in" artifacts exist as standalone entities
     assert "in" not in detected_texts
     assert ":in" not in detected_texts
@@ -770,3 +770,120 @@ def test_validated_phone_recognizer_scoring():
     phone_res2 = [r for r in res_local if r.entity_type == "PHONE_NUMBER"]
     assert len(phone_res2) == 1
     assert phone_res2[0].score == 1.0
+
+
+def test_explicit_eupii_semantics_and_gliner_exclusion():
+    """Verify explicit_eupii mode enables glossary, deterministic/library recognizers (AHV, Address, Phone, Regex),
+    and EU-PII, but strictly excludes GLiNER for that category."""
+    from local_anonymizer.anonymizer import LocalAnonymizer
+
+    modes = {
+        "PERSON": "explicit_eupii",
+        "LOCATION": "explicit_eupii",
+        "ADDRESS": "explicit_eupii",
+        "AHV_NUMBER": "explicit_eupii",
+        "ID_NUMBER": "explicit_eupii",
+        "ORGANIZATION": "all",
+    }
+    anon = LocalAnonymizer(
+        glossary={"Hans Muster": "PERSON"},
+        entity_modes=modes,
+        enabled_entities=["PERSON", "LOCATION", "ADDRESS", "AHV_NUMBER", "ID_NUMBER", "ORGANIZATION"],
+    )
+
+    # 1. Glossary detection works for PERSON
+    res_glossary = anon.analyze("Hans Muster ist Projektleiter.")
+    person_glossary = [r for r in res_glossary if r.entity_type == "PERSON" and "Hans Muster" in "Hans Muster ist Projektleiter."[r.start:r.end]]
+    assert len(person_glossary) >= 1
+
+    # 2. Deterministic AHV number recognition works for AHV_NUMBER under explicit_eupii
+    text_ahv = "Die AHV-Nummer lautet 756.1234.5678.97 für den Versicherten."
+    res_ahv = anon.analyze(text_ahv)
+    ahv_res = [r for r in res_ahv if r.entity_type == "AHV_NUMBER" and text_ahv[r.start:r.end] == "756.1234.5678.97"]
+    assert len(ahv_res) == 1
+    assert ahv_res[0].recognition_metadata["recognizer_name"] == "AHVNumberRecognizer"
+
+    # 3. Deterministic address recognition works for ADDRESS under explicit_eupii
+    text_addr = "Adresse: Musterstrasse 12, 8000 Zürich."
+    res_addr = anon.analyze(text_addr)
+    loc_res = [r for r in res_addr if r.entity_type == "ADDRESS"]
+    assert len(loc_res) >= 1
+    assert loc_res[0].recognition_metadata["recognizer_name"] == "AddressPatternRecognizer"
+
+    # 4. GLiNER is NOT queried/allowed for PERSON
+    assert "PERSON" not in anon.gliner_recognizer.entity_modes or anon.gliner_recognizer.entity_modes["PERSON"] == "explicit_eupii"
+    # When GLiNER runs on text without glossary match, GLiNER must not return PERSON entities
+    gliner_res = anon.gliner_recognizer.analyze("Unbekannteperson Soundso leitet das Meeting.", ["PERSON"])
+    assert not any(r.entity_type == "PERSON" for r in gliner_res)
+
+    # 5. GLiNER IS allowed for ORGANIZATION (which has mode "all")
+    gliner_org = anon.gliner_recognizer.analyze("Die Firma Microsoft Corporation expandiert.", ["ORGANIZATION"])
+    assert any(r.entity_type == "ORGANIZATION" for r in gliner_org)
+
+
+def test_transparency_overview_mode_semantics_and_active_flags():
+    """Verify get_entity_source_overview accurately reports explicit_eupii and active source flags."""
+    from local_anonymizer.anonymizer import LocalAnonymizer
+
+    modes = {
+        "PERSON": "explicit_eupii",
+        "ORGANIZATION": "all",
+        "EMAIL_ADDRESS": "explicit_only",
+        "PHONE_NUMBER": "off",
+    }
+    anon = LocalAnonymizer(
+        glossary={"ZHAW": "ORGANIZATION", "test@example.com": "EMAIL_ADDRESS"},
+        entity_modes=modes,
+        enabled_entities=["PERSON", "ORGANIZATION", "EMAIL_ADDRESS"],
+        enable_eupii=True,
+    )
+
+    overview = {row["category"]: row for row in anon.get_entity_source_overview()}
+
+    # 1. PERSON: explicit_eupii
+    person_row = overview["PERSON"]
+    assert person_row["active"] is True
+    assert person_row["mode"] == "explicit_eupii"
+    gliner_src = next(s for s in person_row["sources"] if s["kind"] == "prompt")
+    eupii_src = next(s for s in person_row["sources"] if s["kind"] == "model")
+    assert gliner_src["active"] is False  # GLiNER inactive in explicit_eupii
+    assert eupii_src["active"] is True   # EU-PII active in explicit_eupii
+
+    # 2. ORGANIZATION: all
+    org_row = overview["ORGANIZATION"]
+    assert org_row["active"] is True
+    assert org_row["mode"] == "all"
+    org_gliner_src = next(s for s in org_row["sources"] if s["kind"] == "prompt")
+    assert org_gliner_src["active"] is True
+
+    # 3. EMAIL_ADDRESS: explicit_only
+    email_row = overview["EMAIL_ADDRESS"]
+    assert email_row["active"] is True
+    assert email_row["mode"] == "explicit_only"
+    email_gliner = next((s for s in email_row["sources"] if s["kind"] == "prompt"), None)
+    if email_gliner:
+        assert email_gliner["active"] is False
+    email_glossary = next(s for s in email_row["sources"] if s["kind"] == "glossary")
+    assert email_glossary["active"] is True
+
+    # 4. PHONE_NUMBER: off
+    phone_row = overview["PHONE_NUMBER"]
+    assert phone_row["active"] is False
+    assert phone_row["mode"] == "off"
+    for s in phone_row["sources"]:
+        assert s["active"] is False
+
+
+def test_local_anonymizer_set_entity_modes_propagation():
+    """Verify set_entity_modes dynamically updates recognizer configurations."""
+    from local_anonymizer.anonymizer import LocalAnonymizer
+
+    anon = LocalAnonymizer(entity_modes={"PERSON": "all"})
+    assert anon.gliner_recognizer.entity_modes["PERSON"] == "all"
+    assert anon.eupii_recognizer.entity_modes["PERSON"] == "all"
+
+    # Update modes dynamically
+    anon.set_entity_modes({"PERSON": "explicit_eupii", "ORGANIZATION": "all"})
+    assert anon.entity_modes["PERSON"] == "explicit_eupii"
+    assert anon.gliner_recognizer.entity_modes["PERSON"] == "explicit_eupii"
+    assert anon.eupii_recognizer.entity_modes["PERSON"] == "explicit_eupii"

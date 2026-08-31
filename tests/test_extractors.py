@@ -661,3 +661,36 @@ def test_pdf_worker_env_restoration():
     finally:
         os.environ.pop("LOCAL_ANONYMIZER_PDF_WORKER", None)
 
+
+def test_pdf_worker_import_does_not_spawn_warmup_thread():
+    """Verify that importing app.py inside a PDF worker subprocess does NOT spawn a model warmup thread."""
+    import subprocess
+    import sys
+    import os
+    from pathlib import Path
+
+    test_script = (
+        "import os, sys, threading\n"
+        "import app\n"
+        "active_thread_names = [t.name for t in threading.enumerate()]\n"
+        "print('ACTIVE_THREADS:', active_thread_names)\n"
+        "has_warmup = any('warmup' in t.lower() for t in active_thread_names)\n"
+        "assert not has_warmup, f'Unexpected warmup thread found: {active_thread_names}'\n"
+        "print('NO_WARMUP_SUCCESS')\n"
+    )
+
+    env = dict(os.environ)
+    env["LOCAL_ANONYMIZER_PDF_WORKER"] = "1"
+    env["PYTHONPATH"] = "src"
+
+    res = subprocess.run(
+        [sys.executable, "-c", test_script],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parent.parent),
+    )
+
+    assert res.returncode == 0, f"Worker test failed: {res.stderr}"
+    assert "NO_WARMUP_SUCCESS" in res.stdout
+

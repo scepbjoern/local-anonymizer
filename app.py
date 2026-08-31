@@ -40,6 +40,7 @@ from local_anonymizer.config import (
     CONFIG_DIR,
     ENTITY_MODE_ALL,
     ENTITY_MODE_EXPLICIT_ONLY,
+    ENTITY_MODE_EXPLICIT_EUPII,
     ENTITY_MODE_OFF,
     LOG_FILE,
 )
@@ -174,7 +175,8 @@ class AppState:
         self.entity_modes: Dict[str, str] = resolve_entity_modes(self.config)
         # Legacy compatibility for config files and code paths that still expose active_entities.
         self.active_entities: List[str] = [
-            entity for entity, mode in self.entity_modes.items() if mode == ENTITY_MODE_ALL
+            entity for entity, mode in self.entity_modes.items()
+            if mode in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
         ]
         self.format_mode: str = self.config.format_mode  # "numbered", "numbered_role", "role_only"
         self.export_format: str = self.config.export_format  # "txt", "md"
@@ -261,6 +263,7 @@ def build_anonymizer(app_state: Optional[AppState] = None):
             enable_eupii=app_state.enable_eupii,
             eupii_threshold=app_state.eupii_threshold,
             eupii_model=app_state.eupii_model_name,
+            entity_modes=app_state.entity_modes,
         )
     else:
         cfg = AppConfig.load()
@@ -276,6 +279,7 @@ def build_anonymizer(app_state: Optional[AppState] = None):
             enable_eupii=cfg.enable_eupii,
             eupii_threshold=cfg.eupii_threshold,
             eupii_model=cfg.eupii_model_name,
+            entity_modes=entity_modes,
         )
 
 
@@ -294,6 +298,7 @@ def sync_cached_anonymizer_settings(anon, app_state: "AppState") -> None:
     anon.enabled_glossary_entities = glossary_entities
     anon.gliner_recognizer.threshold = app_state.gliner_threshold
     anon.set_eupii_enabled(app_state.enable_eupii, app_state.eupii_threshold)
+    anon.set_entity_modes(app_state.entity_modes)
     anon.set_ignore_terms(parse_ignore_terms(app_state.ignore_terms_text))
     new_glossary = parse_glossary(app_state.glossary_text)
     anon.set_glossary(new_glossary)
@@ -328,35 +333,42 @@ def render_entity_source_overview(overview: List[Dict[str, Any]]) -> None:
 
     for row in overview:
         active = row["active"]
+        mode = row.get("mode")
         with ui.card().classes("w-full p-2 " + ("bg-white" if active else "bg-slate-50 opacity-60")):
-            with ui.row().classes("items-center gap-2"):
+            with ui.row().classes("items-center gap-2 flex-wrap"):
                 ui.icon(
                     "check_circle" if active else "radio_button_unchecked",
                     color="positive" if active else "grey",
                 ).classes("text-sm")
                 ui.label(row["category"]).classes("text-sm font-mono font-bold text-slate-800")
-                mode = row.get("mode")
-                if mode == ENTITY_MODE_EXPLICIT_ONLY:
-                    ui.badge("nur explizite Einträge", color="teal").props("dense")
+                if mode == ENTITY_MODE_EXPLICIT_EUPII:
+                    ui.badge("Glossar, manuell, deterministisch & EU-PII (ohne GLiNER)", color="blue").props("dense")
+                elif mode == ENTITY_MODE_EXPLICIT_ONLY:
+                    ui.badge("nur explizite Einträge & manuell", color="orange-8").props("dense")
+                elif mode == ENTITY_MODE_ALL:
+                    ui.badge("alle Quellen (inkl. GLiNER)", color="green-8").props("dense")
                 elif mode == "automatic_only":
                     ui.badge("nur automatische Erkennung", color="purple").props("dense")
-                elif not active:
+                elif not active or mode == ENTITY_MODE_OFF:
                     ui.badge("inaktiv", color="grey-5").props("dense")
 
             with ui.column().classes("w-full gap-1 mt-1 pl-6"):
                 for src in row["sources"]:
+                    src_active = src.get("active", active)
                     kind_label, kind_color = _SOURCE_KIND_LABELS.get(src["kind"], (src["kind"], "grey"))
-                    with ui.row().classes("items-start gap-2 flex-wrap"):
-                        ui.badge(kind_label, color=kind_color).props("dense outline")
+                    with ui.row().classes("items-start gap-2 flex-wrap" + ("" if src_active else " opacity-40")):
+                        ui.badge(kind_label, color=kind_color if src_active else "grey-5").props("dense outline")
                         if src["kind"] == "prompt":
                             prompts_str = ", ".join(f'"{p}"' for p in src["prompts"])
-                            ui.label(f"GLiNER Zero-Shot: {prompts_str}").classes(
+                            status_suffix = "" if src_active else " (inaktiv in diesem Modus)"
+                            ui.label(f"GLiNER Zero-Shot: {prompts_str}{status_suffix}").classes(
                                 "text-xs text-slate-600 font-mono"
                             )
                         elif src["kind"] == "model":
                             model_name = src.get("model_name", "bardsai/eu-pii-anonimization-multilang")
                             thresh = src.get("threshold", 0.5)
-                            ui.label(f"EU-PII Token-Klassifikator ({model_name}, Schwellenwert: {thresh:.2f})").classes(
+                            status_suffix = "" if src_active else " (inaktiv in diesem Modus)"
+                            ui.label(f"EU-PII Token-Klassifikator ({model_name}, Schwellenwert: {thresh:.2f}){status_suffix}").classes(
                                 "text-xs text-slate-600 font-mono"
                             )
                         elif src["kind"] == "regex":
@@ -444,22 +456,31 @@ SURFACE_TAG_OPTIONS: Dict[str, str] = {
     "KURZFORM": "Kurzform / Kürzel (z. B. JM)",
 }
 
-ENTITY_MODE_OPTIONS: Dict[str, str] = {
-    ENTITY_MODE_OFF: "Aus – nichts anonymisieren",
-    ENTITY_MODE_EXPLICIT_ONLY: "Nur Glossar & manuell",
-    ENTITY_MODE_ALL: "Alle Quellen",
-}
+def get_entity_mode_options(ent: str) -> Dict[str, str]:
+    if ent in ["PERSON", "LOCATION", "ID_NUMBER", "HEALTH_DATA"]:
+        return {
+            ENTITY_MODE_OFF: "Aus – nichts anonymisieren",
+            ENTITY_MODE_EXPLICIT_ONLY: "Nur Glossar & manuell",
+            ENTITY_MODE_EXPLICIT_EUPII: "Nur Glossar, manuell, deterministisch & EU-PII (ohne GLiNER)",
+            ENTITY_MODE_ALL: "Alle Quellen (inkl. GLiNER)",
+        }
+    return {
+        ENTITY_MODE_OFF: "Aus – nichts anonymisieren",
+        ENTITY_MODE_EXPLICIT_ONLY: "Nur Glossar & manuell",
+        ENTITY_MODE_ALL: "Alle Quellen",
+    }
 
 ENTITY_MODE_COLORS: Dict[str, str] = {
     ENTITY_MODE_OFF: "bg-red-100 text-red-900 border-red-300",
     ENTITY_MODE_EXPLICIT_ONLY: "bg-orange-100 text-orange-900 border-orange-300",
+    ENTITY_MODE_EXPLICIT_EUPII: "bg-blue-100 text-blue-900 border-blue-300",
     ENTITY_MODE_ALL: "bg-green-100 text-green-900 border-green-300",
 }
 
 
 def entity_mode_classes(mode: str) -> str:
     """Return stable base and state color classes for one category mode selector."""
-    return f"w-44 text-xs {ENTITY_MODE_COLORS.get(mode, ENTITY_MODE_COLORS[ENTITY_MODE_OFF])}"
+    return f"w-64 text-xs {ENTITY_MODE_COLORS.get(mode, ENTITY_MODE_COLORS[ENTITY_MODE_OFF])}"
 
 RECOGNIZER_METHODS: Dict[str, str] = {
     "GLiNERRecognizer": "gliner",
@@ -506,11 +527,16 @@ def resolve_entity_modes(config: AppConfig) -> Dict[str, str]:
     """Load source-aware category modes, migrating older active_entities settings safely."""
     saved_modes = getattr(config, "entity_modes", {}) or {}
     legacy_active = set(getattr(config, "active_entities", []) or [])
+
+    def get_legacy_default(ent: str) -> str:
+        if ent in legacy_active:
+            if ent in ["PERSON", "LOCATION", "ID_NUMBER", "HEALTH_DATA"]:
+                return ENTITY_MODE_EXPLICIT_EUPII
+            return ENTITY_MODE_ALL
+        return ENTITY_MODE_OFF
+
     return {
-        entity: saved_modes.get(
-            entity,
-            ENTITY_MODE_ALL if entity in legacy_active else ENTITY_MODE_OFF,
-        )
+        entity: saved_modes.get(entity, get_legacy_default(entity))
         for entity in AVAILABLE_ENTITIES
     }
 
@@ -519,11 +545,11 @@ def get_recognizer_entities(entity_modes: Dict[str, str]) -> Tuple[List[str], Li
     """Translate UI modes into general-recognizer and glossary category filters."""
     general_entities = [
         entity for entity in AVAILABLE_ENTITIES
-        if entity_modes.get(entity, ENTITY_MODE_OFF) == ENTITY_MODE_ALL
+        if entity_modes.get(entity, ENTITY_MODE_OFF) in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
     ]
     glossary_entities = [
         entity for entity in AVAILABLE_ENTITIES
-        if entity_modes.get(entity, ENTITY_MODE_OFF) in (ENTITY_MODE_EXPLICIT_ONLY, ENTITY_MODE_ALL)
+        if entity_modes.get(entity, ENTITY_MODE_OFF) in (ENTITY_MODE_EXPLICIT_ONLY, ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
     ]
     return general_entities, glossary_entities
 
@@ -540,11 +566,17 @@ def get_active_occurrences(st: AppState, group: EntityGroup) -> List[EntityOccur
         return []
     if mode == ENTITY_MODE_EXPLICIT_ONLY:
         return [occ for occ in group.occurrences if occ.source in ("glossary", "manual")]
+    if mode == ENTITY_MODE_EXPLICIT_EUPII:
+        return [
+            occ for occ in group.occurrences
+            if occ.source in ("glossary", "manual") or occ.method != "gliner"
+        ]
     return list(group.occurrences)
 
 
-# Start background warmup only after all configuration helpers are defined.
-threading.Thread(target=_warmup_background_thread, daemon=True).start()
+# Start background warmup only after all configuration helpers are defined, and never in PDF worker subprocesses.
+if not is_pdf_worker():
+    threading.Thread(target=_warmup_background_thread, daemon=True).start()
 
 
 def save_current_config(st: AppState):
@@ -552,7 +584,8 @@ def save_current_config(st: AppState):
     st.config.format_mode = st.format_mode
     st.config.entity_modes = dict(st.entity_modes)
     st.config.active_entities = [
-        entity for entity, mode in st.entity_modes.items() if mode == ENTITY_MODE_ALL
+        entity for entity, mode in st.entity_modes.items()
+        if mode in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
     ]
     st.config.gliner_threshold = st.gliner_threshold
     st.config.enable_eupii = st.enable_eupii
@@ -562,6 +595,94 @@ def save_current_config(st: AppState):
     st.config.glossary = st.glossary_text
     st.config.export_format = st.export_format
     st.config.save()
+
+
+async def ensure_models_downloaded_with_dialog(state: AppState) -> bool:
+    """
+    Ensure all AI models required by the current configuration are available in the local cache.
+    If a model needs to be downloaded for the first time, prompts the user with an explicit
+    confirmation dialog detailing download size, cache location, and offline privacy guarantees.
+    Returns True if models are ready to use, False if cancelled or download failed.
+    """
+    needs_gliner = any(m == ENTITY_MODE_ALL for m in state.entity_modes.values())
+    needs_eupii = state.enable_eupii and any(
+        state.entity_modes.get(e) in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
+        for e in ["PERSON", "LOCATION", "ID_NUMBER", "HEALTH_DATA"]
+    )
+
+    models_to_download = []
+    if needs_gliner and not is_model_cached(state.gliner_model_name, "gliner"):
+        models_to_download.append({
+            "name": "GLiNER Zero-Shot Modell",
+            "repo": state.gliner_model_name,
+            "type": "gliner",
+            "size": f"ca. {GLINER_MODEL_SIZE_MB / 1000:.2f} GB",
+            "desc": "Universelles Zero-Shot NER-Modell für flexible Erkennung von Personen, Organisationen, Rollen und IT-Systemen.",
+        })
+    if needs_eupii and not is_model_cached(state.eupii_model_name, "transformers"):
+        models_to_download.append({
+            "name": "EU-PII Multilingual Modell",
+            "repo": state.eupii_model_name,
+            "type": "transformers",
+            "size": f"ca. {EUPII_MODEL_SIZE_MB / 1000:.2f} GB",
+            "desc": "Spezialisiertes RoBERTa-Token-Klassifikationsmodell für europäische PII (Personen, Adressen, Ausweisnummern, Gesundheitsdaten).",
+        })
+
+    if not models_to_download:
+        return True
+
+    # Show confirmation dialog
+    confirmed = False
+    with ui.dialog() as dlg, ui.card().classes("p-5 max-w-lg bg-white rounded-xl shadow-xl"):
+        ui.label("Einmaliger Modell-Download erforderlich").classes("text-base font-bold text-slate-800 mb-1")
+
+        md_lines = ["Für die gewählte Konfiguration ist ein einmaliger Download lokaler KI-Modelle erforderlich:\n"]
+        total_mb = sum(
+            GLINER_MODEL_SIZE_MB if m["type"] == "gliner" else EUPII_MODEL_SIZE_MB
+            for m in models_to_download
+        )
+        for m in models_to_download:
+            md_lines.append(f"- **{m['name']}** (`{m['repo']}`): **{m['size']}**\n  _{m['desc']}_")
+
+        md_lines.append(
+            "\n- **Speicherort:** Lokaler HuggingFace-Cache (`~/.cache/huggingface`)\n"
+            "- **Datenschutz:** Nach dem Download arbeiten alle Modelle zu **100% lokal und offline**.\n\n"
+            "Möchtest du den Download jetzt starten?"
+        )
+        ui.markdown("\n".join(md_lines)).classes("text-xs text-slate-600 leading-relaxed mb-3")
+
+        with ui.row().classes("w-full justify-end gap-2"):
+            def on_cancel():
+                dlg.close()
+            def on_confirm():
+                nonlocal confirmed
+                confirmed = True
+                dlg.close()
+            ui.button("Abbrechen", on_click=on_cancel).props("flat text-color=slate")
+            ui.button(f"Jetzt herunterladen ({total_mb / 1000:.2f} GB)", icon="cloud_download", on_click=on_confirm, color="primary").props("unelevated")
+
+    await dlg
+    if not confirmed:
+        return False
+
+    # Perform download with user notification
+    for m in models_to_download:
+        ui.notify(f"Lade {m['name']} ({m['size']}) herunter... Bitte warten.", type="info", timeout=15000)
+        try:
+            def load_model():
+                with _model_lock:
+                    anon = get_synced_cached_anonymizer(state)
+                    if m["type"] == "gliner":
+                        anon.gliner_recognizer.load()
+                    else:
+                        anon.eupii_recognizer.load()
+            await asyncio.to_thread(load_model)
+            ui.notify(f"{m['name']} erfolgreich heruntergeladen und einsatzbereit.", type="positive")
+        except Exception as ex:
+            ui.notify(f"Fehler beim Download von {m['name']}: {ex}", type="negative", timeout=12000, close_button=True)
+            return False
+
+    return True
 
 
 def extract_context_snippet(raw_text: str, start: int, end: int, window: int = 40) -> str:
@@ -1135,6 +1256,12 @@ def create_ui():
     async def run_analysis():
         if not state.raw_text or not state.raw_text.strip():
             ui.notify("Bitte laden Sie zuerst ein Dokument hoch oder fügen Sie Text ein.", type="warning")
+            return
+
+        # Ensure required AI models are confirmed and downloaded before starting analysis
+        ready = await ensure_models_downloaded_with_dialog(state)
+        if not ready:
+            ui.notify("Analyse abgebrochen: Modell-Download wurde nicht bestätigt.", type="warning")
             return
 
         if reanalysis_warning_card is not None:
@@ -1747,8 +1874,8 @@ def create_ui():
                             mode = e.value or ENTITY_MODE_OFF
                             state.entity_modes[e_name] = mode
                             state.active_entities = [
-                                entity for entity, mode in state.entity_modes.items()
-                                if mode == ENTITY_MODE_ALL
+                                entity for entity, m in state.entity_modes.items()
+                                if m in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
                             ]
                             if selector_ref:
                                 selector_ref[0].classes(replace=entity_mode_classes(mode))
@@ -1765,7 +1892,7 @@ def create_ui():
 
                     mode_change, selector_ref = make_entity_mode_change(ent)
                     mode_select = ui.select(
-                        options=ENTITY_MODE_OPTIONS,
+                        options=get_entity_mode_options(ent),
                         value=state.entity_modes.get(ent, ENTITY_MODE_OFF),
                         on_change=mode_change,
                     ).props("dense outlined options-dense").classes(

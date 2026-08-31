@@ -555,3 +555,36 @@ def test_eupii_load_lifecycle_cache_download_and_error(monkeypatch):
         rec3.load()
     assert "1.07 GB" in str(exc_info.value)
     assert "konnte weder aus dem lokalen Cache noch online heruntergeladen werden" in str(exc_info.value)
+
+
+def test_is_model_cached_hub_file_check_without_loading_model(monkeypatch):
+    """Verify is_model_cached checks filesystem/cache metadata without instantiating heavy model weights."""
+    import huggingface_hub
+    from local_anonymizer.recognizers import is_model_cached
+
+    # Simulate hub cache hit
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda repo, filename: f"C:/mock/cache/{filename}")
+    assert is_model_cached("mock/cached-model", "transformers") is True
+    assert is_model_cached("mock/cached-model", "gliner") is True
+
+    # Simulate hub cache miss
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda repo, filename: None)
+    assert is_model_cached("mock/uncached-model", "transformers") is False
+    assert is_model_cached("mock/uncached-model", "gliner") is False
+
+
+def test_gliner_load_lifecycle_error_handling(monkeypatch):
+    """Verify GLiNERRecognizer.load() handles download failures with clean User-friendly errors."""
+    import pytest
+    from local_anonymizer.recognizers import GLiNERRecognizer
+
+    def mock_gliner_fail(*args, **kwargs):
+        raise ConnectionError("Offline / Network error")
+
+    import gliner
+    monkeypatch.setattr(gliner.GLiNER, "from_pretrained", mock_gliner_fail)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        GLiNERRecognizer(model_name="test/gliner-fail-model")
+    assert "1.10 GB" in str(exc_info.value)
+    assert "konnte weder aus dem lokalen Cache noch online heruntergeladen werden" in str(exc_info.value)

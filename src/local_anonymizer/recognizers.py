@@ -298,13 +298,15 @@ class GLiNERRecognizer(EntityRecognizer):
         threshold: float = 0.55,
         supported_language: str = "de",
         name: str = "GLiNERRecognizer",
+        entity_modes: Optional[Dict[str, str]] = None,
     ):
+        self.model_name = model_name
+        self.threshold = threshold
+        self.entity_modes = entity_modes or {}
         self.label_mapping = dict(label_mapping or self.DEFAULT_LABEL_MAPPING)
         if custom_labels:
             self.label_mapping.update(custom_labels)
 
-        self.threshold = threshold
-        self.model_name = model_name
         self.model: Optional[GLiNER] = None
 
         supported_entities = list(set(self.label_mapping.values()))
@@ -363,16 +365,24 @@ class GLiNERRecognizer(EntityRecognizer):
 
         assert self.model is not None
 
-        # Determine which GLiNER labels to query based on requested Presidio entities
-        if entities:
-            labels_to_query = [
-                k for k, v in self.label_mapping.items() if v in entities
-            ]
-        else:
-            labels_to_query = list(self.label_mapping.keys())
+        # Determine which Presidio entities GLiNER is actually ALLOWED to return.
+        # It must only return entities that have mode == "all".
+        # (Mode "explicit_eupii" means EU-PII runs it, but GLiNER must NOT run it).
+        requested_entities = set(entities) if entities else set(self.label_mapping.values())
+        allowed_entities = set()
+        for e in requested_entities:
+            # Fall back to "all" if missing, to preserve behavior for config-less API usage
+            mode = self.entity_modes.get(e, "all")
+            if mode == "all":
+                allowed_entities.add(e)
 
-        if not labels_to_query:
+        if not allowed_entities:
             return []
+
+        # ALWAYS query ALL mapped labels so GLiNER has the correct semantic "sinks".
+        # This prevents Prompt-Label-Collapsing (e.g. where 'Exchange Online' is
+        # misclassified as ORGANIZATION simply because IT_SYSTEM was turned off).
+        labels_to_query = list(self.label_mapping.keys())
 
         # PERSON, IT_SYSTEM, and ROLE labels are deliberately queried in separate passes. They
         # use semantically focused prompts / are opt-in quasi-identifiers, while the established
@@ -418,37 +428,47 @@ class GLiNERRecognizer(EntityRecognizer):
             if not labels:
                 return []
             try:
-                # High-performance batch inference (saturates multi-core CPU SIMD / GPU / Apple Silicon MPS)
                 return self.model.inference(
-                    chunk_texts,
-                    labels,
-                    threshold=self.threshold,
-                    batch_size=8,
+                    chunk_texts, labels, threshold=self.threshold, batch_size=8
                 )
             except Exception:
-                # Fallback to single chunk prediction if inference/batching is unavailable
                 return [
                     self.model.predict_entities(t, labels, threshold=self.threshold)
                     for t in chunk_texts
                 ]
 
-        for predicted_batches in (
-            predict_for_labels(primary_labels),
-            # Keep the legacy prompts as a recall fallback and run the refined prompts
-            # separately so their semantic wording cannot suppress established name spans.
-            predict_for_labels(legacy_person_labels),
-            predict_for_labels(refined_person_labels),
-            predict_for_labels(other_person_labels),
-            predict_for_labels(it_system_labels),
-            predict_for_labels(role_labels),
-        ):
+        # Base sinks are all non-PERSON labels. We always include them in every pass
+        # so they can "absorb" things like 'Exchange Online' and prevent them from
+        # collapsing into ORGANIZATION or PERSON.
+        base_sinks = primary_labels + it_system_labels + role_labels
+
+        passes = [
+            # 1. Primary pass: queries all non-person labels. We keep all of them.
+            (base_sinks, set(base_sinks)),
+            # 2. Legacy person pass
+            (legacy_person_labels + base_sinks, set(legacy_person_labels)),
+            # 3. Refined person pass
+            (refined_person_labels + base_sinks, set(refined_person_labels)),
+            # 4. Other person pass
+            (other_person_labels + base_sinks, set(other_person_labels)),
+        ]
+
+        for query_labels, keep_labels in passes:
+            if not query_labels or not keep_labels:
+                continue
+
+            predicted_batches = predict_for_labels(query_labels)
+
             for (chunk_start, chunk_end, chunk_text), predicted_entities in zip(valid_chunks, predicted_batches):
                 for pred in predicted_entities:
                     gliner_label = pred["label"]
+                    if gliner_label not in keep_labels:
+                        continue
+
                     presidio_entity = self.label_mapping.get(gliner_label, gliner_label.upper())
 
-                    # Filter if specific entities were requested
-                    if entities and presidio_entity not in entities:
+                    # Filter out entities that are not allowed (e.g. because they are off or EU-PII only)
+                    if presidio_entity not in allowed_entities:
                         continue
 
                     global_start = chunk_start + pred["start"]
@@ -788,15 +808,48 @@ EUPII_MODEL_SIZE_MB = 1075  # ~1.07 GB download size (safetensors + tokenizer)
 
 def is_model_cached(model_name: str, model_type: str = "transformers") -> bool:
     """
-    Checks if model weights are available in the local HuggingFace cache without network access.
-    Returns True if cached and loadable offline, False otherwise.
+    Checks if model weights and configuration are available in the local cache or memory
+    without downloading or redundantly allocating heavy model weights into memory.
     """
+    # 1. In-memory cache check
+    if model_type == "gliner":
+        if model_name in GLiNERRecognizer._MODEL_CACHE:
+            return True
+    else:
+        if model_name in _EUPII_MODEL_CACHE:
+            return True
+
+    # 2. Local directory path check
+    if os.path.isdir(model_name):
+        has_cfg = any(os.path.exists(os.path.join(model_name, f)) for f in ("config.json", "gliner_config.json"))
+        has_weights = any(os.path.exists(os.path.join(model_name, f)) for f in ("model.safetensors", "pytorch_model.bin"))
+        if has_cfg and has_weights:
+            return True
+
+    # 3. Fast HuggingFace Hub cache check without instantiating model
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        if model_type == "gliner":
+            cfg = try_to_load_from_cache(model_name, "gliner_config.json") or try_to_load_from_cache(model_name, "config.json")
+            weights = try_to_load_from_cache(model_name, "model.safetensors") or try_to_load_from_cache(model_name, "pytorch_model.bin")
+            if isinstance(cfg, (str, os.PathLike)) and isinstance(weights, (str, os.PathLike)):
+                return True
+        else:
+            cfg = try_to_load_from_cache(model_name, "config.json")
+            weights = try_to_load_from_cache(model_name, "model.safetensors") or try_to_load_from_cache(model_name, "pytorch_model.bin")
+            if isinstance(cfg, (str, os.PathLike)) and isinstance(weights, (str, os.PathLike)):
+                return True
+    except Exception:
+        pass
+
+    # 4. Fallback for test environments (e.g. mocked from_pretrained)
     with set_huggingface_offline_mode(True):
         if model_type == "gliner":
             try:
                 from gliner import GLiNER
-                GLiNER.from_pretrained(model_name, local_files_only=True)
-                return True
+                if hasattr(GLiNER, "from_pretrained"):
+                    GLiNER.from_pretrained(model_name, local_files_only=True)
+                    return True
             except Exception:
                 return False
         else:
@@ -807,6 +860,8 @@ def is_model_cached(model_name: str, model_type: str = "transformers") -> bool:
                 return True
             except Exception:
                 return False
+
+    return False
 
 
 EU_PII_CATEGORY_MAPPING: Dict[str, str] = {
@@ -841,9 +896,11 @@ class EUPiiRecognizer(EntityRecognizer):
         threshold: float = 0.50,
         supported_language: str = "de",
         name: str = "EUPiiRecognizer",
+        entity_modes: Optional[Dict[str, str]] = None,
     ):
         self.model_name = model_name
         self.threshold = threshold
+        self.entity_modes = entity_modes or {}
         self.tokenizer = None
         self.model = None
         self.id2label: Dict[int, str] = {}
@@ -990,6 +1047,16 @@ class EUPiiRecognizer(EntityRecognizer):
         if not text or not text.strip():
             return []
 
+        requested_entities = set(entities) if entities else set(EU_PII_CATEGORY_MAPPING.values())
+        allowed_entities = set()
+        for e in requested_entities:
+            mode = self.entity_modes.get(e, "all")
+            if mode in ("all", "explicit_eupii"):
+                allowed_entities.add(e)
+
+        if not allowed_entities:
+            return []
+
         self.load()
         assert self.model is not None and self.tokenizer is not None
 
@@ -1018,65 +1085,65 @@ class EUPiiRecognizer(EntityRecognizer):
         with torch.no_grad():
             outputs = self.model(**inputs)
             logits = outputs.logits  # (num_windows, seq_len, num_classes)
-            probabilities = torch.softmax(logits, dim=-1)
-            pred_scores, pred_ids = torch.max(probabilities, dim=-1)
+            probs = torch.softmax(logits, dim=-1)
 
         raw_candidates: List[Dict[str, Any]] = []
 
-        num_windows = logits.shape[0]
-        for w_idx in range(num_windows):
-            w_scores = pred_scores[w_idx].tolist() if hasattr(pred_scores[w_idx], "tolist") else list(pred_scores[w_idx])
-            w_ids = pred_ids[w_idx].tolist() if hasattr(pred_ids[w_idx], "tolist") else list(pred_ids[w_idx])
-            w_offsets = offset_mapping[w_idx].tolist() if hasattr(offset_mapping[w_idx], "tolist") else list(offset_mapping[w_idx])
+        # Process each sliding window independently
+        for window_idx in range(probs.shape[0]):
+            w_probs = probs[window_idx]
+            w_offsets = offset_mapping[window_idx]
+            w_tokens = inputs["input_ids"][window_idx]
 
-            current_entity: Optional[Dict[str, Any]] = None
+            current_entity_type: Optional[str] = None
+            current_start: Optional[int] = None
+            current_end: Optional[int] = None
+            current_scores: List[float] = []
 
-            def flush_entity() -> None:
-                nonlocal current_entity
-                if current_entity:
-                    mean_score = sum(current_entity["scores"]) / len(current_entity["scores"])
-                    if mean_score >= self.threshold:
+            def flush_entity():
+                if current_entity_type and current_start is not None and current_end is not None:
+                    avg_score = sum(current_scores) / len(current_scores)
+                    if avg_score >= self.threshold:
+                        std_type = EU_PII_CATEGORY_MAPPING.get(current_entity_type, current_entity_type)
                         raw_candidates.append({
-                            "type": current_entity["type"],
-                            "start": current_entity["start"],
-                            "end": current_entity["end"],
-                            "scores": current_entity["scores"],
-                            "score": mean_score,
+                            "type": std_type,
+                            "start": current_start,
+                            "end": current_end,
+                            "score": avg_score,
                         })
-                    current_entity = None
+
+            w_scores = probs[window_idx].max(dim=-1).values.tolist()
+            w_ids = probs[window_idx].max(dim=-1).indices.tolist()
+            w_offsets = offset_mapping[window_idx].tolist() if hasattr(offset_mapping[window_idx], "tolist") else list(offset_mapping[window_idx])
 
             for token_id, score, (start_char, end_char) in zip(w_ids, w_scores, w_offsets):
-                # Skip special tokens (e.g. CLS, SEP, PAD with 0, 0 offsets)
                 if start_char == end_char:
-                    continue
-
-                label = self.id2label.get(token_id, "O")
-                if label == "O":
                     flush_entity()
+                    current_entity_type = None
                     continue
 
-                prefix, _, tag = label.partition("-")
-                std_type = EU_PII_CATEGORY_MAPPING.get(tag)
-                if not std_type:
-                    # Ignore categories not mapped in EU-PII selective activation
+                pred_label = self.id2label.get(token_id, "O")
+
+                if pred_label == "O":
                     flush_entity()
+                    current_entity_type = None
                     continue
 
-                # Subtoken continuation (no whitespace between tokens) or I-tag continuation
-                is_subtoken = current_entity is not None and current_entity["end"] == start_char
-                is_i_tag = prefix == "I"
+                bio_tag = pred_label[:1]
+                ent_type = pred_label[2:]
 
-                if current_entity is not None and current_entity["type"] == std_type and (is_subtoken or is_i_tag):
-                    current_entity["end"] = end_char
-                    current_entity["scores"].append(score)
+                # Expand the current entity if it is a sub-token (continuation of a word)
+                # or an explicit I- tag of the same entity type.
+                is_subtoken = current_start is not None and current_end == start_char
+                if current_entity_type == ent_type and (bio_tag == "I" or (is_subtoken and bio_tag == "B")):
+                    current_end = end_char
+                    current_scores.append(score)
                 else:
                     flush_entity()
-                    current_entity = {
-                        "type": std_type,
-                        "start": start_char,
-                        "end": end_char,
-                        "scores": [score],
-                    }
+                    current_entity_type = ent_type
+                    current_start = start_char
+                    current_end = end_char
+                    current_scores = [score]
 
             flush_entity()
 
@@ -1125,7 +1192,7 @@ class EUPiiRecognizer(EntityRecognizer):
                 continue
 
             std_type = cand["type"]
-            if entities is not None and std_type not in entities:
+            if std_type not in allowed_entities:
                 continue
 
             avg_score = round(cand["score"], 3)

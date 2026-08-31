@@ -292,6 +292,7 @@ class LocalAnonymizer:
         enable_eupii: bool = True,
         eupii_threshold: float = 0.50,
         eupii_model: str = "bardsai/eu-pii-anonimization-multilang",
+        entity_modes: Optional[Dict[str, str]] = None,
     ):
         self.language = language
         self.glossary = glossary or {}
@@ -299,6 +300,7 @@ class LocalAnonymizer:
         self.enable_eupii = enable_eupii
         self.eupii_threshold = eupii_threshold
         self.eupii_model = eupii_model
+        self.entity_modes = entity_modes or {}
 
         # Keep built-in safeguards separate from user terms: deliberate user ignores must take
         # precedence over glossary entries, while an explicit glossary entry may still override
@@ -376,6 +378,7 @@ class LocalAnonymizer:
             custom_labels=custom_labels,
             threshold=gliner_threshold,
             supported_language=language,
+            entity_modes=self.entity_modes,
         )
         self.fuzzy_recognizer = FuzzyGlossaryRecognizer(
             glossary=self.glossary,
@@ -390,6 +393,7 @@ class LocalAnonymizer:
             model_name=eupii_model,
             threshold=eupii_threshold,
             supported_language=language,
+            entity_modes=self.entity_modes,
         )
 
         self.analyzer.registry.add_recognizer(self.address_recognizer)
@@ -440,6 +444,12 @@ class LocalAnonymizer:
         """Replace user ignore terms while retaining the built-in generic-term safeguards."""
         self.user_ignore_terms = list(ignore_terms or [])
         self.ignore_terms = list(dict.fromkeys(self.default_ignore_terms + self.user_ignore_terms))
+
+    def set_entity_modes(self, entity_modes: Dict[str, str]) -> None:
+        """Update entity_modes dynamically for the active LocalAnonymizer instance."""
+        self.entity_modes = dict(entity_modes)
+        self.gliner_recognizer.entity_modes = self.entity_modes
+        self.eupii_recognizer.entity_modes = self.entity_modes
 
     def set_eupii_enabled(self, enabled: bool, threshold: Optional[float] = None) -> None:
         """Enable or disable EUPiiRecognizer in the active Presidio analyzer registry."""
@@ -588,16 +598,57 @@ class LocalAnonymizer:
             glossary_active = (
                 enabled_glossary is None or category in enabled_glossary
             ) and category in glossary_categories
-            overview.append({
-                "category": category,
-                "active": general_active or glossary_active,
-                "mode": (
+
+            if category in self.entity_modes:
+                cat_mode = self.entity_modes[category]
+                row_active = cat_mode != "off"
+            else:
+                cat_mode = (
                     "all" if general_active and glossary_active
                     else "explicit_only" if glossary_active
                     else "automatic_only" if general_active
                     else "off"
-                ),
-                "sources": category_sources[category],
+                )
+                row_active = general_active or glossary_active
+
+            # Mark per-source active status
+            sources = category_sources[category]
+            for src in sources:
+                kind = src["kind"]
+                if category in self.entity_modes:
+                    if cat_mode == "off":
+                        src["active"] = False
+                    elif cat_mode == "explicit_only":
+                        src["active"] = (kind == "glossary" and glossary_active)
+                    elif cat_mode == "explicit_eupii":
+                        if kind == "prompt":
+                            src["active"] = False
+                        elif kind == "model":
+                            src["active"] = self.enable_eupii
+                        elif kind == "glossary":
+                            src["active"] = glossary_active
+                        else:  # regex, library (deterministic)
+                            src["active"] = general_active
+                    else:  # all
+                        if kind == "model":
+                            src["active"] = self.enable_eupii
+                        elif kind == "glossary":
+                            src["active"] = glossary_active
+                        else:
+                            src["active"] = general_active
+                else:
+                    if kind == "glossary":
+                        src["active"] = glossary_active
+                    elif kind == "model":
+                        src["active"] = general_active and self.enable_eupii
+                    else:
+                        src["active"] = general_active
+
+            overview.append({
+                "category": category,
+                "active": row_active,
+                "mode": cat_mode,
+                "sources": sources,
             })
         return overview
 
