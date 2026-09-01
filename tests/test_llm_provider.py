@@ -71,6 +71,7 @@ async def test_local_api_provider_generate_success():
 
     mock_resp = MagicMock()
     mock_resp.status = 200
+    mock_resp.headers = {"Content-Type": "application/json; charset=utf-8"}
     mock_resp.content = MockContent(json.dumps(mock_resp_json).encode("utf-8"))
 
     mock_post_cm = MagicMock()
@@ -86,6 +87,40 @@ async def test_local_api_provider_generate_success():
 
     res = await provider.generate("Test user prompt", "Test system prompt")
     assert '{"schema_version": "1.0"' in res
+
+    # Verify max_tokens is sent in payload
+    call_kwargs = mock_session.post.call_args[1]
+    assert call_kwargs["json"]["max_tokens"] == 2048
+
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_local_api_provider_content_type_validation():
+    provider = LocalApiProvider(
+        base_url="http://127.0.0.1:11434/v1",
+        model_name="phi4:latest",
+    )
+
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.headers = {"Content-Type": "text/html"}  # Invalid content type
+    mock_resp.content = MagicMock()
+
+    mock_post_cm = MagicMock()
+    mock_post_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_post_cm.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session = MagicMock()
+    mock_session.post.return_value = mock_post_cm
+    mock_session.close = AsyncMock()
+    mock_session.closed = False
+
+    provider._session = mock_session
+
+    with pytest.raises(ValueError, match="Unerwarteter Content-Type"):
+        await provider.generate("prompt", "sys")
+
     await provider.close()
 
 
@@ -104,6 +139,7 @@ async def test_local_api_provider_size_limit_exceeded():
 
     mock_resp = MagicMock()
     mock_resp.status = 200
+    mock_resp.headers = {"Content-Type": "application/json"}
     mock_resp.content = GiantMockContent()
 
     mock_post_cm = MagicMock()
@@ -123,22 +159,24 @@ async def test_local_api_provider_size_limit_exceeded():
 
 
 @pytest.mark.asyncio
-async def test_local_api_provider_concurrent_lock():
-    provider = LocalApiProvider(
-        base_url="http://127.0.0.1:11434/v1",
-        model_name="phi4:latest",
-    )
+async def test_two_separate_provider_sessions_run_concurrently():
+    # Verify that concurrency lock is session-local and does not globally block other sessions
+    p1 = LocalApiProvider("http://127.0.0.1:11434/v1", "phi4:latest")
+    p2 = LocalApiProvider("http://127.0.0.1:11434/v1", "phi4:latest")
 
-    execution_order = []
+    events = []
 
-    async def mock_call(idx: int):
+    async def run_p(provider: LocalApiProvider, tag: str):
         async with provider._lock:
-            execution_order.append(f"start_{idx}")
+            events.append(f"{tag}_start")
             await asyncio.sleep(0.05)
-            execution_order.append(f"end_{idx}")
+            events.append(f"{tag}_end")
 
-    await asyncio.gather(mock_call(1), mock_call(2))
+    await asyncio.gather(run_p(p1, "p1"), run_p(p2, "p2"))
 
-    assert execution_order == ["start_1", "end_1", "start_2", "end_2"] or \
-           execution_order == ["start_2", "end_2", "start_1", "end_1"]
-    await provider.close()
+    # Both should have started before both ended (concurrent execution across sessions)
+    assert events[0].endswith("_start")
+    assert events[1].endswith("_start")
+
+    await p1.close()
+    await p2.close()

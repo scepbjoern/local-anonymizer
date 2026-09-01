@@ -25,13 +25,16 @@ cd local-anonymizer
 ```
 
 ### Step 2: Install Virtual Environment & GUI Dependencies
-Always include the `gui` and `llm` extras so NiceGUI, desktop components, and local LLM triage are installed:
+Include the `gui` extra so NiceGUI and desktop components are installed:
 ```bash
 # Recommended via uv:
-uv sync --extra gui --extra llm
+uv sync --extra gui
 
 # Standard pip alternative:
-pip install -e ".[gui,llm]"
+pip install -e ".[gui]"
+
+# Optional LLM Triage extra:
+uv sync --extra gui --extra llm  # or pip install -e ".[gui,llm]"
 ```
 
 ---

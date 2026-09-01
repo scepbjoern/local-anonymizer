@@ -1,5 +1,11 @@
 """Local LLM Triage Layer (Phase 6A)."""
 
+try:
+    import aiohttp
+    import pydantic
+except ImportError as err:
+    raise ImportError("Dependencies for [llm] extra (aiohttp, pydantic) are not installed.") from err
+
 from local_anonymizer.llm.schema import (
     TriageAction,
     TriageConfidence,

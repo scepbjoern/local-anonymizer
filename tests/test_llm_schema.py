@@ -57,6 +57,12 @@ def test_schema_version_strict_binding():
         )
 
 
+def test_missing_confidence_rejected():
+    # confidence is required, cannot be omitted
+    with pytest.raises(ValidationError):
+        TriageKeepItem.model_validate({"occ_id": "occ-1", "action": "keep"})
+
+
 def test_extra_fields_forbidden():
     with pytest.raises(ValidationError):
         TriageKeepItem(
@@ -125,7 +131,20 @@ def test_validate_batch_response_success():
             TriageDiscardItem(occ_id="id-2", confidence="medium"),
         ],
     )
-    validate_batch_response(envelope, expected_ids, 2, "snap_123")
+    validate_batch_response(envelope, expected_ids, 2, "snap_123", expected_request_id="req-1")
+
+
+def test_validate_batch_response_request_id_mismatch():
+    expected_ids = {"id-1"}
+    envelope = TriageEnvelope(
+        schema_version="1.0",
+        request_id="req-wrong",
+        document_revision=2,
+        document_hash="snap_123",
+        items=[TriageKeepItem(occ_id="id-1", confidence="high")],
+    )
+    with pytest.raises(ValueError, match="Request ID mismatch"):
+        validate_batch_response(envelope, expected_ids, 2, "snap_123", expected_request_id="req-correct")
 
 
 def test_validate_batch_response_missing_id():

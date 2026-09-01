@@ -50,7 +50,7 @@ If you use a local AI coding assistant with terminal and filesystem permissions 
 > *"Klone das Repository https://github.com/scepbjoern/local-anonymizer in <Zielordner> und installiere die Applikation."*
 > *(Or in English: "Clone https://github.com/scepbjoern/local-anonymizer into <target_folder> and install the application.")*
 
-The AI assistant will inspect [`AGENTS.md`](AGENTS.md) and [`pyproject.toml`](pyproject.toml) to automatically handle environment setup, `uv sync --extra gui --extra llm`, and verification tests.
+The AI assistant will inspect [`AGENTS.md`](AGENTS.md) and [`pyproject.toml`](pyproject.toml) to automatically handle environment setup, `uv sync --extra gui`, and verification tests.
 
 > [!NOTE]
 > **Empirical Verification & Security Disclosure:**
@@ -63,12 +63,24 @@ Using [`uv`](https://github.com/astral-sh/uv) (recommended):
 ```bash
 git clone https://github.com/scepbjoern/local-anonymizer.git
 cd local-anonymizer
-uv sync --extra gui --extra llm
+uv sync --extra gui
 ```
 
 Or using standard `pip`:
 
 ```bash
+pip install -e ".[gui]"
+```
+
+#### Optional: Local LLM Triage Layer Extra (`[llm]`)
+
+To enable the optional local LLM review assistance with local OpenAI-compatible endpoints:
+
+```bash
+# Via uv:
+uv sync --extra gui --extra llm
+
+# Via pip:
 pip install -e ".[gui,llm]"
 ```
 

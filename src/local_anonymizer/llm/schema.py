@@ -13,7 +13,7 @@ class BaseTriageItem(BaseModel):
 
     occ_id: str = Field(..., min_length=1, max_length=64, description="Stable occurrence identifier")
     reasoning: Optional[str] = Field(None, max_length=500, description="Brief justification from LLM")
-    confidence: TriageConfidence = Field("high", description="Model confidence level")
+    confidence: TriageConfidence = Field(..., description="Model confidence level")
 
 
 class TriageKeepItem(BaseTriageItem):
@@ -48,7 +48,7 @@ TriageItem = Annotated[
 class TriageEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    schema_version: Literal["1.0"] = Field("1.0", description="Strict schema version requirement")
+    schema_version: Literal["1.0"] = Field(..., description="Strict schema version requirement")
     request_id: str = Field(..., min_length=1, max_length=64, description="Batch request tracking ID")
     document_revision: int = Field(..., ge=0, description="Document revision at request time")
     document_hash: str = Field(..., min_length=1, max_length=128, description="Snapshot hash binding")
@@ -60,6 +60,7 @@ def validate_batch_response(
     expected_occ_ids: Set[str],
     expected_doc_rev: int,
     expected_doc_hash: str,
+    expected_request_id: Optional[str] = None,
 ) -> None:
     """
     Perform strict atomic verification of a batch response envelope against expectations.
@@ -67,6 +68,9 @@ def validate_batch_response(
     """
     if envelope.schema_version != "1.0":
         raise ValueError(f"Schema version mismatch: expected '1.0', got '{envelope.schema_version}'")
+
+    if expected_request_id and envelope.request_id != expected_request_id:
+        raise ValueError(f"Request ID mismatch: expected '{expected_request_id}', got '{envelope.request_id}'")
 
     if envelope.document_revision != expected_doc_rev:
         raise ValueError(

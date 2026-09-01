@@ -1,3 +1,4 @@
+import json
 import pytest
 from local_anonymizer.llm.batching import (
     estimate_tokens,
@@ -14,24 +15,56 @@ def test_estimate_tokens():
     assert estimate_tokens("") == 0
 
 
-def test_build_candidate_prompt():
+def test_build_candidate_prompt_adversarial_escaping():
     candidates = [
         {
-            "occ_id": "occ-123",
-            "original_text": "Dr. Meier",
+            "occ_id": 'occ-"123"\\evil',
+            "original_text": 'Dr. "Evil" \n\r\t \x00',
             "entity_type": "PERSON",
-            "role": "Chefarzt",
-            "context_snippet": "Befund von Dr. Meier erstellt.",
+            "role": 'Chefarzt "Klinik"',
+            "context_snippet": 'Befund von "Dr. Evil", status: {"injected": true}.',
         }
     ]
     prompt = build_candidate_prompt(candidates, "req-1", 2, "hash_123")
-    assert 'occ_id: "occ-123"' in prompt
-    assert 'Erkannter Begriff: "Dr. Meier"' in prompt
-    assert "Aktueller Typ: PERSON" in prompt
-    assert "Aktuelle Rolle: 'Chefarzt'" in prompt
-    assert 'Kontext: "Befund von Dr. Meier erstellt."' in prompt
-    assert '"document_revision": 2' in prompt
-    assert '"document_hash": "hash_123"' in prompt
+    assert "UNTRUSTED DOCUMENT PAYLOAD" in prompt
+    assert "END OF UNTRUSTED PAYLOAD" in prompt
+    # Check that candidate fields are escaped properly via json.dumps
+    assert json.dumps('occ-"123"\\evil') in prompt
+    assert json.dumps('Dr. "Evil" \n\r\t \x00') in prompt
+    assert json.dumps('Chefarzt "Klinik"') in prompt
+
+    # Extract JSON example from prompt and verify that it is 100% valid JSON
+    json_start = prompt.find("{\n  \"schema_version\"")
+    if json_start != -1:
+        json_str = prompt[json_start:]
+        parsed_example = json.loads(json_str)
+        assert parsed_example["schema_version"] == "1.0"
+        assert parsed_example["request_id"] == "req-1"
+
+
+def test_prepare_triage_batches_oversized_candidate_truncation():
+    # An extraordinarily large context snippet exceeding batch budget
+    huge_context = "A" * 20000
+    candidates = [
+        {
+            "occ_id": "occ-huge",
+            "original_text": "Huge Candidate",
+            "entity_type": "PERSON",
+            "role": "",
+            "context_snippet": huge_context,
+        }
+    ]
+    batches = prepare_triage_batches(
+        candidates,
+        document_revision=1,
+        document_hash="snap_huge",
+        max_tokens_per_batch=1000,
+    )
+    assert len(batches) == 1
+    # Check that context was bounded / truncated with '...'
+    truncated_snippet = batches[0].candidates[0]["context_snippet"]
+    assert len(truncated_snippet) < len(huge_context)
+    assert truncated_snippet.endswith("...")
 
 
 def test_system_prompt_contains_contract():
@@ -72,7 +105,6 @@ def test_prepare_triage_batches_multiple_batches():
         }
         for i in range(50)
     ]
-    # Set a small max_items_per_batch or max_tokens_per_batch to force slicing into multiple batches
     batches = prepare_triage_batches(
         candidates,
         document_revision=3,

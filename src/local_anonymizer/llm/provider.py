@@ -1,5 +1,7 @@
 """LlmProvider abstraction and LocalApiProvider implementation (Phase 6A)."""
 
+from __future__ import annotations
+
 import abc
 import asyncio
 import ipaddress
@@ -109,9 +111,9 @@ class LocalApiProvider(LlmProvider):
         self.max_response_bytes: int = int(max_response_bytes)
 
         self._lock: asyncio.Lock = asyncio.Lock()
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: Optional[Any] = None
 
-    def _get_session(self) -> aiohttp.ClientSession:
+    def _get_session(self) -> Any:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(
                 total=self.total_timeout,
@@ -148,6 +150,7 @@ class LocalApiProvider(LlmProvider):
                 "model": self.model_name,
                 "messages": messages,
                 "temperature": 0.0,
+                "max_tokens": 2048,
                 "response_format": {"type": "json_object"},
             }
 
@@ -162,6 +165,12 @@ class LocalApiProvider(LlmProvider):
                 ) as resp:
                     if resp.status != 200:
                         raise ValueError(f"Lokaler LLM-Provider meldete HTTP Status {resp.status}")
+
+                    content_type = resp.headers.get("Content-Type", "").lower()
+                    if "application/json" not in content_type:
+                        raise ValueError(
+                            f"Unerwarteter Content-Type '{content_type}': Erwartet wurde 'application/json'."
+                        )
 
                     # Stream response to enforce max response size limit
                     chunks = []
@@ -178,13 +187,19 @@ class LocalApiProvider(LlmProvider):
 
             except asyncio.CancelledError:
                 logger.info("LLM-Anfrage wurde abgebrochen (Task Cancelled).")
+                if self._session is not None and not getattr(self._session, "closed", True):
+                    try:
+                        await self._session.close()
+                    except Exception:
+                        pass
+                    self._session = None
                 raise
             except asyncio.TimeoutError:
                 raise TimeoutError("Zeitüberschreitung bei der Kommunikation mit dem lokalen LLM.")
             except Exception as e:
                 # Sanitized error message without leaking prompt or document contents
                 msg = str(e)
-                if "Antwortgröße" in msg or "HTTP Status" in msg or "Schema version" in msg:
+                if "Antwortgröße" in msg or "HTTP Status" in msg or "Schema version" in msg or "Content-Type" in msg:
                     raise
                 logger.warning(f"Lokaler LLM-Aufruf fehlgeschlagen: {type(e).__name__}")
                 raise RuntimeError("Verbindung zum lokalen LLM-Dienst fehlgeschlagen oder unterbrochen.")

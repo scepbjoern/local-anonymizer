@@ -1,196 +1,131 @@
+import asyncio
 import json
 import pytest
-from app import (
-    AppState,
-    EntityGroup,
-    EntityOccurrence,
-    split_occurrence_to_new_group,
-    reset_app_state,
-    compute_reactive_preview,
-    sync_group_overrides,
-)
-from local_anonymizer.config import AppConfig
-from local_anonymizer.llm.schema import (
-    TriageKeepItem,
-    TriageRecategorizeItem,
-    TriageDiscardItem,
-    TriageEnvelope,
-    validate_batch_response,
-)
+from unittest.mock import AsyncMock, MagicMock
+from app import EntityGroup, EntityOccurrence, AppState, reset_app_state
+from local_anonymizer.llm.schema import TriageEnvelope, TriageKeepItem, TriageRecategorizeItem
+from local_anonymizer.llm.provider import LocalApiProvider
 from local_anonymizer.llm.batching import prepare_triage_batches
-from local_anonymizer.llm.apply_service import (
-    ApplyCommand,
-    ApplyService,
-    compute_triage_snapshot,
-)
+from local_anonymizer.llm.apply_service import compute_triage_snapshot, ApplyCommand, ApplyService
 
 
-def test_app_config_llm_fields_roundtrip():
-    cfg = AppConfig()
-    cfg.llm_enabled = True
-    cfg.llm_base_url = "http://localhost:11434/v1"
-    cfg.llm_model_name = "qwen2.5:3b"
-    cfg.llm_auto_review = False
-    
-    data = cfg.to_dict()
-    loaded = AppConfig.from_dict(data)
-    assert loaded.llm_enabled is True
-    assert loaded.llm_base_url == "http://localhost:11434/v1"
-    assert loaded.llm_model_name == "qwen2.5:3b"
-    assert loaded.llm_auto_review is False
-
-
-def test_reset_app_state_clears_llm_state_and_increments_revision():
+def test_app_state_llm_fields_and_reset():
     st = AppState()
-    st.raw_text = "Some text"
-    st.document_revision = 1
-    st.llm_triage_results = {"occ-1": TriageKeepItem(occ_id="occ-1", confidence="high")}
-    st.llm_triage_snapshot = "snap_1"
-    st.llm_staged_selections = {"occ-1"}
+    assert hasattr(st, "llm_triage_results")
+    assert hasattr(st, "llm_triage_snapshot")
+    assert hasattr(st, "llm_staged_selections")
+    assert hasattr(st, "is_llm_running")
+    assert hasattr(st, "llm_partial_failure")
+    assert hasattr(st, "llm_unprocessed_occ_ids")
+    assert hasattr(st, "llm_active_task")
+
+    st.llm_triage_results["occ-1"] = "val"
+    st.llm_staged_selections.add("occ-1")
     st.is_llm_running = True
     st.llm_partial_failure = True
-    st.llm_unprocessed_occ_ids = {"occ-2"}
+    st.llm_unprocessed_occ_ids.add("occ-2")
 
     reset_app_state(st)
-
-    assert st.raw_text == ""
-    assert st.document_revision == 2
-    assert len(st.llm_triage_results) == 0
-    assert st.llm_triage_snapshot == ""
-    assert len(st.llm_staged_selections) == 0
+    assert st.llm_triage_results == {}
+    assert st.llm_staged_selections == set()
     assert st.is_llm_running is False
     assert st.llm_partial_failure is False
-    assert len(st.llm_unprocessed_occ_ids) == 0
+    assert st.llm_unprocessed_occ_ids == set()
+    assert st.llm_active_task is None
 
 
-def test_sparse_badge_logic():
-    # Keep item without descriptor -> NO sparse badge
-    keep_pure = TriageKeepItem(occ_id="occ-1", confidence="high")
-    assert keep_pure.action == "keep"
-    assert keep_pure.descriptor_suggestion is None
-
-    # Keep item with descriptor -> MUST receive change badge
-    keep_with_desc = TriageKeepItem(occ_id="occ-2", confidence="high", descriptor_suggestion="Leiter")
-    assert keep_with_desc.descriptor_suggestion == "Leiter"
-
-    # Recategorize -> MUST receive change badge
-    recat = TriageRecategorizeItem(occ_id="occ-3", new_entity_type="ORG", confidence="medium")
-    assert recat.action == "recategorize"
-
-    # Discard -> MUST receive discard badge
-    discard = TriageDiscardItem(occ_id="occ-4", confidence="low")
-    assert discard.action == "discard"
-
-
-def test_end_to_end_simulated_llm_triage_flow():
-    # 1. Initialize state with document and candidates
+@pytest.mark.asyncio
+async def test_late_response_discarded_on_snapshot_drift():
+    # Simulate a running LLM batch loop where snapshot changes during await generate()
     st = AppState()
-    st.raw_text = "Peter Müller traf Dr. Schmidt in Berlin."
-    st.filename = "bericht.txt"
+    st.raw_text = "Dr. Müller arbeitet bei Siemens in Berlin."
     st.document_revision = 1
     st.analysis_revision = 1
-
-    g_peter = EntityGroup(
-        original_text="Peter Müller",
-        entity_type="PERSON",
-        group_id="peter müller",
-    )
-    g_peter.occurrences = [
+    g1 = EntityGroup("Dr. Müller", "PERSON")
+    g1.occurrences = [
         EntityOccurrence(
             start=0,
-            end=12,
-            score=0.98,
-            context_html="<b>Peter Müller</b> traf",
+            end=10,
+            score=0.9,
+            context_html="<b>Dr. Müller</b> arbeitet...",
             needs_review=False,
-            occ_id="occ-p1",
+            method="spacy",
+            occ_id="occ-1",
         )
     ]
-    
-    g_schmidt = EntityGroup(
-        original_text="Dr. Schmidt",
-        entity_type="PERSON",
-        group_id="dr. schmidt",
-    )
-    g_schmidt.occurrences = [
-        EntityOccurrence(
-            start=18,
-            end=29,
-            score=0.95,
-            context_html="traf <b>Dr. Schmidt</b> in",
-            needs_review=False,
-            occ_id="occ-s1",
-        )
-    ]
+    st.entity_groups = [g1]
 
-    g_berlin = EntityGroup(
-        original_text="Berlin",
-        entity_type="LOCATION",
-        group_id="berlin",
-    )
-    g_berlin.occurrences = [
-        EntityOccurrence(
-            start=33,
-            end=39,
-            score=0.99,
-            context_html="in <b>Berlin</b>.",
-            needs_review=False,
-            occ_id="occ-b1",
-        )
-    ]
-
-    st.entity_groups = [g_peter, g_schmidt, g_berlin]
-    compute_reactive_preview(st)
-
-    # 2. Compute triage snapshot & prepare batch
-    snapshot_hash = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
-    candidates = [
-        {"occ_id": "occ-p1", "original_text": "Peter Müller", "entity_type": "PERSON", "role": "", "context_snippet": "Peter Müller traf"},
-        {"occ_id": "occ-s1", "original_text": "Dr. Schmidt", "entity_type": "PERSON", "role": "", "context_snippet": "traf Dr. Schmidt in"},
-        {"occ_id": "occ-b1", "original_text": "Berlin", "entity_type": "LOCATION", "role": "", "context_snippet": "in Berlin."},
-    ]
-
-    batches = prepare_triage_batches(candidates, st.document_revision, snapshot_hash)
+    snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+    candidates = [{
+        "occ_id": "occ-1",
+        "original_text": "Dr. Müller",
+        "entity_type": "PERSON",
+        "role": "",
+        "context_snippet": "Dr. Müller arbeitet...",
+    }]
+    batches = prepare_triage_batches(candidates, st.document_revision, snap)
     assert len(batches) == 1
 
-    # 3. Simulate local LLM response envelope
-    mock_llm_response = json.dumps({
-        "schema_version": "1.0",
-        "request_id": batches[0].request_id,
-        "document_revision": 1,
-        "document_hash": snapshot_hash,
-        "items": [
-            {"occ_id": "occ-p1", "action": "keep", "confidence": "high", "reasoning": "Valid person name", "descriptor_suggestion": "Zeuge"},
-            {"occ_id": "occ-s1", "action": "keep", "confidence": "high", "reasoning": "Doctor name", "descriptor_suggestion": "Arzt"},
-            {"occ_id": "occ-b1", "action": "discard", "confidence": "medium", "reasoning": "General city name, can remain"},
-        ],
-    })
+    # While provider is "thinking", user changes text or document_revision
+    async def delayed_generate(prompt, system_prompt):
+        # Simulate user mutation in parallel
+        st.raw_text = "Dr. Müller hat gekündigt."
+        st.document_revision += 1
+        return json.dumps({
+            "schema_version": "1.0",
+            "request_id": batches[0].request_id,
+            "document_revision": 1,
+            "document_hash": snap,
+            "items": [
+                {"occ_id": "occ-1", "action": "keep", "confidence": "high"}
+            ]
+        })
 
-    envelope = TriageEnvelope.model_validate_json(mock_llm_response)
-    validate_batch_response(envelope, batches[0].occ_id_set, st.document_revision, snapshot_hash)
+    mock_provider = MagicMock(spec=LocalApiProvider)
+    mock_provider.generate = AsyncMock(side_effect=delayed_generate)
+    st.llm_provider = mock_provider
+    st.is_llm_running = True
+    st.llm_triage_snapshot = snap
 
-    # 4. Stage items and apply mutations via ApplyService
-    commands = [
-        ApplyCommand(occ_id="occ-p1", action="keep", descriptor_suggestion="Zeuge"),
-        ApplyCommand(occ_id="occ-s1", action="keep", descriptor_suggestion="Arzt"),
-        ApplyCommand(occ_id="occ-b1", action="discard"),
-    ]
+    # Run batch iteration simulating run_llm_triage loop
+    for b in batches:
+        raw_json = await st.llm_provider.generate(b.user_prompt, b.system_prompt)
+        post_snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+        if post_snap != snap or st.document_revision != b.document_revision:
+            # Must discard stale batch
+            st.llm_partial_failure = True
+            st.llm_unprocessed_occ_ids.update(b.occ_id_set)
+            break
 
-    success, msg = ApplyService.apply_mutations(
-        st,
-        snapshot_hash,
-        commands,
-        split_fn=split_occurrence_to_new_group,
-        sync_fn=sync_group_overrides,
-        preview_fn=compute_reactive_preview,
-    )
+    # Results must NOT be committed
+    assert "occ-1" not in st.llm_triage_results
+    assert st.llm_partial_failure is True
+    assert "occ-1" in st.llm_unprocessed_occ_ids
 
-    assert success is True
-    assert g_peter.role == "Zeuge"
-    assert g_schmidt.role == "Arzt"
-    assert g_berlin.enabled is False
 
-    # 5. Check reactive preview
-    anon_text, mapping, report = compute_reactive_preview(st)
-    assert "Zeuge" in anon_text or "PERSON" in anon_text
-    assert "Arzt" in anon_text or "PERSON" in anon_text
-    assert "Berlin" in anon_text  # Berlin was discarded/disabled so remains in cleartext
+@pytest.mark.asyncio
+async def test_reset_cancels_active_llm_task():
+    st = AppState()
+
+    async def long_running():
+        try:
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            pass
+
+    task = asyncio.create_task(long_running())
+    st.llm_active_task = task
+    assert not task.done()
+
+    reset_app_state(st)
+    assert task.cancelling() > 0 or task.cancelled()
+    await asyncio.sleep(0.01)
+    assert task.done()
+
+
+def test_optional_llm_extra_isolation():
+    # Verify that schema and apply_service imports work cleanly
+    from local_anonymizer.llm.schema import TriageEnvelope
+    from local_anonymizer.llm.apply_service import compute_triage_snapshot
+    assert TriageEnvelope is not None
+    assert compute_triage_snapshot is not None

@@ -1,8 +1,38 @@
-"""Canonical Apply-Service for LLM Triage verdicts (Phase 6A)."""
-
+import copy
 import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
+
+
+CANONICAL_ENTITY_TYPES: Set[str] = {
+    "PERSON",
+    "PER",
+    "ORGANIZATION",
+    "ORG",
+    "LOCATION",
+    "LOC",
+    "GPE",
+    "MISC",
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "IBAN_CODE",
+    "ID_NUMBER",
+    "CREDIT_CARD",
+    "BANK_ACCOUNT",
+    "IP_ADDRESS",
+    "USERNAME",
+    "URL",
+    "HEALTH_DATA",
+    "FINANCIAL_DATA",
+    "ADDRESS",
+    "AHV_NUMBER",
+    "UID_NUMBER",
+    "IT_SYSTEM",
+    "ROLE",
+    "DATE_TIME",
+    "DATE",
+    "TIME",
+}
 
 
 @dataclass
@@ -97,13 +127,21 @@ class ApplyService:
                 return False, f"Doppelter Befehl für Fundstelle {cmd.occ_id}.", []
             seen_occ_ids.add(cmd.occ_id)
 
+            if cmd.action == "recategorize":
+                if not cmd.new_entity_type or cmd.new_entity_type.upper() not in CANONICAL_ENTITY_TYPES:
+                    return (
+                        False,
+                        f"Ungültiger Entitätstyp '{cmd.new_entity_type}' für Fundstelle {cmd.occ_id} vorgeschlagen.",
+                        [],
+                    )
+
             grp, occ = cls._find_occurrence_and_group(state.entity_groups, cmd.occ_id)
             if grp is None or occ is None:
                 return False, f"Fundstelle mit ID '{cmd.occ_id}' wurde im aktuellen Zustand nicht gefunden.", []
 
             will_split = len(grp.occurrences) > 1
             old_type = grp.entity_type
-            new_type = cmd.new_entity_type if (cmd.action == "recategorize" and cmd.new_entity_type) else grp.entity_type
+            new_type = cmd.new_entity_type.upper() if (cmd.action == "recategorize" and cmd.new_entity_type) else grp.entity_type
             old_role = grp.role
             new_role = cmd.descriptor_suggestion if cmd.descriptor_suggestion is not None else grp.role
             old_enabled = grp.enabled
@@ -152,45 +190,70 @@ class ApplyService:
             except Exception:
                 pass
 
-        # Execute mutations
-        for cmd in commands:
-            grp, occ = cls._find_occurrence_and_group(state.entity_groups, cmd.occ_id)
-            if grp is None or occ is None:
-                return False, f"Fundstelle '{cmd.occ_id}' unerwartet nicht mehr auffindbar."
+        # Create deep transaction snapshot of state before mutations
+        saved_groups = copy.deepcopy(getattr(state, "entity_groups", []))
+        saved_overrides = copy.deepcopy(getattr(state, "occurrence_overrides", {}))
+        saved_mapping = copy.deepcopy(getattr(state, "current_mapping", {}))
+        saved_anon_text = getattr(state, "current_anon_text", "")
+        saved_report = getattr(state, "current_report", "")
+        saved_preview_rev = getattr(state, "preview_revision", 0)
+        saved_llm_results = copy.deepcopy(getattr(state, "llm_triage_results", {}))
+        saved_llm_snapshot = getattr(state, "llm_triage_snapshot", "")
+        saved_llm_staged = copy.deepcopy(getattr(state, "llm_staged_selections", set()))
 
-            # If occurrence is part of a multi-occurrence group, split it into an isolated group
-            if len(grp.occurrences) > 1 and split_fn is not None:
-                target_group = split_fn(state, grp, occ)
-            else:
-                target_group = grp
+        try:
+            # Execute mutations
+            for cmd in commands:
+                grp, occ = cls._find_occurrence_and_group(state.entity_groups, cmd.occ_id)
+                if grp is None or occ is None:
+                    raise RuntimeError(f"Fundstelle '{cmd.occ_id}' unerwartet nicht mehr auffindbar.")
 
-            # Apply changes based on action
-            if cmd.action == "discard":
-                target_group.enabled = False
-            elif cmd.action == "recategorize":
-                if cmd.new_entity_type:
-                    target_group.entity_type = cmd.new_entity_type
-                if cmd.descriptor_suggestion is not None:
-                    target_group.role = cmd.descriptor_suggestion
-                target_group.enabled = True
-            elif cmd.action == "keep":
-                if cmd.descriptor_suggestion is not None:
-                    target_group.role = cmd.descriptor_suggestion
-                target_group.enabled = True
+                # If occurrence is part of a multi-occurrence group, split it into an isolated group
+                if len(grp.occurrences) > 1 and split_fn is not None:
+                    target_group = split_fn(state, grp, occ)
+                else:
+                    target_group = grp
 
-            if sync_fn is not None:
-                sync_fn(state, target_group)
+                # Apply changes based on action
+                if cmd.action == "discard":
+                    target_group.enabled = False
+                elif cmd.action == "recategorize":
+                    if cmd.new_entity_type:
+                        target_group.entity_type = cmd.new_entity_type.upper()
+                    if cmd.descriptor_suggestion is not None:
+                        target_group.role = cmd.descriptor_suggestion
+                    target_group.enabled = True
+                elif cmd.action == "keep":
+                    if cmd.descriptor_suggestion is not None:
+                        target_group.role = cmd.descriptor_suggestion
+                    target_group.enabled = True
 
-        # Invalidate / clear LLM proposals in state since candidates were mutated
-        if hasattr(state, "llm_triage_results"):
-            state.llm_triage_results.clear()
-        if hasattr(state, "llm_triage_snapshot"):
-            state.llm_triage_snapshot = ""
-        if hasattr(state, "llm_staged_selections"):
-            state.llm_staged_selections.clear()
+                if sync_fn is not None:
+                    sync_fn(state, target_group)
 
-        # Recalculate preview
-        if preview_fn is not None:
-            preview_fn(state)
+            # Invalidate / clear LLM proposals in state since candidates were mutated
+            if hasattr(state, "llm_triage_results"):
+                state.llm_triage_results.clear()
+            if hasattr(state, "llm_triage_snapshot"):
+                state.llm_triage_snapshot = ""
+            if hasattr(state, "llm_staged_selections"):
+                state.llm_staged_selections.clear()
 
-        return True, f"{len(commands)} Änderungen erfolgreich übernommen."
+            # Recalculate preview
+            if preview_fn is not None:
+                preview_fn(state)
+
+            return True, f"{len(commands)} Änderungen erfolgreich übernommen."
+
+        except Exception as exc:
+            # Atomic rollback to exact initial state
+            state.entity_groups = saved_groups
+            state.occurrence_overrides = saved_overrides
+            state.current_mapping = saved_mapping
+            state.current_anon_text = saved_anon_text
+            state.current_report = saved_report
+            state.preview_revision = saved_preview_rev
+            state.llm_triage_results = saved_llm_results
+            state.llm_triage_snapshot = saved_llm_snapshot
+            state.llm_staged_selections = saved_llm_staged
+            return False, f"Transaktionsfehler beim Anwenden der Triage: {exc}"

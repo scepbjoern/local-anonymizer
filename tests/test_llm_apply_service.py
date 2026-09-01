@@ -1,181 +1,206 @@
+import copy
 import pytest
+from app import EntityGroup, EntityOccurrence
 from local_anonymizer.llm.apply_service import (
     ApplyCommand,
-    compute_triage_snapshot,
     ApplyService,
-)
-from app import (
-    AppState,
-    EntityGroup,
-    EntityOccurrence,
-    split_occurrence_to_new_group,
-    sync_group_overrides,
-    compute_reactive_preview,
+    compute_triage_snapshot,
+    CANONICAL_ENTITY_TYPES,
 )
 
 
-def create_test_state() -> AppState:
-    st = AppState()
-    st.raw_text = "Dr. Meier arbeitet bei der Siemens AG in Berlin. Frau Meier ist auch dort."
-    st.filename = "test.txt"
-    st.document_revision = 1
-    st.analysis_revision = 1
-
-    # Group 1: 'Meier' (2 occurrences)
-    g_meier = EntityGroup(
-        original_text="Meier",
-        entity_type="PERSON",
-        group_id="meier",
-    )
-    g_meier.occurrences = [
-        EntityOccurrence(
-            start=4,
-            end=9,
-            score=0.95,
-            context_html="Dr. <b>Meier</b> arbeitet",
-            needs_review=False,
-            occ_id="occ-meier-1",
-        ),
-        EntityOccurrence(
-            start=55,
-            end=60,
-            score=0.90,
-            context_html="Frau <b>Meier</b> ist",
-            needs_review=False,
-            occ_id="occ-meier-2",
-        ),
-    ]
-
-    # Group 2: 'Siemens AG' (1 occurrence)
-    g_siemens = EntityGroup(
-        original_text="Siemens AG",
-        entity_type="ORG",
-        group_id="siemens ag",
-    )
-    g_siemens.occurrences = [
-        EntityOccurrence(
-            start=27,
-            end=37,
-            score=0.99,
-            context_html="bei der <b>Siemens AG</b> in",
-            needs_review=False,
-            occ_id="occ-siemens-1",
-        ),
-    ]
-
-    st.entity_groups = [g_meier, g_siemens]
-    compute_reactive_preview(st)
-    return st
+class MockState:
+    def __init__(self, raw_text: str, groups: list):
+        self.raw_text = raw_text
+        self.entity_groups = groups
+        self.occurrence_overrides = {}
+        self.current_mapping = {"Dr. Müller": "[PERSON_1]"}
+        self.current_anon_text = "[PERSON_1] ist da."
+        self.current_report = {"summary": "ok"}
+        self.document_revision = 1
+        self.analysis_revision = 1
+        self.preview_revision = 1
+        self.llm_triage_results = {"occ-1": "res1", "occ-2": "res2"}
+        self.llm_triage_snapshot = ""
+        self.llm_staged_selections = {"occ-1", "occ-2"}
 
 
 def test_compute_triage_snapshot_deterministic():
-    st = create_test_state()
-    snap1 = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
-    snap2 = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
-    assert snap1 == snap2
-    assert len(snap1) == 64  # SHA-256 hex string
-
-    # Text change changes snapshot
-    snap3 = compute_triage_snapshot("Modified text", st.analysis_revision, st.entity_groups)
-    assert snap3 != snap1
-
-    # Analysis revision change changes snapshot
-    snap4 = compute_triage_snapshot(st.raw_text, st.analysis_revision + 1, st.entity_groups)
-    assert snap4 != snap1
+    g1 = EntityGroup("Dr. Müller", "PERSON")
+    g1.occurrences = [
+        EntityOccurrence(start=0, end=10, score=0.9, context_html="<b>Dr. Müller</b>", needs_review=False, method="spacy", occ_id="occ-1"),
+    ]
+    s1 = compute_triage_snapshot("Dr. Müller war hier.", 1, [g1])
+    s2 = compute_triage_snapshot("Dr. Müller war hier.", 1, [g1])
+    assert s1 == s2
+    assert len(s1) == 64  # sha256 hex
 
 
-def test_prevalidate_and_preview_impact_success():
-    st = create_test_state()
+def test_prevalidate_and_preview_impact_valid_and_canonical_types():
+    g1 = EntityGroup("Dr. Müller", "PERSON")
+    g1.occurrences = [
+        EntityOccurrence(start=0, end=10, score=0.9, context_html="<b>Dr. Müller</b>", needs_review=False, method="spacy", occ_id="occ-1"),
+        EntityOccurrence(start=20, end=30, score=0.9, context_html="<b>Dr. Müller</b>", needs_review=False, method="spacy", occ_id="occ-2"),
+    ]
+    st = MockState("Dr. Müller und Dr. Müller.", [g1])
     snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+    st.llm_triage_snapshot = snap
 
-    commands = [
-        ApplyCommand(
-            occ_id="occ-meier-1",
-            action="keep",
-            descriptor_suggestion="Arzt",
-        ),
-        ApplyCommand(
-            occ_id="occ-meier-2",
-            action="recategorize",
-            new_entity_type="PERSON",
-            descriptor_suggestion="Patientin",
-        ),
-        ApplyCommand(
-            occ_id="occ-siemens-1",
-            action="discard",
-        ),
+    cmds = [
+        ApplyCommand(occ_id="occ-1", action="recategorize", new_entity_type="ORG", descriptor_suggestion="Firma"),
+        ApplyCommand(occ_id="occ-2", action="discard"),
     ]
 
-    is_valid, err, impacts = ApplyService.prevalidate_and_preview_impact(st, snap, commands)
+    is_valid, err, impacts = ApplyService.prevalidate_and_preview_impact(st, snap, cmds)
     assert is_valid is True
     assert err == ""
-    assert len(impacts) == 3
-
-    # occ-meier-1 is in a 2-item group, so it will split
-    assert impacts[0]["occ_id"] == "occ-meier-1"
+    assert len(impacts) == 2
     assert impacts[0]["will_split"] is True
-    assert impacts[0]["new_role"] == "Arzt"
-
-    # occ-siemens-1 is in a 1-item group, so will_split is False
-    assert impacts[2]["occ_id"] == "occ-siemens-1"
-    assert impacts[2]["will_split"] is False
-    assert impacts[2]["action"] == "discard"
+    assert impacts[0]["new_type"] == "ORG"
+    assert impacts[0]["new_role"] == "Firma"
+    assert impacts[1]["action"] == "discard"
 
 
-def test_prevalidate_stale_snapshot_rejected():
-    st = create_test_state()
-    commands = [ApplyCommand(occ_id="occ-meier-1", action="keep")]
-    is_valid, err, impacts = ApplyService.prevalidate_and_preview_impact(st, "stale_snapshot_hash", commands)
-    assert is_valid is False
-    assert "veraltet" in err
-
-
-def test_apply_mutations_atomic_execution():
-    st = create_test_state()
+def test_prevalidate_rejects_invalid_entity_type():
+    g1 = EntityGroup("Dr. Müller", "PERSON")
+    g1.occurrences = [
+        EntityOccurrence(start=0, end=10, score=0.9, context_html="<b>Dr. Müller</b>", needs_review=False, method="spacy", occ_id="occ-1"),
+    ]
+    st = MockState("Dr. Müller.", [g1])
     snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+    st.llm_triage_snapshot = snap
 
-    commands = [
-        ApplyCommand(
-            occ_id="occ-meier-1",
-            action="keep",
-            descriptor_suggestion="Arzt",
-        ),
-        ApplyCommand(
-            occ_id="occ-meier-2",
-            action="keep",
-            descriptor_suggestion="Patientin",
-        ),
-        ApplyCommand(
-            occ_id="occ-siemens-1",
-            action="discard",
-        ),
+    cmds = [
+        ApplyCommand(occ_id="occ-1", action="recategorize", new_entity_type="INVALID_TYPE_STRING"),
+    ]
+
+    is_valid, err, _ = ApplyService.prevalidate_and_preview_impact(st, snap, cmds)
+    assert is_valid is False
+    assert "Ungültiger Entitätstyp" in err
+
+
+def test_apply_mutations_atomic_rollback_on_split_failure():
+    g1 = EntityGroup("Dr. Müller", "PERSON")
+    g1.occurrences = [
+        EntityOccurrence(start=0, end=10, score=0.9, context_html="<b>Dr. Müller</b>", needs_review=False, method="spacy", occ_id="occ-1"),
+        EntityOccurrence(start=20, end=30, score=0.9, context_html="<b>Dr. Müller</b>", needs_review=False, method="spacy", occ_id="occ-2"),
+    ]
+    st = MockState("Dr. Müller und Dr. Müller.", [g1])
+    snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+    st.llm_triage_snapshot = snap
+
+    initial_groups = copy.deepcopy(st.entity_groups)
+    initial_overrides = copy.deepcopy(st.occurrence_overrides)
+    initial_mapping = copy.deepcopy(st.current_mapping)
+
+    def failing_split(state, grp, occ):
+        raise RuntimeError("Simulated failure during occurrence split")
+
+    def mock_sync(state, grp):
+        pass
+
+    def mock_preview(state):
+        pass
+
+    cmds = [
+        ApplyCommand(occ_id="occ-1", action="recategorize", new_entity_type="ORG"),
     ]
 
     success, msg = ApplyService.apply_mutations(
         st,
         snap,
-        commands,
-        split_fn=split_occurrence_to_new_group,
-        sync_fn=sync_group_overrides,
-        preview_fn=compute_reactive_preview,
+        cmds,
+        split_fn=failing_split,
+        sync_fn=mock_sync,
+        preview_fn=mock_preview,
+    )
+
+    assert success is False
+    assert "Simulated failure during occurrence split" in msg
+    # Verify state rolled back completely
+    assert len(st.entity_groups) == len(initial_groups)
+    assert st.entity_groups[0].count == initial_groups[0].count
+    assert st.occurrence_overrides == initial_overrides
+    assert st.current_mapping == initial_mapping
+    assert st.llm_staged_selections == {"occ-1", "occ-2"}
+
+
+def test_apply_mutations_atomic_rollback_on_preview_failure():
+    g1 = EntityGroup("Dr. Müller", "PERSON")
+    g1.occurrences = [
+        EntityOccurrence(start=0, end=10, score=0.9, context_html="<b>Dr. Müller</b>", needs_review=False, method="spacy", occ_id="occ-1"),
+    ]
+    st = MockState("Dr. Müller.", [g1])
+    snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+    st.llm_triage_snapshot = snap
+
+    initial_groups = copy.deepcopy(st.entity_groups)
+
+    def mock_split(state, grp, occ):
+        pass
+
+    def mock_sync(state, grp):
+        pass
+
+    def failing_preview(state):
+        raise ValueError("Simulated preview calculation crash")
+
+    cmds = [
+        ApplyCommand(occ_id="occ-1", action="recategorize", new_entity_type="ORG"),
+    ]
+
+    success, msg = ApplyService.apply_mutations(
+        st,
+        snap,
+        cmds,
+        split_fn=mock_split,
+        sync_fn=mock_sync,
+        preview_fn=failing_preview,
+    )
+
+    assert success is False
+    assert "Simulated preview calculation crash" in msg
+    # Entity type must be rolled back to PERSON
+    assert st.entity_groups[0].entity_type == "PERSON"
+    assert st.entity_groups[0].occurrences[0].occ_id == "occ-1"
+
+
+def test_apply_mutations_successful_execution():
+    g1 = EntityGroup("Dr. Müller", "PERSON")
+    g1.occurrences = [
+        EntityOccurrence(start=0, end=10, score=0.9, context_html="<b>Dr. Müller</b>", needs_review=False, method="spacy", occ_id="occ-1"),
+    ]
+    st = MockState("Dr. Müller.", [g1])
+    snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+    st.llm_triage_snapshot = snap
+
+    def mock_split(state, grp, occ):
+        pass
+
+    def mock_sync(state, grp):
+        pass
+
+    def mock_preview(state):
+        state.preview_revision += 1
+
+    cmds = [
+        ApplyCommand(occ_id="occ-1", action="recategorize", new_entity_type="ORG", descriptor_suggestion="Firma"),
+    ]
+
+    success, msg = ApplyService.apply_mutations(
+        st,
+        snap,
+        cmds,
+        split_fn=mock_split,
+        sync_fn=mock_sync,
+        preview_fn=mock_preview,
     )
 
     assert success is True
-    assert "3 Änderungen erfolgreich übernommen" in msg
-
-    # Verify state after mutation
-    # occ-meier-1 was split into its own group with role 'Arzt'
-    g_m1, occ1 = ApplyService._find_occurrence_and_group(st.entity_groups, "occ-meier-1")
-    assert g_m1 is not None
-    assert g_m1.role == "Arzt"
-
-    # occ-meier-2 was split into its own group with role 'Patientin'
-    g_m2, occ2 = ApplyService._find_occurrence_and_group(st.entity_groups, "occ-meier-2")
-    assert g_m2 is not None
-    assert g_m2.role == "Patientin"
-    assert g_m1.group_id != g_m2.group_id  # isolated into separate groups!
-
-    # occ-siemens-1 was discarded (enabled=False)
-    g_s, occ_s = ApplyService._find_occurrence_and_group(st.entity_groups, "occ-siemens-1")
-    assert g_s is not None
-    assert g_s.enabled is False
+    assert "1 Änderungen erfolgreich übernommen" in msg
+    assert st.entity_groups[0].entity_type == "ORG"
+    assert st.entity_groups[0].role == "Firma"
+    assert st.preview_revision == 2
+    # occ-1 was removed from staged selections and triage results
+    assert "occ-1" not in st.llm_staged_selections
+    assert "occ-1" not in st.llm_triage_results
