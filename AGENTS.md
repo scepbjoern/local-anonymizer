@@ -60,8 +60,12 @@ pip install -e ".[gui]"
 
 ## 4. First-Run Behavior & Model Weights
 
-* **GLiNER Model Download (~150 MB):** On the very first run, the zero-shot PII model (`urchade/gliner_multi_pii-v1`) is automatically fetched from Hugging Face and cached locally under `~/.cache/huggingface/hub/`.
-* **Async Background Warmup:** The NiceGUI application launches immediately (<0.5s startup). The ML model initializes asynchronously in a background thread. The status badge in the UI transitions to *"Modell bereit"* once warmup completes.
+* **Dual-Model Ensemble Downloads:**
+  * **GLiNER (`urchade/gliner_multi_pii-v1`, ~150 MB):** Zero-shot model for organizations, roles, and open-vocabulary safety net.
+  * **EU-PII (`bardsai/eu-pii-anonimization-multilang`, ~1.1 GB):** Specialized token-classification model for European names, locations, IDs, and health data.
+* **Transparent Confirmation on First Download:** On the very first run, if required models are not yet cached locally under `~/.cache/huggingface/hub/`, the application presents an interactive confirmation dialog detailing the exact model names and download sizes before fetching any weights.
+* **100% Offline After Caching:** Once models are downloaded, all subsequent runs operate completely offline (`HF_HUB_OFFLINE=1`).
+* **Async Background Warmup:** The NiceGUI application launches immediately (<0.5s startup). Cached ML models initialize asynchronously in a background thread. The status badge in the UI transitions to *"Modell bereit"* once warmup completes.
 
 ---
 
@@ -71,7 +75,11 @@ Agents making code modifications must ensure all tests pass:
 ```bash
 uv run pytest -q
 ```
-* Expected outcome: 70 passed tests.
+* Expected outcome: 99 passed unit and regression tests (1 integration test deselected by default).
+* Run the live EU-PII integration test when modifying recognizer lifecycle:
+  ```bash
+  uv run pytest -m integration -q
+  ```
 * Note: A warning regarding `resume_download` from `huggingface_hub` is an upstream deprecation notice and not a test failure.
 
 ---
@@ -79,13 +87,16 @@ uv run pytest -q
 ## 6. Critical Architectural Rules & Pitfalls for Agents
 
 1. **Always use `--extra gui`:** Without `--extra gui`, running `app.py` will fail with missing NiceGUI dependencies.
-2. **In-Memory Guarantee & Temporary Uploads:**
-   * Text extraction and entity mappings operate in-memory.
-   * Large drag-and-drop uploads use a local streaming buffer (`~/.local-anonymizer/temp_uploads`), which is immediately unlinked (`try...finally`) after memory transfer and purged on exit via `atexit`. Do not alter this privacy contract.
+2. **In-Memory Guarantee & Temporary Files Privacy Contract:**
+   * Text extraction, NLP analysis, entity linking, and mapping tables operate in-memory.
+   * Large drag-and-drop uploads use a local streaming buffer (`~/.local-anonymizer/temp_uploads`), which is immediately unlinked (`try...finally`) after memory transfer.
+   * Multi-page PDF extraction writes a temporary file to `~/.local-anonymizer/temp_uploads` to dispatch page tasks across CPU cores via `ProcessPoolExecutor`. This temporary file is unlinked immediately in `finally` and protected against concurrent startup deletion by a 30-minute age cutoff.
+   * Stale temporary files older than 30 minutes are cleaned up on startup and shutdown (`atexit`). Do not alter this privacy and operational contract.
 3. **Session State Isolation:**
    * In `app.py`, `create_ui()` is decorated with `@ui.page('/')`.
    * Application state is encapsulated per-session in `state = AppState()`. Never store client-specific state in global module variables.
    * Shared ML models are protected by `_model_lock = threading.Lock()`.
+   * Multi-page PDF worker environment variables are serialized via `_pdf_env_lock = threading.Lock()`.
 4. **Safe Process Termination on Windows:**
    * Never execute a blanket `taskkill /im pythonw.exe` or `Stop-Process -Name pythonw` as it kills unrelated user processes. Always filter by process path / command line matching `*local-anonymizer*` and `*app.py*`.
 5. **Deterministic Single-Pass De-Anonymization:**

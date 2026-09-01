@@ -32,8 +32,8 @@ Die technische Umsetzung liegt direkt unter `src/local_anonymizer/` und in
 
 - [`extractors.py`](../src/local_anonymizer/extractors.py) – strukturierte
   Dokumenten-Extraktion;
-- [`recognizers.py`](../src/local_anonymizer/recognizers.py) – GLiNER-, Regex-
-  und Glossar-Erkennung;
+- [`recognizers.py`](../src/local_anonymizer/recognizers.py) – EU-PII-,
+  GLiNER-, Regex-, Bibliotheks- und Glossar-Erkennung;
 - [`anonymizer.py`](../src/local_anonymizer/anonymizer.py) – Platzhalter,
   Rollen, Linking und Wiederherstellung;
 - [`pipeline.py`](../src/local_anonymizer/pipeline.py) –

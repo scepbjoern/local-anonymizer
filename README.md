@@ -79,6 +79,7 @@ Eine schrittweise Anleitung für Studierende und andere Nutzerinnen und Nutzer
 steht im [Benutzerleitfaden](docs/guide/00-einstieg.md). Die folgenden Befehle sind
 die technische Kurzreferenz.
 
+
 Launch the application in native desktop mode:
 
 ```bash
@@ -93,7 +94,11 @@ On Windows, you can also double-click `start_windows.vbs` for a silent backgroun
 
 > [!NOTE]
 > **Data Privacy & In-Memory Processing:**
-> All entity analysis, secret mapping tables, and text transformations reside strictly in RAM. When using the native file picker (`tkinter`), files are read directly into memory. When using drag-and-drop in the GUI, large files are streamed to a temporary local upload directory (`~/.local-anonymizer/temp_uploads`, max 50 MB) and are immediately unlinked/deleted from disk as soon as they are loaded into RAM.
+> All entity analysis, secret mapping tables, and text transformations reside strictly in RAM. When using the native file picker (`tkinter`), files are read directly into memory. When using drag-and-drop in the GUI, large files are streamed to a temporary local upload directory (`~/.local-anonymizer/temp_uploads`, max 50 MB) and are immediately unlinked/deleted from disk as soon as they are loaded into RAM. For multi-page PDFs, a temporary extraction file is written to `temp_uploads` to dispatch page tasks across CPU cores via `ProcessPoolExecutor`, protected against concurrent startup deletion by a 30-minute age boundary and unlinked immediately in `finally` upon completion.
+
+> [!NOTE]
+> **First-Run Model Downloads & Offline-First Operation:**
+> On the very first run, if required local ML models (GLiNER ~150 MB, EU-PII ~1.1 GB) are not yet cached under `~/.cache/huggingface/hub/`, the application displays an interactive confirmation dialog with the exact model names and download sizes before fetching any files. Once cached, the application operates 100% offline (`HF_HUB_OFFLINE=1`).
 
 > [!WARNING]
 > **Hinweis für macOS-Nutzer:**
@@ -102,17 +107,6 @@ On Windows, you can also double-click `start_windows.vbs` for a silent backgroun
 > uv run --extra gui python app.py --browser
 > ```
 > Das Windows-Hilfsskript `start_windows.vbs` ist der getestete Referenzweg; auf macOS erfolgt der Start direkt über das Terminal oder ein Shell-Skript.
-
----
-
-### 3. Command Line Interface (CLI)
-
-The CLI provides two primary commands: `anonymize` and `restore`.
-
-#### Step 1: Anonymize a Document
-
-Scrub sensitive information from `.docx`, `.pdf`, `.csv`, `.json`, `.txt`, or `.md` files:
-
 
 ---
 
@@ -169,6 +163,8 @@ Run the full automated test suite (covers all recognizers, extractors, multi-enc
 ```bash
 uv run pytest
 ```
+* **99 passed** unit and regression tests (default execution).
+* Run the live EU-PII model integration test with `uv run pytest -m integration`.
 
 Weitere Dokumentation ist über den [Dokumentations-Wegweiser](docs/INDEX.md)
 erreichbar. Die Produkt- und Architekturdokumente beschreiben Anforderungen

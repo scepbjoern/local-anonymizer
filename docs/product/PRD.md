@@ -11,7 +11,7 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
 ## 2. Kernprinzipien & Design-Vorgaben
 
 1. **🛡️ 100% Lokal & Zero-Telemetry:** Weder Dokumenteninhalte, noch Metadaten oder Telemetrie verlassen das Gerät.
-2. **💾 RAM-zentrierte Verarbeitung & transparenter Streaming-Puffer:** Erkannte Entitäten, Mapping-Tabellen und Texttransformationen verbleiben ausschliesslich im RAM. Bei nativer Datei-Auswahl (`tkinter`) erfolgt das Einlesen direkt ohne temporäre Dateien. Beim Drag-and-Drop im GUI wird die Datei über einen lokalen HTTP-Streaming-Puffer (`~/.local-anonymizer/temp_uploads`, max. 50 MB) gestreamt und unmittelbar nach dem Einlesen in den RAM per `try...finally` sofort gelöscht sowie beim Beenden der Anwendung (`atexit`) automatisch bereinigt.
+2. **💾 RAM-zentrierte Verarbeitung & transparenter Puffer-Lebenszyklus:** Erkannte Entitäten, Mapping-Tabellen und Texttransformationen verbleiben ausschliesslich im RAM. Bei nativer Datei-Auswahl (`tkinter`) erfolgt das Einlesen direkt ohne temporäre Dateien. Beim Drag-and-Drop im GUI wird die Datei über einen lokalen HTTP-Streaming-Puffer (`~/.local-anonymizer/temp_uploads`, max. 50 MB) gestreamt und unmittelbar nach dem Einlesen in den RAM per `try...finally` sofort gelöscht. Bei mehrseitigen PDFs wird kurzzeitig eine temporäre Zwischendatei in `temp_uploads` angelegt, um Seiten-Tasks via `ProcessPoolExecutor` verlustfrei zu parallelisieren; diese ist durch eine 30-Minuten-Betriebsgrenze gegen konkurrierende Starts geschützt und wird im `finally`-Block sofort gelöscht. Veraltete Dateien werden beim Start und Beenden (`atexit`) automatisch bereinigt.
 3. **⚡ No-Admin / Geringer Footprint:** Installation ohne Administratorrechte (via `uv` oder `pip`), lauffähig auf Standard-Notebooks (CPU-only).
 4. **🔄 Deterministische Reversibilität:** Mathematisch exakte, kaskadenfreie Wiederherstellung (Single-Pass-Substitution).
 5. **🎯 High-Recall mit interaktiver Kontrolle:** Das Erkennungsmodell findet im Zweifel lieber zu viel als zu wenig; der Mensch behält im visuellen Review-Interface mühelos die Letztentscheidung.
@@ -158,6 +158,14 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 * Word-zu-Markdown Überschriften-Extraktion & Markdown-zu-Docx Export mit echten Formatvorlagen.
 * Persistente Konfiguration (`config.json`) & Silent-Mode Windows Launcher (`pythonw`).
 * macOS Launch-Skripte & manueller GitHub Actions Mac-Workflow.
+
+### ✅ Phase 4b: Dual-Modell-Ensemble (EU-PII + GLiNER), 4-Stufen-Quellenhierarchie & Robuste PDF-Multiprocessing-Verarbeitung (Abgeschlossen)
+* 99 automatisierte Regressionstests bestanden (100% Pass-Rate) + 1 EU-PII Live-Modell-Integrationstest.
+* **Dual-Modell Ensemble:** Integration des europäischen Token-Klassifikators `bardsai/eu-pii-anonimization-multilang` (Stufe 2) mit Subtoken-Span-Score-Aggregation und kanonischem Schutz deterministischer PII (Stufe 3) und Glossareinträgen (Stufe 4).
+* **4-Stufen Quellenhierarchie:** Klare Vorrangregelung (`Glossar > Deterministisch/Bibliotheken > EU-PII > GLiNER`) mit differenzierten Quell-Badges in der Review-Tabelle.
+* **Granulare Erkennungssteuerung:** Dreistufige Steuerung pro Kategorie (`Alle Quellen`, `Nur Glossar & manuell`, `Aus`) sowie `explicit_eupii`-Modus semantics.
+* **Transparente Modell-Downloads:** Interaktiver Bestätigungsdialog mit Modellnamen und Download-Größen vor dem Erstbezug von Hugging Face; thread-sichere Offline-Modus-Verwaltung (`HF_HUB_OFFLINE=1`).
+* **Robuste PDF-Multiprocessing-Extraktion:** Multi-Core `ProcessPoolExecutor` mit serialisierendem `_pdf_env_lock`, altersbasiertem Schutz gegen konkurrierende App-Starts (30-Minuten-Betriebsgrenze) und sicherem `finally`-Cleanup.
 
 ### 🔮 Phase 5a: Homonym-Zuordnung pro Fundstelle (Geplant nach CAS-Deliverable)
 * Granulare Disambiguierung identischer Textstellen innerhalb eines Dokuments direkt über Einzelauswahlen in den aufklappbaren Kontext-Akkordeons des Review-GUIs.
