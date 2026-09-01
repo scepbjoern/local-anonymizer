@@ -1,11 +1,21 @@
 """
 Unit and regression tests for Phase 5a: Homonym and Occurrence Disambiguation Handling.
-Tests occurrence identity, fail-safe reattachment, split/rollback, placeholder consistency,
-and single-pass restoration.
+Directly tests productive lifecycle functions:
+- rebind_overrides_after_analysis
+- reset_app_state
+- split_occurrence_to_new_group
+- revert_occurrence_to_base
+- group_tree_nodes_by_homonym
+- compute_smart_link_proposals
+- compute_reactive_preview
+- LocalAnonymizer.de_anonymize
 """
 
 import uuid
+from dataclasses import dataclass
+from typing import List, Optional
 import pytest
+
 from app import (
     AppState,
     EntityGroup,
@@ -16,8 +26,21 @@ from app import (
     split_occurrence_to_new_group,
     revert_occurrence_to_base,
     sync_group_overrides,
+    rebind_overrides_after_analysis,
+    reset_app_state,
+    group_tree_nodes_by_homonym,
 )
-from local_anonymizer.anonymizer import LocalAnonymizer, build_entity_tree
+from local_anonymizer.anonymizer import LocalAnonymizer, build_entity_tree, compute_smart_link_proposals
+
+
+@dataclass
+class MockRecognizerResult:
+    start: int
+    end: int
+    entity_type: str
+    score: float
+    analysis_explanation: Optional[str] = None
+    recognition_metadata: Optional[dict] = None
 
 
 def test_occurrence_fingerprint_deterministic():
@@ -29,7 +52,6 @@ def test_occurrence_fingerprint_deterministic():
     end1 = start1 + len("Müller")
     fp1 = compute_context_fingerprint(text1, start1, end1)
 
-    # Adding extra text far away (> 50 chars away from Müller) does not change the ±50 char window
     text2 = "Sehr langer Text am Anfang des Dokuments... " + text1
     start2 = text2.index("Müller")
     end2 = start2 + len("Müller")
@@ -38,35 +60,37 @@ def test_occurrence_fingerprint_deterministic():
     assert fp1 == fp2
 
 
-def test_split_creation_and_placeholder_consistency():
+def test_exact_occurrence_text_split_and_case_sensitive_restore():
     """
-    Test 1: Split a group of 2 occurrences of 'Müller' into two separate groups.
-    One is PERSON (Rolle: Chef), one is PERSON (Rolle: Praktikant).
-    Verify 2 distinct placeholders and clean mapping.
+    Auflage 1: Split and restore with exact occurrence text evidence.
+    Text contains 'Müller' and uppercase 'MÜLLER'.
+    Splitting 'MÜLLER' must keep 'MÜLLER' as original_text and expected_original_text.
+    De-anonymization must restore exact byte-for-byte casing.
     """
     st = AppState()
-    st.raw_text = "Frau Müller sprach mit Herrn Müller über das Projekt."
+    st.raw_text = "Frau Müller sprach mit Herrn MÜLLER über das Projekt."
     st.format_mode = "numbered_role"
 
     idx1 = st.raw_text.find("Müller")
-    idx2 = st.raw_text.find("Müller", idx1 + 1)
+    idx2 = st.raw_text.find("MÜLLER")
+
     occ1 = EntityOccurrence(
         start=idx1,
         end=idx1 + len("Müller"),
         score=0.95,
-        context_html="Frau <b>Müller</b> sprach",
+        context_html="",
         needs_review=False,
         occ_id="occ_1",
         context_fingerprint=compute_context_fingerprint(st.raw_text, idx1, idx1 + len("Müller")),
     )
     occ2 = EntityOccurrence(
         start=idx2,
-        end=idx2 + len("Müller"),
+        end=idx2 + len("MÜLLER"),
         score=0.92,
-        context_html="Herrn <b>Müller</b> über",
+        context_html="",
         needs_review=False,
         occ_id="occ_2",
-        context_fingerprint=compute_context_fingerprint(st.raw_text, idx2, idx2 + len("Müller")),
+        context_fingerprint=compute_context_fingerprint(st.raw_text, idx2, idx2 + len("MÜLLER")),
     )
 
     base_grp = EntityGroup(original_text="Müller", entity_type="PERSON", group_id="müller")
@@ -74,15 +98,15 @@ def test_split_creation_and_placeholder_consistency():
     base_grp.occurrences = [occ1, occ2]
     st.entity_groups = [base_grp]
 
-    # Split occurrence 2 into a new group
+    # Split occurrence 2 (MÜLLER)
     split_grp = split_occurrence_to_new_group(st, base_grp, occ2)
     split_grp.role = "Praktikant"
     sync_group_overrides(st, split_grp)
 
-    assert len(st.entity_groups) == 2
-    assert len(base_grp.occurrences) == 1
-    assert len(split_grp.occurrences) == 1
-    assert "occ_2" in st.occurrence_overrides
+    # Verify exact casing in split group and override
+    assert split_grp.original_text == "MÜLLER"
+    assert split_grp.text_key == "müller"
+    assert st.occurrence_overrides["occ_2"].expected_original_text == "MÜLLER"
     assert st.occurrence_overrides["occ_2"].role == "Praktikant"
 
     # Compute preview
@@ -91,215 +115,271 @@ def test_split_creation_and_placeholder_consistency():
     assert "[PERSON_1_CHEF]" in mapping
     assert "[PERSON_2_PRAKTIKANT]" in mapping
     assert mapping["[PERSON_1_CHEF]"] == "Müller"
-    assert mapping["[PERSON_2_PRAKTIKANT]"] == "Müller"
+    assert mapping["[PERSON_2_PRAKTIKANT]"] == "MÜLLER"
 
-    # Verify single-pass restoration
+    # Verify byte-exact de-anonymization
     restored = LocalAnonymizer.de_anonymize(anon_text, mapping)
     assert restored == st.raw_text
 
+    # Re-analysis must rebind MÜLLER because actual_orig == "MÜLLER" == expected_original_text
+    results = [
+        MockRecognizerResult(start=idx1, end=idx1 + len("Müller"), entity_type="PERSON", score=0.95),
+        MockRecognizerResult(start=idx2, end=idx2 + len("MÜLLER"), entity_type="PERSON", score=0.92),
+    ]
+    rebound_groups, rebound_overrides = rebind_overrides_after_analysis(st.raw_text, results, st.occurrence_overrides)
+    assert len(rebound_overrides) == 1
+    new_occ2_id = list(rebound_overrides.keys())[0]
+    assert rebound_overrides[new_occ2_id].expected_original_text == "MÜLLER"
+    rebound_split = next((g for g in rebound_groups if g.group_id == split_grp.group_id), None)
+    assert rebound_split is not None
+    assert rebound_split.original_text == "MÜLLER"
 
-def test_independent_overrides_for_identical_fingerprints_in_same_analysis():
+
+def test_smart_linking_with_duplicate_named_parents_exact_id():
     """
-    Test 2: Two occurrences with identical context fingerprints receive different overrides
-    in the same analysis session. Both must persist under their own occ_id.
+    Auflage 2: Smart linking suggestions convey exact group_id even if multiple parents
+    have identical names.
     """
-    st = AppState()
-    pad_pre = "P" * 60 + "Hallo "
-    pad_post = " wie geht es Ihnen heute?" + "S" * 60
-    # Create two occurrences with identical 50 char prefix and suffix
-    seg = pad_pre + "Müller" + pad_post
-    st.raw_text = seg + " --- EIN TRENNENDER TEXT ABSATZ --- " + seg
+    # Two distinct target parents with identical name 'Julia Meier' (e.g. from split or different entities)
+    p1 = EntityGroup(original_text="Julia Meier", entity_type="PERSON", group_id="p1_id")
+    p2 = EntityGroup(original_text="Julia Meier", entity_type="PERSON", group_id="p2_id")
+    child = EntityGroup(original_text="Frau Meier", entity_type="PERSON", group_id="child_id")
 
-    idx1 = st.raw_text.find("Müller")
-    idx2 = st.raw_text.find("Müller", idx1 + 1)
+    items = [p1, p2, child]
+    compute_smart_link_proposals(items)
 
-    occ1 = EntityOccurrence(
-        start=idx1,
-        end=idx1 + len("Müller"),
-        score=0.9,
-        context_html="",
-        needs_review=False,
-        occ_id="occ_a",
-        context_fingerprint=compute_context_fingerprint(st.raw_text, idx1, idx1 + len("Müller")),
-    )
-    occ2 = EntityOccurrence(
-        start=idx2,
-        end=idx2 + len("Müller"),
-        score=0.9,
-        context_html="",
-        needs_review=False,
-        occ_id="occ_b",
-        context_fingerprint=compute_context_fingerprint(st.raw_text, idx2, idx2 + len("Müller")),
-    )
+    # When multiple candidates match, candidate list must hold the exact candidate IDs
+    assert child.suggested_parent is None
+    assert set(child.suggested_candidates) == {"p1_id", "p2_id"}
 
-    # They have identical context fingerprints
-    assert occ1.context_fingerprint == occ2.context_fingerprint
-
-    base_grp = EntityGroup(original_text="Müller", entity_type="PERSON", group_id="müller")
-    base_grp.occurrences = [occ1, occ2]
-    st.entity_groups = [base_grp]
-
-    # Split occ1 and occ2 into separate groups
-    grp1 = split_occurrence_to_new_group(st, base_grp, occ1)
-    grp1.entity_type = "ORGANIZATION"
-    sync_group_overrides(st, grp1)
-
-    grp2 = split_occurrence_to_new_group(st, base_grp, occ2)
-    grp2.role = "Berater"
-    sync_group_overrides(st, grp2)
-
-    # Verify both overrides exist independently under occ_a and occ_b
-    assert "occ_a" in st.occurrence_overrides
-    assert "occ_b" in st.occurrence_overrides
-    assert st.occurrence_overrides["occ_a"].entity_type == "ORGANIZATION"
-    assert st.occurrence_overrides["occ_b"].role == "Berater"
+    # When exactly one parent exists:
+    single_items = [p1, child]
+    compute_smart_link_proposals(single_items)
+    assert child.suggested_parent == "p1_id"
+    assert child.suggested_parent_text == "Julia Meier"
 
 
-def test_successful_1_to_1_override_rebinding_and_group_recreation():
+def test_visual_homonym_clustering_independent_roots_and_sorting():
     """
-    Test 3: Re-analysis of the same text with 1:1 matching fingerprint and expected_original_text.
-    Verifies that the override is re-keyed to the new occ_id and the same target_group_id is recreated.
+    Auflage 3: Visual homonym clustering groups independent tree roots by text_key
+    without modifying parent_group_id.
     """
-    st = AppState()
-    raw_text = "Die Meier AG liefert Teile an Firma Schmidt."
-    start = raw_text.index("Meier AG")
-    end = start + len("Meier AG")
+    g1 = EntityGroup(original_text="Müller", entity_type="PERSON", group_id="müller_base")
+    g1.occurrences = [EntityOccurrence(start=10, end=16, score=0.9, context_html="", needs_review=False)]
+
+    g2 = EntityGroup(original_text="Schmidt", entity_type="PERSON", group_id="schmidt_base")
+    g2.occurrences = [
+        EntityOccurrence(start=0, end=7, score=0.9, context_html="", needs_review=False),
+        EntityOccurrence(start=100, end=107, score=0.9, context_html="", needs_review=False),
+    ]
+
+    g3 = EntityGroup(original_text="MÜLLER", entity_type="PERSON", group_id="split_muller_2")
+    g3.occurrences = [EntityOccurrence(start=50, end=56, score=0.9, context_html="", needs_review=False)]
+
+    # Unsorted list
+    tree = build_entity_tree([g1, g2, g3])
+    clusters = group_tree_nodes_by_homonym(tree)
+
+    # Must contain 2 clusters: "müller" (containing g1 and g3) and "schmidt" (containing g2)
+    assert len(clusters) == 2
+    m_cluster = next((c for c in clusters if c.text_key == "müller"), None)
+    s_cluster = next((c for c in clusters if c.text_key == "schmidt"), None)
+
+    assert m_cluster is not None
+    assert len(m_cluster.nodes) == 2
+    assert {n.item.group_id for n in m_cluster.nodes} == {"müller_base", "split_muller_2"}
+
+    assert s_cluster is not None
+    assert len(s_cluster.nodes) == 1
+
+    # Invariance: Semantic parent links must strictly remain None!
+    assert g1.parent_group_id is None
+    assert g3.parent_group_id is None
+
+
+def test_rebind_overrides_1_to_1_success():
+    """
+    Auflage 4: Productive rebind_overrides_after_analysis handles 1:1 match successfully.
+    """
+    raw_text = "Herr Weber besuchte Herrn Weber."
+    idx1 = raw_text.find("Weber")
+    idx2 = raw_text.find("Weber", idx1 + 1)
+    fp1 = compute_context_fingerprint(raw_text, idx1, idx1 + len("Weber"))
+    fp2 = compute_context_fingerprint(raw_text, idx2, idx2 + len("Weber"))
+
+    old_overrides = {
+        "old_occ_2": OccurrenceOverride(
+            target_group_id="split_weber_special",
+            context_fingerprint=fp2,
+            expected_original_text="Weber",
+            entity_type="PERSON",
+            role="Vorstand",
+            enabled=True,
+        )
+    }
+
+    results = [
+        MockRecognizerResult(start=idx1, end=idx1 + len("Weber"), entity_type="PERSON", score=0.9),
+        MockRecognizerResult(start=idx2, end=idx2 + len("Weber"), entity_type="PERSON", score=0.9),
+    ]
+
+    rebound_groups, new_overrides = rebind_overrides_after_analysis(raw_text, results, old_overrides)
+
+    assert len(new_overrides) == 1
+    new_occ_id = list(new_overrides.keys())[0]
+    assert new_occ_id != "old_occ_2"  # Re-keyed to new occ_id
+    assert new_overrides[new_occ_id].target_group_id == "split_weber_special"
+    assert new_overrides[new_occ_id].role == "Vorstand"
+
+    assert len(rebound_groups) == 2
+    split_g = next((g for g in rebound_groups if g.group_id == "split_weber_special"), None)
+    assert split_g is not None
+    assert split_g.role == "Vorstand"
+    assert len(split_g.occurrences) == 1
+
+
+def test_rebind_overrides_ambiguous_multiple_old_dropped():
+    """
+    Auflage 4: When multiple old overrides have the same fingerprint, all are fail-safe discarded.
+    """
+    raw_text = "Test Text"
+    fp = "same_fp"
+    old_overrides = {
+        "old_1": OccurrenceOverride(target_group_id="s1", context_fingerprint=fp, expected_original_text="Test"),
+        "old_2": OccurrenceOverride(target_group_id="s2", context_fingerprint=fp, expected_original_text="Test"),
+    }
+    results = [MockRecognizerResult(start=0, end=4, entity_type="PERSON", score=0.9)]
+
+    groups, new_overrides = rebind_overrides_after_analysis(raw_text, results, old_overrides)
+    assert len(new_overrides) == 0
+    assert len(groups) == 1
+    assert groups[0].group_id == "test"
+
+
+def test_rebind_overrides_ambiguous_multiple_new_dropped():
+    """
+    Auflage 4: When multiple new occurrences share the same fingerprint, overrides are fail-safe discarded.
+    """
+    pad_pre = "X" * 60 + " "
+    pad_post = " " + "Y" * 60
+    seg = pad_pre + "Kunde" + pad_post
+    raw_text = seg + " --- " + seg
+
+    idx1 = raw_text.find("Kunde")
+    idx2 = raw_text.find("Kunde", idx1 + 1)
+    fp = compute_context_fingerprint(raw_text, idx1, idx1 + len("Kunde"))
+
+    old_overrides = {
+        "old_1": OccurrenceOverride(target_group_id="s1", context_fingerprint=fp, expected_original_text="Kunde", role="VIP")
+    }
+
+    results = [
+        MockRecognizerResult(start=idx1, end=idx1 + len("Kunde"), entity_type="PERSON", score=0.9),
+        MockRecognizerResult(start=idx2, end=idx2 + len("Kunde"), entity_type="PERSON", score=0.9),
+    ]
+
+    groups, new_overrides = rebind_overrides_after_analysis(raw_text, results, old_overrides)
+    assert len(new_overrides) == 0
+    assert len(groups) == 1  # Kept in single base group
+
+
+def test_rebind_overrides_text_mismatch_dropped():
+    """
+    Auflage 4: If context fingerprint matches but raw text changed, override is fail-safe discarded.
+    """
+    raw_text = "Firma Schmidt liefert."
+    fp = compute_context_fingerprint(raw_text, 6, 13)
+
+    old_overrides = {
+        "old_1": OccurrenceOverride(target_group_id="s1", context_fingerprint=fp, expected_original_text="Meier", role="Chef")
+    }
+
+    results = [MockRecognizerResult(start=6, end=13, entity_type="ORGANIZATION", score=0.9)]
+
+    groups, new_overrides = rebind_overrides_after_analysis(raw_text, results, old_overrides)
+    assert len(new_overrides) == 0
+
+
+def test_rebind_overrides_optional_fallback():
+    """
+    Auflage 4: Rebinding with None values for entity_type/role/enabled retains base recognizer values.
+    """
+    raw_text = "Kontakt mit Dr. Frank."
+    start = raw_text.find("Dr. Frank")
+    end = start + len("Dr. Frank")
     fp = compute_context_fingerprint(raw_text, start, end)
 
-    # Initial override
-    st.occurrence_overrides["old_occ_id"] = OccurrenceOverride(
-        target_group_id="split_custom_1",
-        context_fingerprint=fp,
-        expected_original_text="Meier AG",
-        entity_type="ORGANIZATION",
-        role="Zulieferer",
-        enabled=True,
-    )
+    old_overrides = {
+        "old_1": OccurrenceOverride(
+            target_group_id="split_frank",
+            context_fingerprint=fp,
+            expected_original_text="Dr. Frank",
+            entity_type=None,
+            role=None,
+            enabled=None,
+        )
+    }
 
-    # Simulate re-analysis results
-    new_occ = EntityOccurrence(
-        start=start,
-        end=end,
-        score=0.98,
-        context_html="",
-        needs_review=False,
-        occ_id="new_occ_id",
-        context_fingerprint=fp,
-    )
-    base_grp = EntityGroup(original_text="Meier AG", entity_type="PERSON", group_id="meier ag")
-    base_grp.occurrences = [new_occ]
+    results = [MockRecognizerResult(start=start, end=end, entity_type="PERSON", score=0.9)]
 
-    # Run re-attachment logic (simulating run_analysis step 3)
-    old_overrides = list(st.occurrence_overrides.values())
-    new_overrides = {}
-    old_by_fp = {}
-    for ov in old_overrides:
-        old_by_fp.setdefault(ov.context_fingerprint, []).append(ov)
-
-    all_new_occurrences = [(new_occ, "Meier AG", "PERSON")]
-    new_by_fp = {}
-    for occ, norm, ent_type in all_new_occurrences:
-        new_by_fp.setdefault(occ.context_fingerprint, []).append((occ, norm, ent_type))
-
-    split_groups_dict = {}
-    for f_print, ov_list in old_by_fp.items():
-        cand_list = new_by_fp.get(f_print, [])
-        if len(ov_list) == 1 and len(cand_list) == 1:
-            ov = ov_list[0]
-            cand_occ, actual_norm, actual_type = cand_list[0]
-            if actual_norm == ov.expected_original_text:
-                new_overrides[cand_occ.occ_id] = OccurrenceOverride(
-                    target_group_id=ov.target_group_id,
-                    context_fingerprint=f_print,
-                    expected_original_text=ov.expected_original_text,
-                    entity_type=ov.entity_type,
-                    role=ov.role,
-                    enabled=ov.enabled,
-                )
-                tgt_id = ov.target_group_id
-                if tgt_id not in split_groups_dict:
-                    restored_type = ov.entity_type if ov.entity_type is not None else actual_type
-                    restored_grp = EntityGroup(
-                        original_text=ov.expected_original_text,
-                        entity_type=restored_type,
-                        group_id=tgt_id,
-                    )
-                    if ov.role is not None:
-                        restored_grp.role = ov.role
-                    if ov.enabled is not None:
-                        restored_grp.enabled = ov.enabled
-                    split_groups_dict[tgt_id] = restored_grp
-
-    assert "new_occ_id" in new_overrides
-    assert "old_occ_id" not in new_overrides
-    assert "split_custom_1" in split_groups_dict
-    assert split_groups_dict["split_custom_1"].role == "Zulieferer"
-    assert split_groups_dict["split_custom_1"].entity_type == "ORGANIZATION"
+    groups, new_overrides = rebind_overrides_after_analysis(raw_text, results, old_overrides)
+    assert len(new_overrides) == 1
+    assert len(groups) == 1
+    assert groups[0].group_id == "split_frank"
+    assert groups[0].entity_type == "PERSON"
+    assert groups[0].role == ""
+    assert groups[0].enabled is True
 
 
-def test_ambiguous_rebinding_discarded_failsafe():
+def test_reset_app_state_and_unified_loading():
     """
-    Test 4: If multiple occurrences have the same fingerprint after re-analysis,
-    all overrides for this fingerprint must be fail-safe discarded.
+    Auflage 4: Productive reset_app_state completely empties all document-specific state.
     """
     st = AppState()
-    fp = "identical_repeated_hash"
+    st.filename = "test.docx"
+    st.raw_text = "Inhalt"
+    st.entity_groups = [EntityGroup(original_text="A", entity_type="PERSON")]
+    st.occurrence_overrides = {"occ_1": OccurrenceOverride("s1", "fp", "A")}
+    st.current_mapping = {"[PERSON_1]": "A"}
+    st.current_anon_text = "[PERSON_1]"
 
-    # 1 old override
-    st.occurrence_overrides["old_id"] = OccurrenceOverride(
-        target_group_id="split_1",
-        context_fingerprint=fp,
-        expected_original_text="Meyer",
-        entity_type="ORGANIZATION",
-    )
+    reset_app_state(st)
 
-    # 2 new occurrences with the same fingerprint
-    new_occ1 = EntityOccurrence(start=0, end=5, score=0.9, context_html="", needs_review=False, occ_id="new_1", context_fingerprint=fp)
-    new_occ2 = EntityOccurrence(start=20, end=25, score=0.9, context_html="", needs_review=False, occ_id="new_2", context_fingerprint=fp)
-
-    old_overrides = list(st.occurrence_overrides.values())
-    new_overrides = {}
-    old_by_fp = {fp: old_overrides}
-    new_by_fp = {fp: [(new_occ1, "Meyer", "PERSON"), (new_occ2, "Meyer", "PERSON")]}
-
-    split_groups_dict = {}
-    for f_print, ov_list in old_by_fp.items():
-        cand_list = new_by_fp.get(f_print, [])
-        if len(ov_list) == 1 and len(cand_list) == 1:
-            pass  # Will NOT be entered because len(cand_list) == 2
-
-    # Verify no override was attached
-    assert len(new_overrides) == 0
-    assert len(split_groups_dict) == 0
+    assert st.filename == ""
+    assert st.raw_text == ""
+    assert st.entity_groups == []
+    assert st.occurrence_overrides == {}
+    assert st.current_mapping == {}
+    assert st.current_anon_text == ""
 
 
-def test_text_change_failsafe_discard():
+def test_category_modes_with_split_groups():
     """
-    Test 5: If the fingerprint matches but the actual original text changed,
-    the override is discarded fail-safely.
+    Auflage 4: Category modes correctly control preview inclusion of split groups.
     """
-    fp = "some_hash"
-    ov = OccurrenceOverride(
-        target_group_id="split_1",
-        context_fingerprint=fp,
-        expected_original_text="Meyer",
-        entity_type="ORGANIZATION",
-    )
-    # Candidate text is "Mayer" instead of "Meyer"
-    cand_occ = EntityOccurrence(start=0, end=5, score=0.9, context_html="", needs_review=False, occ_id="new_1", context_fingerprint=fp)
-    cand_list = [(cand_occ, "Mayer", "PERSON")]
+    st = AppState()
+    st.raw_text = "Firma A traf Person B."
+    g_org = EntityGroup(original_text="Firma A", entity_type="ORGANIZATION", group_id="split_org_1")
+    g_org.occurrences = [EntityOccurrence(start=0, end=7, score=0.9, context_html="", needs_review=False)]
 
-    new_overrides = {}
-    if len([ov]) == 1 and len(cand_list) == 1:
-        if cand_list[0][1] == ov.expected_original_text:
-            new_overrides["new_1"] = ov
+    g_per = EntityGroup(original_text="Person B", entity_type="PERSON", group_id="person_b")
+    g_per.occurrences = [EntityOccurrence(start=13, end=21, score=0.9, context_html="", needs_review=False)]
 
-    assert len(new_overrides) == 0
+    st.entity_groups = [g_org, g_per]
+
+    # Disable ORGANIZATION
+    g_org.enabled = False
+    g_per.enabled = True
+
+    anon_text, mapping, report = compute_reactive_preview(st)
+    assert "[PERSON_1]" in mapping
+    assert "[ORGANIZATION" not in anon_text
+    assert "Firma A" in anon_text
 
 
 def test_revert_occurrence_to_base():
     """
-    Test 6: Reverting a split occurrence returns it to the base group and removes the override.
+    Reverting a split occurrence returns it to the base group and removes the override.
     """
     st = AppState()
     base_grp = EntityGroup(original_text="Schmidt", entity_type="PERSON", group_id="schmidt")
@@ -312,7 +392,6 @@ def test_revert_occurrence_to_base():
     assert len(st.entity_groups) == 2
     assert "occ_2" in st.occurrence_overrides
 
-    # Revert occ2 back to base
     revert_occurrence_to_base(st, split_grp, occ2)
 
     assert "occ_2" not in st.occurrence_overrides
@@ -321,40 +400,17 @@ def test_revert_occurrence_to_base():
     assert len(st.entity_groups[0].occurrences) == 2
 
 
-def test_workspace_reset_clears_overrides():
-    """
-    Test 7: Workspace reset completely clears entity groups and occurrence overrides.
-    """
-    st = AppState()
-    st.occurrence_overrides["some_occ"] = OccurrenceOverride(
-        target_group_id="split_1",
-        context_fingerprint="fp",
-        expected_original_text="Test",
-    )
-    assert len(st.occurrence_overrides) == 1
-
-    # Simulate reset
-    st.entity_groups = []
-    st.occurrence_overrides = {}
-    st.current_mapping = {}
-
-    assert len(st.occurrence_overrides) == 0
-    assert len(st.entity_groups) == 0
-
-
 def test_placeholder_modes_with_homonyms_and_collision():
     """
-    Test 8: Verify all 3 placeholder modes with homonym groups, including collision fallback in Mode 3 (role_only).
+    Verify all 3 placeholder modes with homonym groups, including collision fallback in Mode 3 (role_only).
     """
     st = AppState()
     st.raw_text = "A und B trafen C."
 
-    # Group 1: Müller (PERSON, role=Chef)
     g1 = EntityGroup(original_text="Müller", entity_type="PERSON", group_id="müller_1")
     g1.role = "Chef"
     g1.occurrences = [EntityOccurrence(start=0, end=1, score=0.9, context_html="", needs_review=False)]
 
-    # Group 2: Müller (PERSON, role=Chef) -> Colliding role!
     g2 = EntityGroup(original_text="Müller", entity_type="PERSON", group_id="müller_2")
     g2.role = "Chef"
     g2.occurrences = [EntityOccurrence(start=6, end=7, score=0.9, context_html="", needs_review=False)]
@@ -373,38 +429,8 @@ def test_placeholder_modes_with_homonyms_and_collision():
     assert "[PERSON_1_CHEF]" in map2
     assert "[PERSON_2_CHEF]" in map2
 
-    # Mode 3: Role Only -> Must fall back to numbered_role due to collision!
+    # Mode 3: Role Only -> Colliding role falls back to numbered_role
     st.format_mode = "role_only"
     _, map3, _ = compute_reactive_preview(st)
     assert "[PERSON_1_CHEF]" in map3
     assert "[PERSON_2_CHEF]" in map3
-
-
-def test_visual_homonym_clustering_without_parent_link():
-    """
-    Test 9: Two homonym groups are separate tree roots (no parent_group_id set).
-    """
-    g1 = EntityGroup(original_text="Meier", entity_type="PERSON", group_id="meier")
-    g2 = EntityGroup(original_text="Meier", entity_type="ORGANIZATION", group_id="split_123")
-
-    tree = build_entity_tree([g1, g2])
-    assert len(tree) == 2
-    assert tree[0].item.group_id == "meier"
-    assert tree[1].item.group_id == "split_123"
-    assert g2.parent_group_id is None
-
-
-def test_smart_linking_with_homonyms():
-    """
-    Test 10: Smart linking can link a child to a specific parent using parent_group_id.
-    """
-    parent = EntityGroup(original_text="Dr. Meier", entity_type="PERSON", group_id="dr_meier")
-    child = EntityGroup(original_text="Meier", entity_type="PERSON", group_id="meier")
-    child.parent_group_id = parent.group_id
-    child.surface_tag = "NACHNAME"
-
-    tree = build_entity_tree([parent, child])
-    assert len(tree) == 1
-    assert tree[0].item.group_id == "dr_meier"
-    assert len(tree[0].children) == 1
-    assert tree[0].children[0].item.group_id == "meier"

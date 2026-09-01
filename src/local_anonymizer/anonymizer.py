@@ -165,10 +165,12 @@ def compute_smart_link_proposals(
     get_text: Optional[Callable[[Any], str]] = None,
     get_entity_type: Optional[Callable[[Any], str]] = None,
     get_parent: Optional[Callable[[Any], Optional[str]]] = None,
+    get_id: Optional[Callable[[Any], str]] = None,
 ) -> None:
     """
     Compute smart linking suggestions as interactive proposals (NO auto-commit!).
-    Sets attributes .suggested_parent, .suggested_tag, and .suggested_candidates on each item in O(n) time.
+    Sets attributes .suggested_parent (group_id), .suggested_parent_text, .suggested_tag,
+    and .suggested_candidates (list of group_ids) on each item in O(n) time.
     """
     if get_text is None:
         get_text = lambda x: getattr(x, "original_text", str(x))
@@ -176,27 +178,32 @@ def compute_smart_link_proposals(
         get_entity_type = lambda x: getattr(x, "entity_type", "")
     if get_parent is None:
         get_parent = lambda x: getattr(x, "parent_group_id", getattr(x, "parent_group_text", None))
+    if get_id is None:
+        get_id = lambda x: str(getattr(x, "group_id", getattr(x, "original_text", str(x))))
 
     # Pre-index potential parent person entities for fast O(1) candidate lookup
-    by_first_name: Dict[str, List[str]] = {}
-    by_last_name: Dict[str, List[str]] = {}
-    by_word: Dict[str, List[str]] = {}
+    by_first_name: Dict[str, List[Tuple[str, str]]] = {}
+    by_last_name: Dict[str, List[Tuple[str, str]]] = {}
+    by_word: Dict[str, List[Tuple[str, str]]] = {}
 
     for other in items:
         if get_entity_type(other) == "PERSON" and not get_parent(other):
+            other_id = get_id(other)
             other_text = get_text(other).strip()
             other_words = other_text.split()
             for w in other_words:
-                by_word.setdefault(w.lower(), []).append(other_text)
+                by_word.setdefault(w.lower(), []).append((other_id, other_text))
             if len(other_words) > 1:
                 first = other_words[0].lower().rstrip(".")
                 last = other_words[-1].lower()
-                by_first_name.setdefault(first, []).append(other_text)
+                by_first_name.setdefault(first, []).append((other_id, other_text))
                 if first not in HONORIFICS:
-                    by_last_name.setdefault(last, []).append(other_text)
+                    by_last_name.setdefault(last, []).append((other_id, other_text))
 
     for g in items:
         g.suggested_parent = None
+        if hasattr(g, "suggested_parent_text"):
+            g.suggested_parent_text = None
         g.suggested_tag = None
         g.suggested_candidates = []
 
@@ -206,45 +213,47 @@ def compute_smart_link_proposals(
         if get_entity_type(g) != "PERSON":
             continue
 
+        g_id = get_id(g)
         orig_text = get_text(g).strip()
         orig_lower = orig_text.lower()
         words = orig_text.split()
-        potential_candidates: List[Tuple[str, str]] = []
+        potential_candidates: List[Tuple[str, str, str]] = []  # (cand_id, cand_text, tag)
 
         # 1. Single word: Check genitive stem or first/last name
         if len(words) == 1:
             stem = re.sub(r"(s|'s|’s)$", "", orig_text, flags=re.IGNORECASE).strip()
             if stem and stem.lower() != orig_lower:
-                for c_name in by_word.get(stem.lower(), []):
-                    if c_name.lower() != orig_lower:
-                        potential_candidates.append((c_name, "GENITIV"))
+                for c_id, c_name in by_word.get(stem.lower(), []):
+                    if c_id != g_id and c_name.lower() != orig_lower:
+                        potential_candidates.append((c_id, c_name, "GENITIV"))
 
-            for c_name in by_first_name.get(orig_lower, []):
-                if c_name.lower() != orig_lower:
-                    potential_candidates.append((c_name, "VORNAME"))
+            for c_id, c_name in by_first_name.get(orig_lower, []):
+                if c_id != g_id and c_name.lower() != orig_lower:
+                    potential_candidates.append((c_id, c_name, "VORNAME"))
 
-            for c_name in by_last_name.get(orig_lower, []):
-                if c_name.lower() != orig_lower:
-                    potential_candidates.append((c_name, "NACHNAME"))
+            for c_id, c_name in by_last_name.get(orig_lower, []):
+                if c_id != g_id and c_name.lower() != orig_lower:
+                    potential_candidates.append((c_id, c_name, "NACHNAME"))
 
         # 2. Multi-word: Check German/English honorifics (e.g. "Frau Meier", "Mr. Smith")
         elif len(words) >= 2 and words[0].lower().rstrip(".") in HONORIFICS:
             last_name = words[-1].lower()
-            for c_name in by_last_name.get(last_name, []):
-                if c_name.lower() != orig_lower:
-                    potential_candidates.append((c_name, "ANREDE"))
+            for c_id, c_name in by_last_name.get(last_name, []):
+                if c_id != g_id and c_name.lower() != orig_lower:
+                    potential_candidates.append((c_id, c_name, "ANREDE"))
 
-        unique_cand_dict: Dict[str, str] = {}
-        for cand_name, tag in potential_candidates:
-            unique_cand_dict.setdefault(cand_name, tag)
+        unique_cand_dict: Dict[str, Tuple[str, str]] = {}  # cand_id -> (cand_text, tag)
+        for cand_id, cand_name, tag in potential_candidates:
+            unique_cand_dict.setdefault(cand_id, (cand_name, tag))
 
         if len(unique_cand_dict) == 1:
-            cand_name, tag = list(unique_cand_dict.items())[0]
-            g.suggested_parent = cand_name
+            cand_id, (cand_name, tag) = list(unique_cand_dict.items())[0]
+            g.suggested_parent = cand_id
+            g.suggested_parent_text = cand_name
             g.suggested_tag = tag
         elif len(unique_cand_dict) > 1:
             g.suggested_candidates = list(unique_cand_dict.keys())
-            g.suggested_tag = list(unique_cand_dict.values())[0]
+            g.suggested_tag = list(unique_cand_dict.values())[0][1]
 
 
 @dataclass
