@@ -110,7 +110,18 @@ async def api_upload(file: UploadFile = File(...)):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+import hashlib
+
 # --- Data Models for Grouped Review ---
+def compute_context_fingerprint(text: str, start: int, end: int, window: int = 50) -> str:
+    """Compute deterministic context fingerprint for reattachment across re-analyses."""
+    pre = text[max(0, start - window):start]
+    term = text[start:end]
+    post = text[end:min(len(text), end + window)]
+    raw = f"{pre}|{term}|{post}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class EntityOccurrence:
     start: int
@@ -121,15 +132,28 @@ class EntityOccurrence:
     source: str = "automatic"
     method: str = "ai"
     method_detail: Optional[str] = None
+    occ_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    context_fingerprint: str = ""
+
+
+@dataclass
+class OccurrenceOverride:
+    target_group_id: str
+    context_fingerprint: str
+    expected_original_text: str
+    entity_type: Optional[str] = None
+    role: Optional[str] = None
+    enabled: Optional[bool] = None
 
 
 class EntityGroup:
-    def __init__(self, original_text: str, entity_type: str):
+    def __init__(self, original_text: str, entity_type: str, group_id: Optional[str] = None):
         self.original_text: str = original_text
         self.entity_type: str = entity_type
+        self.group_id: str = group_id if group_id is not None else original_text.strip().lower()
         self.enabled: bool = True
         self.role: str = ""
-        self.parent_group_text: Optional[str] = None
+        self.parent_group_id: Optional[str] = None
         self.surface_tag: str = ""
         self.placeholder: str = ""
         self.suggested_parent: Optional[str] = None
@@ -138,8 +162,20 @@ class EntityGroup:
         self.occurrences: List[EntityOccurrence] = []
 
     @property
-    def key(self) -> str:
+    def text_key(self) -> str:
         return self.original_text.strip().lower()
+
+    @property
+    def key(self) -> str:
+        return self.group_id
+
+    @property
+    def parent_group_text(self) -> Optional[str]:
+        return self.parent_group_id
+
+    @parent_group_text.setter
+    def parent_group_text(self, value: Optional[str]) -> None:
+        self.parent_group_id = value
 
     @property
     def count(self) -> int:
@@ -169,6 +205,72 @@ class EntityGroup:
         return self.occurrences[0].start if self.occurrences else 0
 
 
+def split_occurrence_to_new_group(st: "AppState", grp: EntityGroup, occ: EntityOccurrence) -> EntityGroup:
+    """Split a single occurrence into its own separate EntityGroup with an active override."""
+    target_group_id = f"split_{uuid.uuid4().hex[:8]}"
+    override = OccurrenceOverride(
+        target_group_id=target_group_id,
+        context_fingerprint=occ.context_fingerprint,
+        expected_original_text=grp.original_text,
+        entity_type=grp.entity_type,
+        role=grp.role,
+        enabled=grp.enabled,
+    )
+    st.occurrence_overrides[occ.occ_id] = override
+    if occ in grp.occurrences:
+        grp.occurrences.remove(occ)
+    new_grp = EntityGroup(
+        original_text=grp.original_text,
+        entity_type=grp.entity_type,
+        group_id=target_group_id,
+    )
+    new_grp.role = grp.role
+    new_grp.enabled = grp.enabled
+    new_grp.occurrences.append(occ)
+    st.entity_groups.append(new_grp)
+    return new_grp
+
+
+def revert_occurrence_to_base(st: "AppState", grp: EntityGroup, occ: EntityOccurrence) -> None:
+    """Revert a split occurrence back to its canonical base group."""
+    st.occurrence_overrides.pop(occ.occ_id, None)
+    base_key = grp.text_key
+    base_grp = next((g for g in st.entity_groups if g.group_id == base_key), None)
+    if not base_grp:
+        base_grp = EntityGroup(
+            original_text=grp.original_text,
+            entity_type=grp.entity_type,
+            group_id=base_key,
+        )
+        base_grp.role = grp.role
+        base_grp.enabled = grp.enabled
+        st.entity_groups.append(base_grp)
+
+    if occ in grp.occurrences:
+        grp.occurrences.remove(occ)
+    if occ not in base_grp.occurrences:
+        base_grp.occurrences.append(occ)
+        base_grp.occurrences.sort(key=lambda o: o.start)
+
+    # Clean up empty split group
+    if grp.group_id != base_key and len(grp.occurrences) == 0:
+        if grp in st.entity_groups:
+            st.entity_groups.remove(grp)
+        for other in st.entity_groups:
+            if other.parent_group_id == grp.group_id:
+                other.parent_group_id = base_grp.group_id
+
+
+def sync_group_overrides(st: "AppState", grp: EntityGroup) -> None:
+    """Sync group property changes (type, role, enabled) to any active overrides in this group."""
+    for occ in grp.occurrences:
+        if occ.occ_id in st.occurrence_overrides:
+            ov = st.occurrence_overrides[occ.occ_id]
+            ov.entity_type = grp.entity_type
+            ov.role = grp.role
+            ov.enabled = grp.enabled
+
+
 # --- App State ---
 class AppState:
     def __init__(self):
@@ -176,6 +278,7 @@ class AppState:
         self.filename: str = ""
         self.raw_text: str = ""
         self.entity_groups: List[EntityGroup] = []
+        self.occurrence_overrides: Dict[str, OccurrenceOverride] = {}
         self.entity_modes: Dict[str, str] = resolve_entity_modes(self.config)
         # Legacy compatibility for config files and code paths that still expose active_entities.
         self.active_entities: List[str] = [
@@ -730,11 +833,11 @@ def compute_reactive_preview(st: AppState) -> Tuple[str, Dict[str, str], Dict]:
 
     # Pass 1: Masters
     for g in active_groups:
-        is_child = g.parent_group_text and g.parent_group_text.strip().lower() != g.key
+        is_child = bool(g.parent_group_id and g.parent_group_id != g.group_id)
         if not is_child:
             count = category_counters.get(g.entity_type, 0) + 1
             category_counters[g.entity_type] = count
-            group_info[g.key] = {
+            group_info[g.group_id] = {
                 "id": count,
                 "role": g.role,
                 "surface_tag": g.surface_tag,
@@ -742,19 +845,19 @@ def compute_reactive_preview(st: AppState) -> Tuple[str, Dict[str, str], Dict]:
 
     # Pass 2: Linked children
     for g in active_groups:
-        is_child = g.parent_group_text and g.parent_group_text.strip().lower() != g.key
+        is_child = bool(g.parent_group_id and g.parent_group_id != g.group_id)
         if is_child:
-            parent_key = g.parent_group_text.strip().lower()
-            if parent_key in group_info:
-                p_id = group_info[parent_key]["id"]
-                p_role = group_info[parent_key]["role"] or g.role
+            parent_id = g.parent_group_id
+            if parent_id in group_info:
+                p_id = group_info[parent_id]["id"]
+                p_role = group_info[parent_id]["role"] or g.role
             else:
                 count = category_counters.get(g.entity_type, 0) + 1
                 category_counters[g.entity_type] = count
                 p_id = count
                 p_role = g.role
 
-            group_info[g.key] = {
+            group_info[g.group_id] = {
                 "id": p_id,
                 "role": p_role,
                 "surface_tag": g.surface_tag or "VORNAME",
@@ -763,7 +866,7 @@ def compute_reactive_preview(st: AppState) -> Tuple[str, Dict[str, str], Dict]:
     # 2. Check collisions for Mode 3 (role_only)
     role_type_groups: Dict[Tuple[str, str], Set[int]] = {}
     for g in active_groups:
-        info = group_info.get(g.key, {})
+        info = group_info.get(g.group_id, {})
         role_str = clean_tag(info.get("role", ""))
         if role_str:
             pair = (g.entity_type, role_str)
@@ -782,7 +885,7 @@ def compute_reactive_preview(st: AppState) -> Tuple[str, Dict[str, str], Dict]:
             g.placeholder = "(ignoriert / inaktiv)"
             continue
 
-        info = group_info.get(g.key, {"id": 1, "role": "", "surface_tag": ""})
+        info = group_info.get(g.group_id, {"id": 1, "role": "", "surface_tag": ""})
         ent_id = info["id"]
         role_str = clean_tag(info["role"])
         tag_str = clean_tag(info["surface_tag"])
@@ -792,7 +895,7 @@ def compute_reactive_preview(st: AppState) -> Tuple[str, Dict[str, str], Dict]:
 
         if st.format_mode == "role_only" and role_str and not is_colliding:
             placeholder = f"[{g.entity_type}_{role_str}{suffix_tag}]"
-        elif (st.format_mode in ("numbered_role", "role_only") or is_colliding) and role_str:
+        elif (st.format_mode == "numbered_role" or (st.format_mode == "role_only" and is_colliding)) and role_str:
             placeholder = f"[{g.entity_type}_{ent_id}_{role_str}{suffix_tag}]"
         else:
             # Modus 1 (Numbered)
@@ -948,6 +1051,8 @@ def create_ui():
         """Unified workspace loader."""
         state.filename = filename
         state.raw_text = text
+        state.entity_groups = []
+        state.occurrence_overrides = {}
         if raw_text_area is not None:
             raw_text_area.value = text
         if analyze_btn is not None:
@@ -1032,6 +1137,7 @@ def create_ui():
         state.raw_text = ""
         state.last_raw_bytes = None
         state.entity_groups = []
+        state.occurrence_overrides = {}
         state.current_mapping = {}
         state.current_anon_text = ""
         if raw_text_area is not None:
@@ -1370,13 +1476,17 @@ def create_ui():
             update_step_ui(2, 0.75, "Span-Deduplizierung & Genitiv-Erweiterung...")
             await asyncio.sleep(0.05)
 
-            groups_dict: Dict[str, EntityGroup] = {}
+            base_groups_dict: Dict[str, EntityGroup] = {}
+            all_new_occurrences: List[Tuple[EntityOccurrence, str, str]] = []
+
             for res in results:
                 orig = state.raw_text[res.start:res.end]
                 norm = orig.strip()
                 key = norm.lower()
                 needs_rev = res.score < REVIEW_SCORE_THRESHOLD
                 ctx_html = extract_context_snippet(state.raw_text, res.start, res.end)
+                fingerprint = compute_context_fingerprint(state.raw_text, res.start, res.end)
+                occ_id = uuid.uuid4().hex
 
                 source, method = classify_recognition_result(res)
                 occ = EntityOccurrence(
@@ -1387,12 +1497,66 @@ def create_ui():
                     needs_review=needs_rev,
                     source=source,
                     method=method,
+                    occ_id=occ_id,
+                    context_fingerprint=fingerprint,
                 )
-                if key not in groups_dict:
-                    groups_dict[key] = EntityGroup(original_text=norm, entity_type=res.entity_type)
-                groups_dict[key].occurrences.append(occ)
+                if key not in base_groups_dict:
+                    base_groups_dict[key] = EntityGroup(original_text=norm, entity_type=res.entity_type, group_id=key)
+                base_groups_dict[key].occurrences.append(occ)
+                all_new_occurrences.append((occ, norm, res.entity_type))
 
-            state.entity_groups = list(groups_dict.values())
+            # Re-attach and remap overrides fail-safely
+            old_overrides = list(state.occurrence_overrides.values())
+            new_overrides: Dict[str, OccurrenceOverride] = {}
+
+            old_by_fp: Dict[str, List[OccurrenceOverride]] = {}
+            for ov in old_overrides:
+                old_by_fp.setdefault(ov.context_fingerprint, []).append(ov)
+
+            new_by_fp: Dict[str, List[Tuple[EntityOccurrence, str, str]]] = {}
+            for occ, norm, ent_type in all_new_occurrences:
+                new_by_fp.setdefault(occ.context_fingerprint, []).append((occ, norm, ent_type))
+
+            split_groups_dict: Dict[str, EntityGroup] = {}
+
+            for fp, ov_list in old_by_fp.items():
+                cand_list = new_by_fp.get(fp, [])
+                if len(ov_list) == 1 and len(cand_list) == 1:
+                    ov = ov_list[0]
+                    new_occ, actual_norm, actual_type = cand_list[0]
+                    if actual_norm == ov.expected_original_text:
+                        # 1:1 match and exact original text confirmed
+                        new_overrides[new_occ.occ_id] = OccurrenceOverride(
+                            target_group_id=ov.target_group_id,
+                            context_fingerprint=fp,
+                            expected_original_text=ov.expected_original_text,
+                            entity_type=ov.entity_type,
+                            role=ov.role,
+                            enabled=ov.enabled,
+                        )
+                        tgt_id = ov.target_group_id
+                        if tgt_id not in split_groups_dict:
+                            restored_type = ov.entity_type if ov.entity_type is not None else actual_type
+                            restored_grp = EntityGroup(
+                                original_text=ov.expected_original_text,
+                                entity_type=restored_type,
+                                group_id=tgt_id,
+                            )
+                            if ov.role is not None:
+                                restored_grp.role = ov.role
+                            if ov.enabled is not None:
+                                restored_grp.enabled = ov.enabled
+                            split_groups_dict[tgt_id] = restored_grp
+
+                        base_k = actual_norm.strip().lower()
+                        if base_k in base_groups_dict and new_occ in base_groups_dict[base_k].occurrences:
+                            base_groups_dict[base_k].occurrences.remove(new_occ)
+                        if new_occ not in split_groups_dict[tgt_id].occurrences:
+                            split_groups_dict[tgt_id].occurrences.append(new_occ)
+
+            active_base_groups = [g for g in base_groups_dict.values() if g.occurrences]
+            state.entity_groups = active_base_groups + list(split_groups_dict.values())
+            state.occurrence_overrides = new_overrides
 
             # Step 4: Smart-Linking proposals
             update_step_ui(3, 0.90, "Namensbezüge & Rollen-Kandidaten...")
@@ -1431,17 +1595,17 @@ def create_ui():
     def get_sorted_groups() -> List[EntityGroup]:
         """Return entity groups sorted according to user selection."""
         if state.sort_by == "Alphabetisch (A–Z)":
-            return sorted(state.entity_groups, key=lambda g: g.original_text.lower())
+            return sorted(state.entity_groups, key=lambda g: (g.text_key, g.group_id))
         elif state.sort_by == "Erstes Auftreten im Text":
             return sorted(state.entity_groups, key=lambda g: g.first_start)
         elif state.sort_by == "Häufigkeit (meiste Treffer zuerst)":
             return sorted(state.entity_groups, key=lambda g: (-g.count, g.first_start))
         elif state.sort_by == "Entitätstyp (PERSON, ORG, ...)":
-            return sorted(state.entity_groups, key=lambda g: (g.entity_type, g.original_text.lower()))
+            return sorted(state.entity_groups, key=lambda g: (g.entity_type, g.text_key, g.group_id))
         elif state.sort_by == "⚠️ Review-Bedarf zuerst":
             return sorted(state.entity_groups, key=lambda g: (not g.needs_review, -g.count, g.first_start))
         else:
-            return sorted(state.entity_groups, key=lambda g: g.original_text.lower())
+            return sorted(state.entity_groups, key=lambda g: (g.text_key, g.group_id))
 
     def build_review_table():
         if not table_holder:
@@ -1454,12 +1618,6 @@ def create_ui():
 
             total_hits = sum(g.count for g in state.entity_groups)
             unique_count = len(state.entity_groups)
-
-            # Precompute all entity names once in O(n) for linking dropdowns
-            all_entity_names = sorted(
-                list({g.original_text.strip() for g in state.entity_groups if g.original_text.strip()}),
-                key=lambda s: s.lower(),
-            )
 
             ui.label(f"Erkannte Entitäten ({unique_count} Begriffe, {total_hits} Fundstellen gesamt)").classes("text-lg font-bold text-slate-800 mb-1")
             ui.label("Vergeben Sie optionale Rollen oder übernehmen Sie Verknüpfungsvorschläge. Jede Zeile zeigt den zugeordneten Platzhalter und klappt Fundstellen auf:").classes("text-sm text-slate-600 mb-3")
@@ -1513,12 +1671,14 @@ def create_ui():
                     def select_all():
                         for g in state.entity_groups:
                             g.enabled = True
+                            sync_group_overrides(state, g)
                         refresh_preview_and_exports()
                         build_review_table()
 
                     def deselect_all():
                         for g in state.entity_groups:
                             g.enabled = False
+                            sync_group_overrides(state, g)
                         refresh_preview_and_exports()
                         build_review_table()
 
@@ -1540,6 +1700,8 @@ def create_ui():
                 master: EntityGroup = root_node.item
                 has_children = len(root_node.children) > 0
                 row_bg = "bg-amber-50" if master.needs_review else ("bg-white" if node_idx % 2 == 0 else "bg-slate-50")
+                is_split = master.group_id != master.text_key
+                is_homonym = len([g for g in state.entity_groups if g.text_key == master.text_key]) > 1
 
                 with ui.column().classes("w-full mb-2"):
                     child_badge_refs: List[Tuple[EntityGroup, Any]] = []
@@ -1555,6 +1717,7 @@ def create_ui():
                                     def make_group_check(grp):
                                         def on_change(e):
                                             grp.enabled = e.value
+                                            sync_group_overrides(state, grp)
                                             refresh_preview_and_exports()
                                             build_review_table()
                                         return on_change
@@ -1568,6 +1731,11 @@ def create_ui():
                                     # Master Placeholder Badge
                                     master_badge = ui.badge(master.placeholder, color="blue-9").props("outline dense").classes("text-xs font-mono font-bold")
 
+                                    if is_split:
+                                        ui.badge("✂️ Ausgliederung", color="purple-7").props("dense").tooltip("Abgespaltene Homonym-Gruppe mit eigener Zuweisung")
+                                    elif is_homonym:
+                                        ui.badge("Homonym", color="indigo-6").props("dense outline").tooltip("Mehrere Gruppen mit identischem Oberflächentext")
+
                                     if has_children:
                                         ui.badge(f"🔗 {len(root_node.children)} verknüpft", color="teal").props("dense").tooltip("Hauptperson mit verknüpften Schreibweisen")
 
@@ -1576,6 +1744,7 @@ def create_ui():
                                     def make_group_select(grp):
                                         def on_change(e):
                                             grp.entity_type = e.value
+                                            sync_group_overrides(state, grp)
                                             refresh_preview_and_exports()
                                             build_review_table()
                                         return on_change
@@ -1591,6 +1760,7 @@ def create_ui():
                                     def make_role_change(grp, m_badge, c_badges):
                                         def on_change(e):
                                             grp.role = (e.value or "").strip()
+                                            sync_group_overrides(state, grp)
                                             compute_reactive_preview(state)
                                             m_badge.set_text(grp.placeholder)
                                             for c_grp, c_badge in c_badges:
@@ -1607,21 +1777,22 @@ def create_ui():
 
                                 # 4. Interactive Smart-Linking Proposal (Confirmation Model) or Link Dropdown
                                 if not has_children:
-                                    if master.suggested_parent and not master.parent_group_text:
+                                    if master.suggested_parent and not master.parent_group_id:
                                         with ui.row().classes("items-center gap-1"):
                                             def make_apply_suggestion(grp, p_target, tag):
                                                 def on_click():
-                                                    grp.parent_group_text = p_target
-                                                    grp.surface_tag = tag
-                                                    grp.suggested_parent = None
-                                                    grp.suggested_tag = None
-                                                    grp.suggested_candidates = []
                                                     p_match = next((x for x in state.entity_groups if x.original_text == p_target), None)
-                                                    if p_match and not p_match.surface_tag:
-                                                        p_match.surface_tag = "VOLLNAME"
-                                                    ui.notify(f"'{grp.original_text}' mit '{p_target}' ({tag}) verknüpft.", type="positive", icon="link")
-                                                    refresh_preview_and_exports()
-                                                    build_review_table()
+                                                    if p_match:
+                                                        grp.parent_group_id = p_match.group_id
+                                                        grp.surface_tag = tag
+                                                        grp.suggested_parent = None
+                                                        grp.suggested_tag = None
+                                                        grp.suggested_candidates = []
+                                                        if not p_match.surface_tag:
+                                                            p_match.surface_tag = "VOLLNAME"
+                                                        ui.notify(f"'{grp.original_text}' mit '{p_target}' ({tag}) verknüpft.", type="positive", icon="link")
+                                                        refresh_preview_and_exports()
+                                                        build_review_table()
                                                 return on_click
 
                                             tag_label = SURFACE_TAG_OPTIONS.get(master.suggested_tag, master.suggested_tag or "Vorname")
@@ -1636,16 +1807,29 @@ def create_ui():
                                         ui.badge(f"💡 {len(master.suggested_candidates)} Namenskandidaten", color="amber-8").props("outline dense").tooltip("Mehrere passende Personen gefunden. Bitte im Dropdown rechts auswählen.")
 
                                     # Manual Link Dropdown: All other recognized entities in the workspace
-                                    all_other_names = [n for n in all_entity_names if n.lower() != master.key]
-                                    if all_other_names:
+                                    link_options = {"": "Eigenständig"}
+                                    for other in state.entity_groups:
+                                        if other.group_id != master.group_id and not other.parent_group_id:
+                                            desc = f" ({other.entity_type}"
+                                            if other.role:
+                                                desc += f", {other.role}"
+                                            desc += f", {other.count}x)"
+                                            link_options[other.group_id] = f"{other.original_text}{desc}"
+
+                                    if len(link_options) > 1:
                                         with ui.row().classes("items-center gap-1"):
                                             def make_link_to_master(grp):
                                                 def on_change(e):
                                                     val = (e.value or "").strip()
-                                                    if val and val != "Eigenständig":
-                                                        p_match = next((x for x in state.entity_groups if x.original_text.lower() == val.lower()), None)
+                                                    if not val or val == "Eigenständig":
+                                                        grp.parent_group_id = None
+                                                        grp.surface_tag = ""
+                                                        grp.suggested_parent = None
+                                                        grp.suggested_candidates = []
+                                                    else:
+                                                        p_match = next((x for x in state.entity_groups if x.group_id == val), None)
                                                         if p_match:
-                                                            grp.parent_group_text = p_match.original_text
+                                                            grp.parent_group_id = p_match.group_id
                                                             if not grp.surface_tag:
                                                                 grp.surface_tag = "VORNAME"
                                                             grp.suggested_parent = None
@@ -1656,16 +1840,16 @@ def create_ui():
                                                             refresh_preview_and_exports()
                                                             build_review_table()
                                                         else:
-                                                            ui.notify(f"Ungültige Verknüpfung: '{val}' existiert nicht.", type="warning")
+                                                            ui.notify(f"Ungültige Verknüpfung: Zielgruppe existiert nicht.", type="warning")
                                                 return on_change
 
+                                            current_val = master.parent_group_id if (master.parent_group_id and master.parent_group_id in link_options) else ""
                                             ui.select(
-                                                options=["Eigenständig"] + all_other_names,
-                                                value="Eigenständig",
+                                                options=link_options,
+                                                value=current_val,
                                                 label="Verknüpfen mit:",
-                                                with_input=True,
                                                 on_change=make_link_to_master(master),
-                                            ).props('dense outlined bg-white use-input clearable options-dense menu-props="{ maxHeight: \'300px\' }"').classes("min-w-[200px] max-w-[320px] text-xs").tooltip("Zielperson / Bezug auswählen oder durch Tippen filtern")
+                                            ).props('dense outlined bg-white options-dense menu-props="{ maxHeight: \'300px\' }"').classes("min-w-[200px] max-w-[320px] text-xs").tooltip("Zielperson / Bezug auswählen")
 
                                 # 5. Score & Action
                                 with ui.row().classes("items-center gap-2"):
@@ -1686,6 +1870,7 @@ def create_ui():
                                                 render_ignore_list_ui()
                                                 save_current_config(state)
                                             grp.enabled = False
+                                            sync_group_overrides(state, grp)
                                             ui.notify(f"'{term}' zur Ignore-Liste hinzugefügt.", type="info")
                                             refresh_preview_and_exports()
                                             build_review_table()
@@ -1703,13 +1888,12 @@ def create_ui():
                                             ]
                                             lines.append(f"{term}: {grp.entity_type}")
                                             state.glossary_text = "\n".join(lines)
-                                            # Make the action effective immediately in the current
-                                            # review, even before the next full analysis.
                                             for occurrence in grp.occurrences:
                                                 occurrence.source = "glossary"
                                                 occurrence.method = "glossary_direct"
                                                 occurrence.method_detail = "direct"
                                             grp.enabled = True
+                                            sync_group_overrides(state, grp)
                                             save_current_config(state)
                                             render_glossary_list_ui()
                                             compute_reactive_preview(state)
@@ -1726,6 +1910,7 @@ def create_ui():
                                                 occurrence.method_detail = "manual"
                                                 occurrence.needs_review = False
                                             grp.enabled = True
+                                            sync_group_overrides(state, grp)
                                             compute_reactive_preview(state)
                                             refresh_preview_and_exports()
                                             build_review_table()
@@ -1751,12 +1936,38 @@ def create_ui():
                         with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
                             ui.label(f"Fundstellen im Text ({master.count} Vorkommen):").classes("text-xs font-bold text-slate-700")
                             for occ_idx, occ in enumerate(master.occurrences, start=1):
-                                with ui.row().classes("items-center gap-2 p-1.5 bg-slate-50 rounded border text-xs w-full"):
-                                    ui.label(f"#{occ_idx}").classes("font-bold text-slate-500 w-6")
-                                    ui.html(occ.context_html).classes("flex-1 text-slate-800")
-                                    method_label, method_color, method_tooltip = method_display(occ.method)
-                                    ui.badge(method_label, color=method_color).props("dense outline").tooltip(method_tooltip)
-                                    ui.label(f"Score: {occ.score:.2f}").classes("text-slate-400 font-mono text-[10px]")
+                                with ui.row().classes("items-center justify-between gap-2 p-1.5 bg-slate-50 rounded border text-xs w-full"):
+                                    with ui.row().classes("items-center gap-2 flex-1"):
+                                        ui.label(f"#{occ_idx}").classes("font-bold text-slate-500 w-6")
+                                        ui.html(occ.context_html).classes("flex-1 text-slate-800")
+                                        method_label, method_color, method_tooltip = method_display(occ.method)
+                                        ui.badge(method_label, color=method_color).props("dense outline").tooltip(method_tooltip)
+                                        ui.label(f"Score: {occ.score:.2f}").classes("text-slate-400 font-mono text-[10px]")
+
+                                    with ui.row().classes("items-center gap-1 shrink-0"):
+                                        is_split_occ = occ.occ_id in state.occurrence_overrides or master.group_id != master.text_key
+                                        if is_split_occ:
+                                            def make_revert_occ(grp, o):
+                                                def on_click():
+                                                    revert_occurrence_to_base(state, grp, o)
+                                                    compute_reactive_preview(state)
+                                                    refresh_preview_and_exports()
+                                                    build_review_table()
+                                                    ui.notify(f"Fundstelle wieder mit der Hauptgruppe '{grp.original_text}' zusammengeführt.", type="info", icon="merge")
+                                                return on_click
+
+                                            ui.button("↩️ Zusammenführen", on_click=make_revert_occ(master, occ)).props("flat dense size=sm color=teal-8").tooltip("Ausgliederung rückgängig machen und mit Basisgruppe vereinen")
+                                        elif master.count > 1:
+                                            def make_split_occ(grp, o):
+                                                def on_click():
+                                                    split_occurrence_to_new_group(state, grp, o)
+                                                    compute_reactive_preview(state)
+                                                    refresh_preview_and_exports()
+                                                    build_review_table()
+                                                    ui.notify(f"Fundstelle als eigene Gruppe ausgegliedert.", type="info", icon="call_split")
+                                                return on_click
+
+                                            ui.button("✂️ Ausgliedern", on_click=make_split_occ(master, occ)).props("flat dense size=sm color=primary").tooltip("Als eigene Gruppe ausgliedern (Homonym-Behandlung)")
 
                     # Render Indented Linked Children
                     for child_node in root_node.children:
@@ -1796,7 +2007,7 @@ def create_ui():
                                     with ui.row().classes("items-center gap-2"):
                                         def make_unlink_action(c_grp):
                                             def on_click():
-                                                c_grp.parent_group_text = None
+                                                c_grp.parent_group_id = None
                                                 c_grp.surface_tag = ""
                                                 ui.notify(f"'{c_grp.original_text}' getrennt und als eigenständige Entität gesetzt.", type="info")
                                                 refresh_preview_and_exports()
@@ -1813,13 +2024,39 @@ def create_ui():
                             # Child Occurrences
                             with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
                                 ui.label(f"Fundstellen von '{child.original_text}' ({child.count} Vorkommen):").classes("text-xs font-bold text-slate-700")
-                            for occ_idx, occ in enumerate(child.occurrences, start=1):
-                                with ui.row().classes("items-center gap-2 p-1.5 bg-slate-50 rounded border text-xs w-full"):
-                                    ui.label(f"#{occ_idx}").classes("font-bold text-slate-500 w-6")
-                                    ui.html(occ.context_html).classes("flex-1 text-slate-800")
-                                    method_label, method_color, method_tooltip = method_display(occ.method)
-                                    ui.badge(method_label, color=method_color).props("dense outline").tooltip(method_tooltip)
-                                    ui.label(f"Score: {occ.score:.2f}").classes("text-slate-400 font-mono text-[10px]")
+                                for occ_idx, occ in enumerate(child.occurrences, start=1):
+                                    with ui.row().classes("items-center justify-between gap-2 p-1.5 bg-slate-50 rounded border text-xs w-full"):
+                                        with ui.row().classes("items-center gap-2 flex-1"):
+                                            ui.label(f"#{occ_idx}").classes("font-bold text-slate-500 w-6")
+                                            ui.html(occ.context_html).classes("flex-1 text-slate-800")
+                                            method_label, method_color, method_tooltip = method_display(occ.method)
+                                            ui.badge(method_label, color=method_color).props("dense outline").tooltip(method_tooltip)
+                                            ui.label(f"Score: {occ.score:.2f}").classes("text-slate-400 font-mono text-[10px]")
+
+                                        with ui.row().classes("items-center gap-1 shrink-0"):
+                                            is_split_occ = occ.occ_id in state.occurrence_overrides or child.group_id != child.text_key
+                                            if is_split_occ:
+                                                def make_revert_child_occ(grp, o):
+                                                    def on_click():
+                                                        revert_occurrence_to_base(state, grp, o)
+                                                        compute_reactive_preview(state)
+                                                        refresh_preview_and_exports()
+                                                        build_review_table()
+                                                        ui.notify(f"Fundstelle wieder mit der Hauptgruppe '{grp.original_text}' zusammengeführt.", type="info", icon="merge")
+                                                    return on_click
+
+                                                ui.button("↩️ Zusammenführen", on_click=make_revert_child_occ(child, occ)).props("flat dense size=sm color=teal-8").tooltip("Ausgliederung rückgängig machen und mit Basisgruppe vereinen")
+                                            elif child.count > 1:
+                                                def make_split_child_occ(grp, o):
+                                                    def on_click():
+                                                        split_occurrence_to_new_group(state, grp, o)
+                                                        compute_reactive_preview(state)
+                                                        refresh_preview_and_exports()
+                                                        build_review_table()
+                                                        ui.notify(f"Fundstelle als eigene Gruppe ausgegliedert.", type="info", icon="call_split")
+                                                    return on_click
+
+                                                ui.button("✂️ Ausgliedern", on_click=make_split_child_occ(child, occ)).props("flat dense size=sm color=primary").tooltip("Als eigene Gruppe ausgliedern (Homonym-Behandlung)")
 
     # --- Main Layout ---
     with ui.row().classes("w-full no-wrap p-4 gap-6"):
@@ -2334,7 +2571,7 @@ def create_ui():
                                     # Collect existing accepted spans
                                     existing_spans = []
                                     for g in state.entity_groups:
-                                        if g.key != term.lower():
+                                        if g.text_key != term.lower():
                                             for occ in g.occurrences:
                                                 existing_spans.append((occ.start, occ.end))
 
@@ -2345,6 +2582,7 @@ def create_ui():
                                         overlaps_existing = any(not (end <= s or start >= e) for s, e in existing_spans)
                                         if not overlaps_existing:
                                             ctx_html = extract_context_snippet(state.raw_text, start, end)
+                                            fingerprint = compute_context_fingerprint(state.raw_text, start, end)
                                             new_occurrences.append(
                                                 EntityOccurrence(
                                                     start=start,
@@ -2354,6 +2592,8 @@ def create_ui():
                                                     needs_review=False,
                                                     source="manual",
                                                     method="manual",
+                                                    occ_id=uuid.uuid4().hex,
+                                                    context_fingerprint=fingerprint,
                                                 )
                                             )
 
@@ -2362,13 +2602,17 @@ def create_ui():
                                         return
 
                                     # Find or create EntityGroup
-                                    existing_group = next((g for g in state.entity_groups if g.key == term.lower()), None)
+                                    existing_group = next((g for g in state.entity_groups if g.group_id == term.lower()), None)
                                     if existing_group:
                                         existing_group.occurrences = new_occurrences
                                         existing_group.entity_type = manual_type.value
                                         existing_group.enabled = True
                                     else:
-                                        new_g = EntityGroup(original_text=matches[0].group(0), entity_type=manual_type.value)
+                                        new_g = EntityGroup(
+                                            original_text=matches[0].group(0),
+                                            entity_type=manual_type.value,
+                                            group_id=term.lower(),
+                                        )
                                         new_g.occurrences = new_occurrences
                                         state.entity_groups.append(new_g)
 

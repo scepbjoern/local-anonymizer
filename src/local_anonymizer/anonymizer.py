@@ -120,15 +120,18 @@ def build_entity_tree(
     """
     Build a hierarchical tree of entities (roots/masters with linked children).
     
-    Defaults to reading .key and .parent_group_text if callables are omitted.
+    Defaults to reading .group_id (or .key) and .parent_group_id (or .parent_group_text) if callables are omitted.
     """
     if get_key is None:
-        get_key = lambda x: getattr(x, "key", str(x).lower())
+        get_key = lambda x: str(getattr(x, "group_id", getattr(x, "key", str(x).lower())))
     if get_parent_key is None:
         get_parent_key = lambda x: (
-            getattr(x, "parent_group_text", "").strip().lower()
-            if getattr(x, "parent_group_text", None)
-            else None
+            getattr(x, "parent_group_id", None)
+            or (
+                getattr(x, "parent_group_text", "").strip().lower()
+                if getattr(x, "parent_group_text", None)
+                else None
+            )
         )
 
     item_keys = {get_key(it): it for it in items}
@@ -172,7 +175,7 @@ def compute_smart_link_proposals(
     if get_entity_type is None:
         get_entity_type = lambda x: getattr(x, "entity_type", "")
     if get_parent is None:
-        get_parent = lambda x: getattr(x, "parent_group_text", None)
+        get_parent = lambda x: getattr(x, "parent_group_id", getattr(x, "parent_group_text", None))
 
     # Pre-index potential parent person entities for fast O(1) candidate lookup
     by_first_name: Dict[str, List[str]] = {}
