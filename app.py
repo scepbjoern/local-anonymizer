@@ -287,7 +287,8 @@ def rebind_overrides_after_analysis(
     1. Builds base EntityGroup instances and occurrences with fresh occ_id and context_fingerprint.
     2. Re-attaches overrides only on strict 1:1 match of context_fingerprint and exact original_text.
     3. Reconstructs target_group_id split EntityGroups with expected_original_text.
-    4. Discards ambiguous (1:N, N:1, N:M), mismatched, or orphaned overrides fail-safely.
+    4. Discards ambiguous (1:N, N:1, N:M), mismatched, invalid target_id, base-collision,
+       or conflicting overrides fail-safely.
 
     Returns:
         (entity_groups, new_occurrence_overrides)
@@ -332,7 +333,8 @@ def rebind_overrides_after_analysis(
     for occ, orig, ent_type in all_new_occurrences:
         new_by_fp.setdefault(occ.context_fingerprint, []).append((occ, orig, ent_type))
 
-    split_groups_dict: Dict[str, EntityGroup] = {}
+    # Phase 1: Collect candidates that pass 1:1 fingerprint match and exact original text
+    candidates_by_tgt: Dict[str, List[Tuple[OccurrenceOverride, EntityOccurrence, str, str]]] = {}
 
     for fp, ov_list in old_by_fp.items():
         cand_list = new_by_fp.get(fp, [])
@@ -340,34 +342,60 @@ def rebind_overrides_after_analysis(
             ov = ov_list[0]
             new_occ, actual_orig, actual_type = cand_list[0]
             if actual_orig == ov.expected_original_text:
-                # 1:1 match and exact original text confirmed
-                new_overrides[new_occ.occ_id] = OccurrenceOverride(
-                    target_group_id=ov.target_group_id,
-                    context_fingerprint=fp,
-                    expected_original_text=ov.expected_original_text,
-                    entity_type=ov.entity_type,
-                    role=ov.role,
-                    enabled=ov.enabled,
-                )
-                tgt_id = ov.target_group_id
-                if tgt_id not in split_groups_dict:
-                    restored_type = ov.entity_type if ov.entity_type is not None else actual_type
-                    restored_grp = EntityGroup(
-                        original_text=ov.expected_original_text,
-                        entity_type=restored_type,
-                        group_id=tgt_id,
-                    )
-                    if ov.role is not None:
-                        restored_grp.role = ov.role
-                    if ov.enabled is not None:
-                        restored_grp.enabled = ov.enabled
-                    split_groups_dict[tgt_id] = restored_grp
+                tgt_id = (ov.target_group_id or "").strip()
+                if tgt_id:
+                    candidates_by_tgt.setdefault(tgt_id, []).append((ov, new_occ, actual_orig, actual_type))
 
-                base_k = actual_orig.strip().lower()
-                if base_k in base_groups_dict and new_occ in base_groups_dict[base_k].occurrences:
-                    base_groups_dict[base_k].occurrences.remove(new_occ)
-                if new_occ not in split_groups_dict[tgt_id].occurrences:
-                    split_groups_dict[tgt_id].occurrences.append(new_occ)
+    # Phase 2: Validate target_group_id integrity and consistency
+    split_groups_dict: Dict[str, EntityGroup] = {}
+
+    for tgt_id, matches in candidates_by_tgt.items():
+        # Reject empty target_group_id or collision with any canonical base group key
+        if not tgt_id or tgt_id.lower() in base_groups_dict:
+            continue
+
+        # Check if all overrides for this target_group_id have consistent expected_original_text and metadata
+        first_ov, _, first_orig, first_type = matches[0]
+        is_consistent = all(
+            (
+                ov.expected_original_text == first_ov.expected_original_text
+                and ov.entity_type == first_ov.entity_type
+                and ov.role == first_ov.role
+                and ov.enabled == first_ov.enabled
+                and orig == first_orig
+            )
+            for ov, occ, orig, typ in matches
+        )
+        if not is_consistent:
+            # Conflicting overrides pointing to the same target_group_id -> fail-safe drop
+            continue
+
+        restored_type = first_ov.entity_type if first_ov.entity_type is not None else first_type
+        restored_grp = EntityGroup(
+            original_text=first_ov.expected_original_text,
+            entity_type=restored_type,
+            group_id=tgt_id,
+        )
+        if first_ov.role is not None:
+            restored_grp.role = first_ov.role
+        if first_ov.enabled is not None:
+            restored_grp.enabled = first_ov.enabled
+
+        for ov, new_occ, actual_orig, _ in matches:
+            new_overrides[new_occ.occ_id] = OccurrenceOverride(
+                target_group_id=tgt_id,
+                context_fingerprint=new_occ.context_fingerprint,
+                expected_original_text=ov.expected_original_text,
+                entity_type=ov.entity_type,
+                role=ov.role,
+                enabled=ov.enabled,
+            )
+            base_k = actual_orig.strip().lower()
+            if base_k in base_groups_dict and new_occ in base_groups_dict[base_k].occurrences:
+                base_groups_dict[base_k].occurrences.remove(new_occ)
+            restored_grp.occurrences.append(new_occ)
+
+        split_groups_dict[tgt_id] = restored_grp
 
     active_base_groups = [g for g in base_groups_dict.values() if g.occurrences]
     final_entity_groups = active_base_groups + list(split_groups_dict.values())
@@ -384,6 +412,40 @@ def reset_app_state(st: "AppState") -> None:
     st.current_mapping = {}
     st.current_anon_text = ""
     st.current_report = {}
+
+
+def load_document_into_state(
+    state: "AppState",
+    text: str,
+    filename: str,
+    raw_bytes: Optional[bytes] = None,
+) -> None:
+    """
+    Load extracted document text and optional raw bytes into AppState.
+    Clears previous analysis and overrides via reset_app_state while preserving the new raw_bytes.
+    """
+    reset_app_state(state)
+    state.filename = filename
+    state.raw_text = text
+    state.last_raw_bytes = raw_bytes
+
+
+def format_link_dropdown_label(grp: EntityGroup) -> str:
+    """
+    Generate an unambiguous visible label for an EntityGroup in link dropdowns.
+    Includes text, type, optional role, base/split marker with short ID, and count.
+    """
+    is_split = grp.group_id != grp.text_key
+    desc_parts = [grp.entity_type]
+    if grp.role:
+        desc_parts.append(grp.role)
+    if is_split:
+        short_id = grp.group_id.replace("split_", "")[:6]
+        desc_parts.append(f"Ausgliederung · {short_id}")
+    else:
+        desc_parts.append("Basis")
+    desc_parts.append(f"{grp.count}x")
+    return f"{grp.original_text} ({', '.join(desc_parts)})"
 
 
 @dataclass
@@ -1193,11 +1255,9 @@ def create_ui():
     map_json_input = None
     restored_preview = None
 
-    def load_content_into_workspace(text: str, filename: str):
+    def load_content_into_workspace(text: str, filename: str, raw_bytes: Optional[bytes] = None):
         """Unified workspace loader."""
-        reset_app_state(state)
-        state.filename = filename
-        state.raw_text = text
+        load_document_into_state(state, text, filename, raw_bytes=raw_bytes)
         if raw_text_area is not None:
             raw_text_area.value = text
         if analyze_btn is not None:
@@ -1214,7 +1274,6 @@ def create_ui():
 
     async def extract_and_load_file_bytes(raw_bytes: bytes, filename: str):
         """Asynchronously extract structured text from document bytes with live UI progress."""
-        state.last_raw_bytes = raw_bytes
         if extraction_progress_card is not None and extraction_progress_bar is not None and extraction_progress_label is not None:
             extraction_progress_card.set_visibility(True)
             extraction_progress_bar.set_value(0.0)
@@ -1238,7 +1297,7 @@ def create_ui():
                 state.include_headers_footers,
                 state.extract_picture_text,
             )
-            load_content_into_workspace(text, filename)
+            load_content_into_workspace(text, filename, raw_bytes=raw_bytes)
         except Exception as ex:
             err_msg = f"{type(ex).__name__}: {str(ex)}"
             logging.error(f"File extraction error: {err_msg}", exc_info=True)
@@ -1894,14 +1953,7 @@ def create_ui():
                                             link_options = {"": "Eigenständig"}
                                             for other in state.entity_groups:
                                                 if other.group_id != master.group_id and not other.parent_group_id:
-                                                    is_other_split = other.group_id != other.text_key
-                                                    desc_parts = [other.entity_type]
-                                                    if other.role:
-                                                        desc_parts.append(other.role)
-                                                    desc_parts.append("Ausgliederung" if is_other_split else "Basis")
-                                                    desc_parts.append(f"{other.count}x")
-                                                    desc = f" ({', '.join(desc_parts)})"
-                                                    link_options[other.group_id] = f"{other.original_text}{desc}"
+                                                    link_options[other.group_id] = format_link_dropdown_label(other)
 
                                             if len(link_options) > 1:
                                                 with ui.row().classes("items-center gap-1"):
