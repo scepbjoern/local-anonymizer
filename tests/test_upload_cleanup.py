@@ -87,10 +87,69 @@ def test_extract_upload_payload_rejects_malformed_file_id(tmp_path: Path):
 
 def test_extract_upload_payload_missing_binary(tmp_path: Path):
     file_id = str(uuid.uuid4())
-    # Do not create the .bin file
+    # Create only metadata file, binary is missing
+    meta_f = tmp_path / f"{file_id}.json"
+    meta_f.write_text(json.dumps({"filename": "missing.txt"}), encoding="utf-8")
+    assert meta_f.exists()
+
     event_data = {"file_id": file_id, "name": "missing.txt"}
     with pytest.raises(ValueError, match="existiert nicht"):
         extract_upload_payload(event_data, upload_dir=tmp_path)
+
+    # Invariant: metadata file must be immediately deleted on failure
+    assert not meta_f.exists()
+
+
+def test_extract_upload_payload_read_error_cleans_both(tmp_path: Path, monkeypatch):
+    file_id = str(uuid.uuid4())
+    bin_f = tmp_path / f"{file_id}.bin"
+    meta_f = tmp_path / f"{file_id}.json"
+    bin_f.write_bytes(b"content")
+    meta_f.write_text(json.dumps({"filename": "doc.txt"}), encoding="utf-8")
+
+    assert bin_f.exists()
+    assert meta_f.exists()
+
+    def failing_read(self):
+        raise IOError("Disk read error")
+
+    monkeypatch.setattr(Path, "read_bytes", failing_read)
+
+    event_data = {"file_id": file_id, "name": "doc.txt"}
+    with pytest.raises(IOError, match="Disk read error"):
+        extract_upload_payload(event_data, upload_dir=tmp_path)
+
+    # Invariant: both files must be cleaned up on exception inside extract_upload_payload
+    assert not bin_f.exists()
+    assert not meta_f.exists()
+
+
+@pytest.mark.asyncio
+async def test_api_upload_partial_file_cleanup_on_error(tmp_path: Path, monkeypatch):
+    from fastapi import UploadFile
+    import io
+    from app import api_upload
+
+    # Direct UPLOAD_DIR to temporary path
+    monkeypatch.setattr("app.UPLOAD_DIR", tmp_path)
+
+    # Simulate error while writing json metadata
+    def failing_write_text(self, *args, **kwargs):
+        raise OSError("Simulated metadata write failure")
+
+    monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+    mock_file = UploadFile(
+        filename="test.docx",
+        file=io.BytesIO(b"binary file content"),
+    )
+
+    resp = await api_upload(mock_file)
+    assert resp.status_code == 500
+
+    # Ensure no partial .bin or .json files remain in UPLOAD_DIR
+    remaining_files = list(tmp_path.glob("*"))
+    assert len(remaining_files) == 0, f"Found leaked partial upload files: {remaining_files}"
 
 
 @pytest.mark.parametrize("channel", ["main", "restore", "mapping"])

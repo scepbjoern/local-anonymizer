@@ -114,6 +114,8 @@ if not is_pdf_worker():
 @app.post("/api/upload")
 async def api_upload(file: UploadFile = File(...)):
     """FastAPI endpoint to receive large dropped files via HTTP streaming to disk with size limits."""
+    bin_path: Optional[Path] = None
+    meta_path: Optional[Path] = None
     try:
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         content = await file.read()
@@ -128,6 +130,7 @@ async def api_upload(file: UploadFile = File(...)):
         logging.info(f"api_upload: Saved {file.filename} ({len(content)} bytes) as {file_id}")
         return JSONResponse({"file_id": file_id, "filename": file.filename, "size": len(content)})
     except Exception as e:
+        cleanup_upload_paths(bin_path, meta_path)
         logging.error(f"api_upload failed: {e}", exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -180,6 +183,7 @@ def extract_upload_payload(
     Extract raw_bytes and filename from an upload event payload (dict).
     Validates file_id as strict UUID and resolves temp paths under upload_dir.
     Returns (raw_bytes, filename, temp_paths_tuple_or_None).
+    Guarantees immediate cleanup of any resolved temp files if extraction fails before returning.
     Raises ValueError if data is invalid or cannot be decoded.
     """
     if not isinstance(data, dict):
@@ -198,22 +202,27 @@ def extract_upload_payload(
     bin_path, meta_path = temp_paths if temp_paths else (None, None)
     raw_bytes: Optional[bytes] = None
 
-    if bin_path:
-        if not bin_path.exists():
-            raise ValueError(f"Upload-Datei {bin_path.name} existiert nicht.")
-        raw_bytes = bin_path.read_bytes()
-        if meta_path and meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                filename = meta.get("filename") or filename
-            except Exception:
-                pass
-    elif filepath and Path(filepath).is_file():
-        raw_bytes = safe_read_bytes(filepath)
-    elif "base64" in data and data["base64"]:
-        raw_bytes = base64.b64decode(data["base64"])
-    else:
-        raise ValueError(f"Keine Dateidaten im Event empfangen (keys={list(data.keys())})")
+    try:
+        if bin_path:
+            if not bin_path.exists():
+                raise ValueError(f"Upload-Datei {bin_path.name} existiert nicht.")
+            raw_bytes = bin_path.read_bytes()
+            if meta_path and meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    filename = meta.get("filename") or filename
+                except Exception:
+                    pass
+        elif filepath and Path(filepath).is_file():
+            raw_bytes = safe_read_bytes(filepath)
+        elif "base64" in data and data["base64"]:
+            raw_bytes = base64.b64decode(data["base64"])
+        else:
+            raise ValueError(f"Keine Dateidaten im Event empfangen (keys={list(data.keys())})")
+    except Exception:
+        if temp_paths:
+            cleanup_upload_paths(*temp_paths)
+        raise
 
     return raw_bytes, filename, temp_paths
 
