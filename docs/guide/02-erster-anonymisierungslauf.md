@@ -29,12 +29,10 @@ Nach dem Laden kannst du den extrahierten Originaltext anzeigen und bei Bedarf d
 In der Seitenleiste findest du **Erkennung je Entitätstyp**. Für jede Kategorie
 gibt es vier Modi:
 
-- **Alle Quellen**: automatische KI-/ML-Erkennung, Regex beziehungsweise Bibliothek
-  sowie Glossar und manuelle Einträge;
-- **Nur ML & Regex**: automatische Erkennung ohne Berücksichtigung des Glossars;
-- **Nur Glossar & manuell**: keine automatische Erkennung, aber explizite
-  Glossareinträge und manuelle Markierungen;
-- **Aus**: die Kategorie ist vollständig deaktiviert.
+- **Alle Quellen**: Sämtliche Quellen (KI/ML inkl. GLiNER, EU-PII, Bibliotheken, Regex, Glossar und manuelle Einträge);
+- **Nur Glossar, manuell, deterministisch & EU-PII (ohne GLiNER)**: Glossar, manuelle Einträge, deterministische Bibliotheken & EU-PII, aber ohne GLiNER (für die Kernkategorien PERSON, LOCATION, ID_NUMBER, HEALTH_DATA);
+- **Nur Glossar & manuell**: keine automatische Erkennung; nur explizite Glossareinträge und manuelle Markierungen;
+- **Aus**: die Kategorie ist vollständig deaktiviert (auch Glossar- und manuelle Treffer werden ignoriert).
 
 Für den ersten Lauf kannst du die Voreinstellungen verwenden. Die optionale
 Kategorie `ROLE` ist standardmässig ausgeschaltet, weil Funktionsbezeichnungen

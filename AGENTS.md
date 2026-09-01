@@ -45,9 +45,15 @@ uv sync --extra gui --extra llm  # or pip install -e ".[gui,llm]"
   ```bash
   uv run --extra gui python app.py
   ```
+* **Optional LLM-Enabled GUI Launch:**
+  ```bash
+  uv run --extra gui --extra llm python app.py
+  ```
 * **Web Browser Fallback Mode (e.g. headless, remote, or macOS testing):**
   ```bash
   uv run --extra gui python app.py --browser
+  # Or with LLM:
+  uv run --extra gui --extra llm python app.py --browser
   ```
 * **Silent Windows Launcher (No console window):**
   ```bash

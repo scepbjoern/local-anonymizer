@@ -21,7 +21,7 @@ Für die Kernpipeline brauchst du:
 - keine Administratorrechte, sofern die lokale Geräteverwaltung die
   Installation von `uv` nicht zusätzlich einschränkt.
 
-Die Kernpipeline (GLiNER, EU-PII, Regex, Schweizer Prüfziffern) benötigt kein lokales Chat-LLM und läuft flüssig auf Standard-Laptops mit reiner CPU. Für Systeme mit dedizierter GPU steht optional ein lokaler LLM-Triage-Layer zur Verfügung.
+Die Kernpipeline (GLiNER, EU-PII, Regex, Schweizer Prüfziffern) benötigt kein lokales Chat-LLM und läuft flüssig auf Standard-Laptops mit reiner CPU. Für den optionalen lokalen LLM-Triage-Layer (Phase 6A mit ~8B-Modellen) wird für den getesteten Referenzweg eine GPU-Beschleunigung empfohlen.
 
 ## Option A: Einrichtung durch einen Programmierassistenten
 
@@ -143,7 +143,7 @@ dauern.
 
 #### Optional: Lokalen LLM-Review-Assistenten einrichten (`[llm]`)
 
-Wenn du eine dedizierte GPU besitzt und den optionalen lokalen LLM-Review-Assistenten nutzen möchtest:
+Wenn du den optionalen lokalen LLM-Review-Assistenten (beschleunigter Power-User-Pfad) nutzen möchtest:
 
 1. Installiere das Zusatzpaket:
    ```powershell
@@ -155,9 +155,15 @@ Wenn du eine dedizierte GPU besitzt und den optionalen lokalen LLM-Review-Assist
    ollama pull qwen3:8b
    ```
    *(Als Alternativen wurden auch `ministral-3:8b` und `qwen3.5:9b` getestet; `qwen3:8b` ist die Standardempfehlung).*
-4. Aktiviere in den Einstellungen der Applikation die Option **Lokale LLM-Review-Assistenz** und trage `qwen3:8b` ein.
+4. Starte die Anwendung mit aktiviertem LLM-Extra:
+   ```powershell
+   uv run --extra gui --extra llm python app.py
+   # Oder im Browser-Modus:
+   uv run --extra gui --extra llm python app.py --browser
+   ```
+5. Aktiviere in den Einstellungen der Applikation die Option **Lokale LLM-Review-Assistenz** und trage `qwen3:8b` ein.
 
-### 5. Anwendung starten
+### 5. Anwendung starten (Standard-Kernpfad)
 
 Starte die GUI mit:
 

@@ -172,7 +172,7 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 
 ### ✅ Phase 6A: Lokaler LLM-Triage-Layer (Abgeschlossen)
 * **Pydantic-v2 Schema-Vertrag (`schema.py`):** Strikte Validierung (`extra="forbid"`), Snapshot- und Revisionsbindung zur Vermeidung von Drift.
-* **Deterministisches Batching (`batching.py`):** Dynamisches Token-Budgeting, Kontext-Snippets mit Schutz vor Prompt-Injection, sequenzielle Abarbeitung.
+* **Deterministisches Batching (`batching.py`):** Dynamisches Token-Budgeting, Kontext-Snippets mit Delimiter-Abgrenzung, JSON-Escaping und Payload-Kennzeichnung zur Risikominimierung (ohne absolute Schutzgarantie; abgesichert durch strikte Schemavalidierung und menschliche Letztfreigabe), sequenzielle Abarbeitung.
 * **Lokaler Loopback-Provider (`provider.py`):** Strikte Beschränkung auf `127.0.0.1`/`localhost`, automatischer HTTP-400/422-Retry ohne `reasoning_effort`, Streaming-Größenbegrenzung (2 MB), kein Cloud-Fallback. Getestet mit Referenzmodell `qwen3:8b` via Ollama.
 * **Atomare Mutation & Rollback (`apply_service.py`):** Vorvalidierung kanonischer Entitätstypen, Auswirkungsprüfung mit unverbindlicher Vorschau, atomare Übernahme mit automatischem Rollback bei Fehlern.
 * **Human-in-the-Loop Triage-Panel (`app.py`):** Vorschlagskarten (Keep, Recategorize, Discard) mit Inline-Rollenanpassung, Vormerkung für Sammelübernahme, Auswirkungsdialog und transparenter Kennzeichnung ungeprüfter Teilantworten.

@@ -169,7 +169,7 @@ Die UI-Schalter für Entitätstypen verwenden bis zu vier Modi: `Aus` blockiert 
 │                 Batching & Token Budgeting (batching.py)                    │
 │  - Extraktion kontextueller Snippets um occ_id                              │
 │  - Dynamische Partitionierung in sequenzielle Batches (Token-Budget)        │
-│  - Adversarial Escaping (Schutz vor Prompt-Injection im Dokumententext)     │
+│  - Adversarial Escaping & Delimiter (Risikominimierung für Fremdtexte)      │
 └──────────────────────────────────────┬──────────────────────────────────────┘
                                        │
                                        ▼
