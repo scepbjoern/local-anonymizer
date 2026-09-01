@@ -280,11 +280,14 @@ def rebind_overrides_after_analysis(
     raw_text: str,
     results: List[Any],
     current_overrides: Dict[str, OccurrenceOverride],
+    existing_groups: Optional[List[EntityGroup]] = None,
 ) -> Tuple[List[EntityGroup], Dict[str, OccurrenceOverride]]:
     """
     Rebind occurrence overrides fail-safely after an analysis run.
 
     1. Builds base EntityGroup instances and occurrences with fresh occ_id and context_fingerprint.
+       Preserves user customizations (role, custom type, enabled, surface_tag, parent_group_id)
+       on base groups if they existed prior to re-analysis.
     2. Re-attaches overrides only on strict 1:1 match of context_fingerprint and exact original_text.
     3. Reconstructs target_group_id split EntityGroups with expected_original_text.
     4. Discards ambiguous (1:N, N:1, N:M), mismatched, invalid target_id, base-collision,
@@ -293,6 +296,12 @@ def rebind_overrides_after_analysis(
     Returns:
         (entity_groups, new_occurrence_overrides)
     """
+    existing_base_map: Dict[str, EntityGroup] = {}
+    if existing_groups:
+        for g in existing_groups:
+            if g.group_id == g.text_key:
+                existing_base_map[g.group_id] = g
+
     base_groups_dict: Dict[str, EntityGroup] = {}
     all_new_occurrences: List[Tuple[EntityOccurrence, str, str]] = []
 
@@ -318,7 +327,20 @@ def rebind_overrides_after_analysis(
             context_fingerprint=fingerprint,
         )
         if key not in base_groups_dict:
-            base_groups_dict[key] = EntityGroup(original_text=norm, entity_type=res.entity_type, group_id=key)
+            if key in existing_base_map:
+                prev = existing_base_map[key]
+                base_grp = EntityGroup(
+                    original_text=norm,
+                    entity_type=prev.entity_type or res.entity_type,
+                    group_id=key,
+                )
+                base_grp.role = prev.role
+                base_grp.enabled = prev.enabled
+                base_grp.surface_tag = prev.surface_tag
+                base_grp.parent_group_id = prev.parent_group_id
+            else:
+                base_grp = EntityGroup(original_text=norm, entity_type=res.entity_type, group_id=key)
+            base_groups_dict[key] = base_grp
         base_groups_dict[key].occurrences.append(occ)
         all_new_occurrences.append((occ, orig, res.entity_type))
 
@@ -399,6 +421,14 @@ def rebind_overrides_after_analysis(
 
     active_base_groups = [g for g in base_groups_dict.values() if g.occurrences]
     final_entity_groups = active_base_groups + list(split_groups_dict.values())
+
+    # Fail-safe cleanup of parent_group_id if referenced target group no longer exists
+    active_group_ids = {g.group_id for g in final_entity_groups}
+    for g in final_entity_groups:
+        if g.parent_group_id and g.parent_group_id not in active_group_ids:
+            g.parent_group_id = None
+            g.surface_tag = ""
+
     return final_entity_groups, new_overrides
 
 
@@ -1678,6 +1708,7 @@ def create_ui():
                 state.raw_text,
                 results,
                 state.occurrence_overrides,
+                existing_groups=state.entity_groups,
             )
 
             # Step 4: Smart-Linking proposals

@@ -595,3 +595,94 @@ def test_placeholder_modes_with_homonyms_and_collision():
     _, map3, _ = compute_reactive_preview(st)
     assert "[PERSON_1_CHEF]" in map3
     assert "[PERSON_2_CHEF]" in map3
+
+
+def test_rebind_overrides_preserves_base_group_role_and_split_role():
+    """
+    Verify that upon re-analysis, user-assigned roles on base groups (e.g. 'Vater')
+    and split groups (e.g. 'Sohn') are both preserved.
+    """
+    st = AppState()
+    st.raw_text = "Dr. Thomas Müller forscht. Sein Sohn Thomas Müller hilft. Thomas Müller genehmigt."
+    st.format_mode = "numbered_role"
+
+    idx1 = st.raw_text.find("Thomas Müller")
+    idx2 = st.raw_text.find("Thomas Müller", idx1 + 1)
+    idx3 = st.raw_text.find("Thomas Müller", idx2 + 1)
+
+    occ1 = EntityOccurrence(
+        start=idx1,
+        end=idx1 + len("Thomas Müller"),
+        score=0.95,
+        context_html="",
+        needs_review=False,
+        occ_id="occ_1",
+        context_fingerprint=compute_context_fingerprint(st.raw_text, idx1, idx1 + len("Thomas Müller")),
+    )
+    occ2 = EntityOccurrence(
+        start=idx2,
+        end=idx2 + len("Thomas Müller"),
+        score=0.95,
+        context_html="",
+        needs_review=False,
+        occ_id="occ_2",
+        context_fingerprint=compute_context_fingerprint(st.raw_text, idx2, idx2 + len("Thomas Müller")),
+    )
+    occ3 = EntityOccurrence(
+        start=idx3,
+        end=idx3 + len("Thomas Müller"),
+        score=0.95,
+        context_html="",
+        needs_review=False,
+        occ_id="occ_3",
+        context_fingerprint=compute_context_fingerprint(st.raw_text, idx3, idx3 + len("Thomas Müller")),
+    )
+
+    base_grp = EntityGroup(original_text="Thomas Müller", entity_type="PERSON", group_id="thomas müller")
+    base_grp.role = "Vater"
+    base_grp.occurrences = [occ1, occ2, occ3]
+    st.entity_groups = [base_grp]
+
+    # Split occurrence 2 (Sohn)
+    split_grp = split_occurrence_to_new_group(st, base_grp, occ2)
+    split_grp.role = "Sohn"
+    sync_group_overrides(st, split_grp)
+
+    # Pre-check: 2 groups exist (Vater with 2 occs, Sohn with 1 occ)
+    assert base_grp.role == "Vater"
+    assert split_grp.role == "Sohn"
+
+    # Simulate re-analysis
+    results = [
+        MockRecognizerResult(start=idx1, end=idx1 + len("Thomas Müller"), entity_type="PERSON", score=0.95),
+        MockRecognizerResult(start=idx2, end=idx2 + len("Thomas Müller"), entity_type="PERSON", score=0.95),
+        MockRecognizerResult(start=idx3, end=idx3 + len("Thomas Müller"), entity_type="PERSON", score=0.95),
+    ]
+
+    rebound_groups, rebound_overrides = rebind_overrides_after_analysis(
+        st.raw_text,
+        results,
+        st.occurrence_overrides,
+        existing_groups=st.entity_groups,
+    )
+
+    st.entity_groups = rebound_groups
+    st.occurrence_overrides = rebound_overrides
+
+    # Verify both roles are preserved after re-analysis
+    base_after = next((g for g in st.entity_groups if g.group_id == "thomas müller"), None)
+    split_after = next((g for g in st.entity_groups if g.group_id == split_grp.group_id), None)
+
+    assert base_after is not None
+    assert base_after.role == "Vater"
+    assert len(base_after.occurrences) == 2
+
+    assert split_after is not None
+    assert split_after.role == "Sohn"
+    assert len(split_after.occurrences) == 1
+
+    anon_text, mapping, report = compute_reactive_preview(st)
+    assert "[PERSON_1_VATER]" in mapping
+    assert "[PERSON_2_SOHN]" in mapping
+    assert mapping["[PERSON_1_VATER]"] == "Thomas Müller"
+    assert mapping["[PERSON_2_SOHN]"] == "Thomas Müller"
