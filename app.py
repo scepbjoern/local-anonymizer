@@ -132,6 +132,92 @@ async def api_upload(file: UploadFile = File(...)):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+def validate_and_resolve_upload_paths(file_id: Any, upload_dir: Path = UPLOAD_DIR) -> Optional[Tuple[Path, Path]]:
+    """
+    Strictly validate that file_id is a valid UUID string and return the canonical (bin_path, meta_path)
+    located directly within upload_dir.
+    Returns None if file_id is missing, invalid, or contains path traversal attempts.
+    """
+    if not file_id or not isinstance(file_id, str):
+        return None
+    file_id_str = file_id.strip()
+    try:
+        val = uuid.UUID(file_id_str)
+        canonical_id = str(val)
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+    resolved_upload_dir = upload_dir.resolve()
+    bin_path = (resolved_upload_dir / f"{canonical_id}.bin").resolve()
+    meta_path = (resolved_upload_dir / f"{canonical_id}.json").resolve()
+
+    # Defense-in-depth: Verify paths reside directly inside resolved_upload_dir
+    if bin_path.parent != resolved_upload_dir or meta_path.parent != resolved_upload_dir:
+        return None
+
+    return bin_path, meta_path
+
+
+def cleanup_upload_paths(bin_path: Optional[Path], meta_path: Optional[Path]) -> None:
+    """Safely delete uploaded temporary files immediately."""
+    if bin_path is not None:
+        try:
+            bin_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    if meta_path is not None:
+        try:
+            meta_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def extract_upload_payload(
+    data: Any,
+    upload_dir: Path = UPLOAD_DIR,
+) -> Tuple[Optional[bytes], str, Optional[Tuple[Path, Path]]]:
+    """
+    Extract raw_bytes and filename from an upload event payload (dict).
+    Validates file_id as strict UUID and resolves temp paths under upload_dir.
+    Returns (raw_bytes, filename, temp_paths_tuple_or_None).
+    Raises ValueError if data is invalid or cannot be decoded.
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"Ungültige Eventdaten: {type(data)}")
+
+    filename = data.get("name") or "dokument"
+    filepath = data.get("path", "")
+    file_id = data.get("file_id", "")
+
+    temp_paths: Optional[Tuple[Path, Path]] = None
+    if file_id:
+        temp_paths = validate_and_resolve_upload_paths(file_id, upload_dir=upload_dir)
+        if temp_paths is None:
+            raise ValueError(f"Ungültige oder unzulässige file_id: {file_id}")
+
+    bin_path, meta_path = temp_paths if temp_paths else (None, None)
+    raw_bytes: Optional[bytes] = None
+
+    if bin_path:
+        if not bin_path.exists():
+            raise ValueError(f"Upload-Datei {bin_path.name} existiert nicht.")
+        raw_bytes = bin_path.read_bytes()
+        if meta_path and meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                filename = meta.get("filename") or filename
+            except Exception:
+                pass
+    elif filepath and Path(filepath).is_file():
+        raw_bytes = safe_read_bytes(filepath)
+    elif "base64" in data and data["base64"]:
+        raw_bytes = base64.b64decode(data["base64"])
+    else:
+        raise ValueError(f"Keine Dateidaten im Event empfangen (keys={list(data.keys())})")
+
+    return raw_bytes, filename, temp_paths
+
+
 import hashlib
 
 # --- Data Models for Grouped Review ---
@@ -3318,50 +3404,24 @@ def create_ui(client: Optional[Client] = None):
 
                         # Drop handler via HTTP streaming / path / base64
                         async def on_file_dropped(e):
-                            if not check_mutation_allowed():
-                                return
                             data = e.args
                             logging.info(f"on_file_dropped received: {type(data)} -> {data}")
-                            filename = data.get("name", "dokument")
-                            filepath = data.get("path", "")
-                            file_id = data.get("file_id", "")
-                            bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
-                            meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
+                            temp_paths = None
                             try:
-                                if bin_path and bin_path.exists():
-                                    raw_bytes = bin_path.read_bytes()
-                                    if meta_path and meta_path.exists():
-                                        try:
-                                            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                                            filename = meta.get("filename") or filename
-                                        except Exception:
-                                            pass
-                                elif filepath and Path(filepath).is_file():
-                                    raw_bytes = safe_read_bytes(filepath)
-                                elif "base64" in data and data["base64"]:
-                                    raw_bytes = base64.b64decode(data["base64"])
-                                else:
-                                    exists = bin_path.exists() if bin_path else False
-                                    raise ValueError(f"Keine Dateidaten empfangen (file_id={file_id}, exists={exists}, keys={list(data.keys()) if isinstance(data, dict) else data})")
-
+                                raw_bytes, filename, temp_paths = extract_upload_payload(data, UPLOAD_DIR)
+                                if not check_mutation_allowed():
+                                    return
                                 await extract_and_load_file_bytes(raw_bytes, filename)
                             except Exception as ex:
                                 err_msg = f"{type(ex).__name__}: {str(ex)}"
                                 logging.error(f"Drop error: {err_msg}", exc_info=True)
                                 ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
                             finally:
-                                if bin_path:
-                                    try:
-                                        bin_path.unlink(missing_ok=True)
-                                    except Exception:
-                                        pass
-                                if meta_path:
-                                    try:
-                                        meta_path.unlink(missing_ok=True)
-                                    except Exception:
-                                        pass
+                                if temp_paths:
+                                    cleanup_upload_paths(*temp_paths)
 
                         ui.on("file_dropped", on_file_dropped)
+                        state.register_mutating_element(dropzone_card, "workspace")
 
                         # Hook HTML5 drag events with HTTP streaming upload
                         ui.add_body_html(f"""
@@ -3725,45 +3785,19 @@ def create_ui(client: Optional[Client] = None):
                                     ui.notify(f"Fehler beim Laden: {str(ex)}", type="negative")
 
                             async def on_restore_file_dropped(e):
-                                if not check_mutation_allowed():
-                                    return
                                 data = e.args
-                                filename = data.get("name", "dokument")
-                                filepath = data.get("path", "")
-                                file_id = data.get("file_id", "")
-                                bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
-                                meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
+                                temp_paths = None
                                 try:
-                                    if bin_path and bin_path.exists():
-                                        raw_bytes = bin_path.read_bytes()
-                                        if meta_path and meta_path.exists():
-                                            try:
-                                                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                                                filename = meta.get("filename") or filename
-                                            except Exception:
-                                                pass
-                                    elif filepath and Path(filepath).is_file():
-                                        raw_bytes = safe_read_bytes(filepath)
-                                    elif "base64" in data and data["base64"]:
-                                        raw_bytes = base64.b64decode(data["base64"])
-                                    else:
-                                        exists = bin_path.exists() if bin_path else False
-                                        raise ValueError(f"Keine Dateidaten empfangen (file_id={file_id}, exists={exists}, keys={list(data.keys()) if isinstance(data, dict) else data})")
+                                    raw_bytes, filename, temp_paths = extract_upload_payload(data, UPLOAD_DIR)
+                                    if not check_mutation_allowed():
+                                        return
                                     text = await asyncio.to_thread(read_document_from_bytes, raw_bytes, filename)
                                     load_restore_text(text, filename)
                                 except Exception as ex:
                                     ui.notify(f"Fehler beim Laden: {type(ex).__name__}: {str(ex)}", type="negative", timeout=15000)
                                 finally:
-                                    if bin_path:
-                                        try:
-                                            bin_path.unlink(missing_ok=True)
-                                        except Exception:
-                                            pass
-                                    if meta_path:
-                                        try:
-                                            meta_path.unlink(missing_ok=True)
-                                        except Exception:
-                                            pass
+                                    if temp_paths:
+                                        cleanup_upload_paths(*temp_paths)
 
                             with ui.card().classes(
                                 "w-full py-4 px-3 bg-slate-50 hover:bg-slate-100 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-2 select-none"
@@ -3776,6 +3810,7 @@ def create_ui(client: Optional[Client] = None):
                                 ui.label(".docx · .pdf · .txt · .md").classes("text-[11px] text-slate-400 pointer-events-none")
                                 restore_drop_card.on("click", open_restore_file_dialog)
                                 ui.on("restore_file_dropped", on_restore_file_dropped)
+                                state.register_mutating_element(restore_drop_card, "workspace")
 
                             ui.add_body_html(f"""
                             <script>
@@ -3874,44 +3909,18 @@ def create_ui(client: Optional[Client] = None):
                                     ui.notify(f"Ungültige JSON-Mapping-Datei: {str(ex)}", type="negative")
 
                             async def on_mapping_file_dropped(e):
-                                if not check_mutation_allowed():
-                                    return
                                 data = e.args
-                                filename = data.get("name", "mapping.json")
-                                filepath = data.get("path", "")
-                                file_id = data.get("file_id", "")
-                                bin_path = UPLOAD_DIR / f"{file_id}.bin" if file_id else None
-                                meta_path = UPLOAD_DIR / f"{file_id}.json" if file_id else None
+                                temp_paths = None
                                 try:
-                                    if bin_path and bin_path.exists():
-                                        raw_bytes = bin_path.read_bytes()
-                                        if meta_path and meta_path.exists():
-                                            try:
-                                                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                                                filename = meta.get("filename") or filename
-                                            except Exception:
-                                                pass
-                                    elif filepath and Path(filepath).is_file():
-                                        raw_bytes = safe_read_bytes(filepath)
-                                    elif "base64" in data and data["base64"]:
-                                        raw_bytes = base64.b64decode(data["base64"])
-                                    else:
-                                        exists = bin_path.exists() if bin_path else False
-                                        raise ValueError(f"Keine Dateidaten empfangen (file_id={file_id}, exists={exists}, keys={list(data.keys()) if isinstance(data, dict) else data})")
+                                    raw_bytes, filename, temp_paths = extract_upload_payload(data, UPLOAD_DIR)
+                                    if not check_mutation_allowed():
+                                        return
                                     load_mapping_data(json.loads(raw_bytes.decode("utf-8")))
                                 except Exception as ex:
                                     ui.notify(f"Fehler beim Laden: {str(ex)}", type="negative", timeout=15000)
                                 finally:
-                                    if bin_path:
-                                        try:
-                                            bin_path.unlink(missing_ok=True)
-                                        except Exception:
-                                            pass
-                                    if meta_path:
-                                        try:
-                                            meta_path.unlink(missing_ok=True)
-                                        except Exception:
-                                            pass
+                                    if temp_paths:
+                                        cleanup_upload_paths(*temp_paths)
 
                             with ui.card().classes(
                                 "w-full py-4 px-3 bg-slate-50 hover:bg-slate-100 border-2 border-dashed border-blue-300 hover:border-blue-500 rounded-xl flex flex-col items-center justify-center text-center cursor-pointer shadow-none transition-all duration-150 mb-2 select-none"
@@ -3927,6 +3936,7 @@ def create_ui(client: Optional[Client] = None):
                                     ui.label("mapping.json ablegen oder klicken").classes("text-[11px] text-slate-400 pointer-events-none")
                                 mapping_drop_card.on("click", open_mapping_file_dialog)
                                 ui.on("mapping_file_dropped", on_mapping_file_dropped)
+                                state.register_mutating_element(mapping_drop_card, "workspace")
 
                             ui.add_body_html(f"""
                             <script>
