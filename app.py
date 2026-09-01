@@ -2382,7 +2382,7 @@ def create_ui(client: Optional[Client] = None):
                     target_badge = ui.badge(
                         compute_card_target_placeholder(current_suggestion),
                         color="indigo-8",
-                    ).props("dense").classes("font-mono text-xs font-bold").tooltip("Vorschau des finalen Platzhalters")
+                    ).props("dense").classes("font-mono text-xs font-bold").tooltip("Unverbindliche Kategorie-/Deskriptorvorschau (Nummerierung wird bei Übernahme ermittelt)")
 
                     # Inline editable input for descriptor/role
                     def on_role_edit(e):
@@ -2548,7 +2548,7 @@ def create_ui(client: Optional[Client] = None):
                             if not has_entities:
                                 triage_start_btn.tooltip("Führen Sie zuerst eine Textanalyse durch, um Fundstellen zu ermitteln.")
                             elif not has_model:
-                                triage_start_btn.tooltip("Geben Sie in der Seitenleiste einen Modellnamen an (z. B. phi4:latest).")
+                                triage_start_btn.tooltip("Geben Sie in der Seitenleiste einen Modellnamen an (z. B. qwen3:8b).")
 
                 if state.is_llm_running:
                     with ui.column().classes("w-full mt-2"):
@@ -2624,7 +2624,7 @@ def create_ui(client: Optional[Client] = None):
             return
 
         if not state.config.llm_model_name or not state.config.llm_model_name.strip():
-            ui.notify("Bitte geben Sie einen Modellnamen in den LLM-Einstellungen an (z. B. phi4:latest).", type="warning")
+            ui.notify("Bitte geben Sie einen Modellnamen in den LLM-Einstellungen an (z. B. qwen3:8b).", type="warning")
             return
 
         if not state.raw_text or not state.entity_groups:

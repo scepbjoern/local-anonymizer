@@ -61,6 +61,6 @@
   },
   "llm_enabled": false,
   "llm_base_url": "http://127.0.0.1:11434/v1",
-  "llm_model_name": "phi4:latest",
+  "llm_model_name": "qwen3:8b",
   "llm_auto_review": true
 }
