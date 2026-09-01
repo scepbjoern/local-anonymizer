@@ -2,7 +2,7 @@ import asyncio
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from app import EntityGroup, EntityOccurrence, AppState, reset_app_state
+from app import EntityGroup, EntityOccurrence, AppState, reset_app_state, reset_app_state_async
 from local_anonymizer.llm.schema import TriageEnvelope, TriageKeepItem, TriageRecategorizeItem
 from local_anonymizer.llm.provider import LocalApiProvider
 from local_anonymizer.llm.batching import prepare_triage_batches
@@ -35,76 +35,97 @@ def test_app_state_llm_fields_and_reset():
 
 
 @pytest.mark.asyncio
-async def test_late_response_discarded_on_snapshot_drift():
-    # Simulate a running LLM batch loop where snapshot changes during await generate()
+async def test_late_response_discarded_on_snapshot_drift_multi_batch():
+    # 3 batches: batch 1 succeeds, batch 2 experiences drift -> batch 2 and 3 marked unprocessed
     st = AppState()
-    st.raw_text = "Dr. Müller arbeitet bei Siemens in Berlin."
+    st.raw_text = "Dr. Müller und Dr. Schmidt und Dr. Weber."
     st.document_revision = 1
     st.analysis_revision = 1
     g1 = EntityGroup("Dr. Müller", "PERSON")
     g1.occurrences = [
-        EntityOccurrence(
-            start=0,
-            end=10,
-            score=0.9,
-            context_html="<b>Dr. Müller</b> arbeitet...",
-            needs_review=False,
-            method="spacy",
-            occ_id="occ-1",
-        )
+        EntityOccurrence(start=0, end=10, score=0.9, context_html="Dr. Müller", needs_review=False, method="spacy", occ_id="occ-1"),
+        EntityOccurrence(start=15, end=26, score=0.9, context_html="Dr. Schmidt", needs_review=False, method="spacy", occ_id="occ-2"),
+        EntityOccurrence(start=31, end=40, score=0.9, context_html="Dr. Weber", needs_review=False, method="spacy", occ_id="occ-3"),
     ]
     st.entity_groups = [g1]
 
     snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
-    candidates = [{
-        "occ_id": "occ-1",
-        "original_text": "Dr. Müller",
-        "entity_type": "PERSON",
-        "role": "",
-        "context_snippet": "Dr. Müller arbeitet...",
-    }]
-    batches = prepare_triage_batches(candidates, st.document_revision, snap)
-    assert len(batches) == 1
+    candidates = [
+        {"occ_id": "occ-1", "original_text": "Dr. Müller", "entity_type": "PERSON", "role": "", "context_snippet": "Dr. Müller"},
+        {"occ_id": "occ-2", "original_text": "Dr. Schmidt", "entity_type": "PERSON", "role": "", "context_snippet": "Dr. Schmidt"},
+        {"occ_id": "occ-3", "original_text": "Dr. Weber", "entity_type": "PERSON", "role": "", "context_snippet": "Dr. Weber"},
+    ]
+    batches = prepare_triage_batches(candidates, st.document_revision, snap, max_items_per_batch=1)
+    assert len(batches) == 3
 
-    # While provider is "thinking", user changes text or document_revision
-    async def delayed_generate(prompt, system_prompt):
-        # Simulate user mutation in parallel
-        st.raw_text = "Dr. Müller hat gekündigt."
-        st.document_revision += 1
-        return json.dumps({
-            "schema_version": "1.0",
-            "request_id": batches[0].request_id,
-            "document_revision": 1,
-            "document_hash": snap,
-            "items": [
-                {"occ_id": "occ-1", "action": "keep", "confidence": "high"}
-            ]
-        })
+    async def generate_mock(prompt, system_prompt):
+        if "occ-2" in prompt:
+            # Simulate drift during batch 2
+            st.raw_text = "Dr. Müller und jemand anderes."
+            st.document_revision += 1
+            return json.dumps({
+                "schema_version": "1.0",
+                "request_id": batches[1].request_id,
+                "document_revision": 1,
+                "document_hash": snap,
+                "items": [{"occ_id": "occ-2", "action": "keep", "confidence": "high"}]
+            })
+        elif "occ-1" in prompt:
+            return json.dumps({
+                "schema_version": "1.0",
+                "request_id": batches[0].request_id,
+                "document_revision": 1,
+                "document_hash": snap,
+                "items": [{"occ_id": "occ-1", "action": "keep", "confidence": "high"}]
+            })
+        else:
+            return json.dumps({
+                "schema_version": "1.0",
+                "request_id": batches[2].request_id,
+                "document_revision": 1,
+                "document_hash": snap,
+                "items": [{"occ_id": "occ-3", "action": "keep", "confidence": "high"}]
+            })
 
     mock_provider = MagicMock(spec=LocalApiProvider)
-    mock_provider.generate = AsyncMock(side_effect=delayed_generate)
+    mock_provider.generate = AsyncMock(side_effect=generate_mock)
     st.llm_provider = mock_provider
     st.is_llm_running = True
     st.llm_triage_snapshot = snap
 
-    # Run batch iteration simulating run_llm_triage loop
-    for b in batches:
-        raw_json = await st.llm_provider.generate(b.user_prompt, b.system_prompt)
-        post_snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
-        if post_snap != snap or st.document_revision != b.document_revision:
-            # Must discard stale batch
+    # Execute batch loop matching production logic in launch_llm_triage
+    for batch_idx, b in enumerate(batches):
+        pre_snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+        if pre_snap != snap or st.document_revision != b.document_revision:
             st.llm_partial_failure = True
-            st.llm_unprocessed_occ_ids.update(b.occ_id_set)
+            for rem in batches[batch_idx:]:
+                st.llm_unprocessed_occ_ids.update(rem.occ_id_set)
             break
 
-    # Results must NOT be committed
-    assert "occ-1" not in st.llm_triage_results
+        raw_json = await st.llm_provider.generate(b.user_prompt, b.system_prompt)
+
+        post_snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+        if post_snap != snap or st.document_revision != b.document_revision:
+            st.llm_partial_failure = True
+            for rem in batches[batch_idx:]:
+                st.llm_unprocessed_occ_ids.update(rem.occ_id_set)
+            break
+
+        data = json.loads(raw_json)
+        for item in data.get("items", []):
+            st.llm_triage_results[item["occ_id"]] = item
+
+    # Batch 1 was processed and saved
+    assert "occ-1" in st.llm_triage_results
+    # Batches 2 and 3 were marked unprocessed
+    assert "occ-2" not in st.llm_triage_results
+    assert "occ-3" not in st.llm_triage_results
     assert st.llm_partial_failure is True
-    assert "occ-1" in st.llm_unprocessed_occ_ids
+    assert st.llm_unprocessed_occ_ids == {"occ-2", "occ-3"}
 
 
 @pytest.mark.asyncio
-async def test_reset_cancels_active_llm_task():
+async def test_reset_app_state_async_lifecycle():
     st = AppState()
 
     async def long_running():
@@ -115,16 +136,19 @@ async def test_reset_cancels_active_llm_task():
 
     task = asyncio.create_task(long_running())
     st.llm_active_task = task
-    assert not task.done()
 
-    reset_app_state(st)
-    assert task.cancelling() > 0 or task.cancelled()
-    await asyncio.sleep(0.01)
+    mock_provider = MagicMock(spec=LocalApiProvider)
+    mock_provider.close = AsyncMock()
+    st.llm_provider = mock_provider
+
+    await reset_app_state_async(st)
     assert task.done()
+    assert mock_provider.close.called
+    assert st.llm_provider is None
+    assert st.llm_active_task is None
 
 
 def test_optional_llm_extra_isolation():
-    # Verify that schema and apply_service imports work cleanly
     from local_anonymizer.llm.schema import TriageEnvelope
     from local_anonymizer.llm.apply_service import compute_triage_snapshot
     assert TriageEnvelope is not None

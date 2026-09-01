@@ -18,7 +18,15 @@ from local_anonymizer.llm.schema import (
 )
 from local_anonymizer.llm.provider import LlmProvider, LocalApiProvider
 from local_anonymizer.llm.batching import TriageBatch, prepare_triage_batches
-from local_anonymizer.llm.apply_service import ApplyCommand, ApplyService
+from local_anonymizer.llm.apply_service import (
+    ApplyCommand,
+    ApplyService,
+    compute_triage_snapshot,
+    normalize_entity_type,
+    check_mutation_allowed,
+    CANONICAL_APP_ENTITY_TYPES,
+    ENTITY_TYPE_ALIASES,
+)
 
 __all__ = [
     "TriageAction",
@@ -35,4 +43,9 @@ __all__ = [
     "prepare_triage_batches",
     "ApplyCommand",
     "ApplyService",
+    "compute_triage_snapshot",
+    "normalize_entity_type",
+    "check_mutation_allowed",
+    "CANONICAL_APP_ENTITY_TYPES",
+    "ENTITY_TYPE_ALIASES",
 ]

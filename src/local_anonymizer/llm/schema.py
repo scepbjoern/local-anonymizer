@@ -60,7 +60,7 @@ def validate_batch_response(
     expected_occ_ids: Set[str],
     expected_doc_rev: int,
     expected_doc_hash: str,
-    expected_request_id: Optional[str] = None,
+    expected_request_id: str,
 ) -> None:
     """
     Perform strict atomic verification of a batch response envelope against expectations.
@@ -69,7 +69,7 @@ def validate_batch_response(
     if envelope.schema_version != "1.0":
         raise ValueError(f"Schema version mismatch: expected '1.0', got '{envelope.schema_version}'")
 
-    if expected_request_id and envelope.request_id != expected_request_id:
+    if envelope.request_id != expected_request_id:
         raise ValueError(f"Request ID mismatch: expected '{expected_request_id}', got '{envelope.request_id}'")
 
     if envelope.document_revision != expected_doc_rev:

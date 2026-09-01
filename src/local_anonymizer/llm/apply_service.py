@@ -4,35 +4,63 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 
 
-CANONICAL_ENTITY_TYPES: Set[str] = {
+CANONICAL_APP_ENTITY_TYPES: Set[str] = {
     "PERSON",
-    "PER",
     "ORGANIZATION",
-    "ORG",
-    "LOCATION",
-    "LOC",
-    "GPE",
-    "MISC",
     "EMAIL_ADDRESS",
     "PHONE_NUMBER",
+    "LOCATION",
+    "DATE_TIME",
     "IBAN_CODE",
-    "ID_NUMBER",
     "CREDIT_CARD",
     "BANK_ACCOUNT",
-    "IP_ADDRESS",
-    "USERNAME",
-    "URL",
-    "HEALTH_DATA",
+    "ID_NUMBER",
     "FINANCIAL_DATA",
+    "HEALTH_DATA",
+    "IP_ADDRESS",
+    "MAC_ADDRESS",
+    "URL",
+    "USERNAME",
+    "CRYPTO",
+    "MEDICAL_LICENSE",
     "ADDRESS",
     "AHV_NUMBER",
     "UID_NUMBER",
     "IT_SYSTEM",
     "ROLE",
-    "DATE_TIME",
-    "DATE",
-    "TIME",
 }
+
+ENTITY_TYPE_ALIASES: Dict[str, str] = {
+    "ORG": "ORGANIZATION",
+    "PER": "PERSON",
+    "LOC": "LOCATION",
+    "GPE": "LOCATION",
+    "DATE": "DATE_TIME",
+    "TIME": "DATE_TIME",
+}
+
+
+def normalize_entity_type(raw_type: Optional[str]) -> Optional[str]:
+    """
+    Normalize model/provider entity types to canonical application types.
+    Maps aliases like ORG -> ORGANIZATION, LOC -> LOCATION, PER -> PERSON.
+    Returns canonical type string or None if unrecognized/unsupported.
+    """
+    if not raw_type or not isinstance(raw_type, str):
+        return None
+    cleaned = raw_type.strip().upper()
+    if cleaned in CANONICAL_APP_ENTITY_TYPES:
+        return cleaned
+    if cleaned in ENTITY_TYPE_ALIASES:
+        return ENTITY_TYPE_ALIASES[cleaned]
+    return None
+
+
+def check_mutation_allowed(state: Any) -> bool:
+    """Central guard against mutating state while LLM triage is running."""
+    if getattr(state, "is_llm_running", False):
+        return False
+    return True
 
 
 @dataclass
@@ -127,8 +155,10 @@ class ApplyService:
                 return False, f"Doppelter Befehl für Fundstelle {cmd.occ_id}.", []
             seen_occ_ids.add(cmd.occ_id)
 
+            norm_type: Optional[str] = None
             if cmd.action == "recategorize":
-                if not cmd.new_entity_type or cmd.new_entity_type.upper() not in CANONICAL_ENTITY_TYPES:
+                norm_type = normalize_entity_type(cmd.new_entity_type)
+                if not norm_type:
                     return (
                         False,
                         f"Ungültiger Entitätstyp '{cmd.new_entity_type}' für Fundstelle {cmd.occ_id} vorgeschlagen.",
@@ -141,7 +171,7 @@ class ApplyService:
 
             will_split = len(grp.occurrences) > 1
             old_type = grp.entity_type
-            new_type = cmd.new_entity_type.upper() if (cmd.action == "recategorize" and cmd.new_entity_type) else grp.entity_type
+            new_type = norm_type if (cmd.action == "recategorize" and norm_type) else grp.entity_type
             old_role = grp.role
             new_role = cmd.descriptor_suggestion if cmd.descriptor_suggestion is not None else grp.role
             old_enabled = grp.enabled
@@ -190,12 +220,12 @@ class ApplyService:
             except Exception:
                 pass
 
-        # Create deep transaction snapshot of state before mutations
+        # Create defensive deep transaction snapshot of state before mutations
         saved_groups = copy.deepcopy(getattr(state, "entity_groups", []))
         saved_overrides = copy.deepcopy(getattr(state, "occurrence_overrides", {}))
         saved_mapping = copy.deepcopy(getattr(state, "current_mapping", {}))
         saved_anon_text = getattr(state, "current_anon_text", "")
-        saved_report = getattr(state, "current_report", "")
+        saved_report = copy.deepcopy(getattr(state, "current_report", {}))
         saved_preview_rev = getattr(state, "preview_revision", 0)
         saved_llm_results = copy.deepcopy(getattr(state, "llm_triage_results", {}))
         saved_llm_snapshot = getattr(state, "llm_triage_snapshot", "")
@@ -218,8 +248,10 @@ class ApplyService:
                 if cmd.action == "discard":
                     target_group.enabled = False
                 elif cmd.action == "recategorize":
-                    if cmd.new_entity_type:
-                        target_group.entity_type = cmd.new_entity_type.upper()
+                    norm_type = normalize_entity_type(cmd.new_entity_type)
+                    if not norm_type:
+                        raise ValueError(f"Ungültiger Entitätstyp '{cmd.new_entity_type}' für Fundstelle {cmd.occ_id}.")
+                    target_group.entity_type = norm_type
                     if cmd.descriptor_suggestion is not None:
                         target_group.role = cmd.descriptor_suggestion
                     target_group.enabled = True

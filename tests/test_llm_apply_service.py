@@ -5,7 +5,9 @@ from local_anonymizer.llm.apply_service import (
     ApplyCommand,
     ApplyService,
     compute_triage_snapshot,
-    CANONICAL_ENTITY_TYPES,
+    CANONICAL_APP_ENTITY_TYPES,
+    normalize_entity_type,
+    check_mutation_allowed,
 )
 
 
@@ -23,6 +25,27 @@ class MockState:
         self.llm_triage_results = {"occ-1": "res1", "occ-2": "res2"}
         self.llm_triage_snapshot = ""
         self.llm_staged_selections = {"occ-1", "occ-2"}
+        self.is_llm_running = False
+
+
+def test_normalize_entity_type():
+    assert normalize_entity_type("ORGANIZATION") == "ORGANIZATION"
+    assert normalize_entity_type("org") == "ORGANIZATION"
+    assert normalize_entity_type("PER") == "PERSON"
+    assert normalize_entity_type("person") == "PERSON"
+    assert normalize_entity_type("LOC") == "LOCATION"
+    assert normalize_entity_type("GPE") == "LOCATION"
+    assert normalize_entity_type("DATE") == "DATE_TIME"
+    assert normalize_entity_type("TIME") == "DATE_TIME"
+    assert normalize_entity_type("UNKNOWN_XYZ") is None
+    assert normalize_entity_type("MISC") is None
+
+
+def test_check_mutation_allowed():
+    st = MockState("text", [])
+    assert check_mutation_allowed(st) is True
+    st.is_llm_running = True
+    assert check_mutation_allowed(st) is False
 
 
 def test_compute_triage_snapshot_deterministic():
@@ -56,7 +79,7 @@ def test_prevalidate_and_preview_impact_valid_and_canonical_types():
     assert err == ""
     assert len(impacts) == 2
     assert impacts[0]["will_split"] is True
-    assert impacts[0]["new_type"] == "ORG"
+    assert impacts[0]["new_type"] == "ORGANIZATION"
     assert impacts[0]["new_role"] == "Firma"
     assert impacts[1]["action"] == "discard"
 
@@ -198,7 +221,7 @@ def test_apply_mutations_successful_execution():
 
     assert success is True
     assert "1 Änderungen erfolgreich übernommen" in msg
-    assert st.entity_groups[0].entity_type == "ORG"
+    assert st.entity_groups[0].entity_type == "ORGANIZATION"
     assert st.entity_groups[0].role == "Firma"
     assert st.preview_revision == 2
     # occ-1 was removed from staged selections and triage results

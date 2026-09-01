@@ -116,47 +116,50 @@ def prepare_triage_batches(
     """
     Split a list of candidate occurrences into token-budgeted sequential batches.
     Each batch receives an exact set of occ_ids and strict envelope bindings.
+    Guarantees that estimate_tokens(system_prompt) + estimate_tokens(user_prompt) <= max_tokens_per_batch.
     """
     if not candidates:
         return []
 
-    system_tokens = estimate_tokens(SYSTEM_TRIAGE_PROMPT)
-    base_envelope_tokens = 150  # overhead for JSON structure
-    available_batch_tokens = max(500, max_tokens_per_batch - system_tokens - base_envelope_tokens)
+    if max_tokens_per_batch < 150:
+        raise ValueError(f"max_tokens_per_batch ({max_tokens_per_batch}) ist zu klein (mindestens 150 erforderlich).")
 
-    # Sanitize and bound individual oversized candidates deterministically
+    system_tokens = estimate_tokens(SYSTEM_TRIAGE_PROMPT)
+    max_user_tokens = max(50, max_tokens_per_batch - system_tokens)
+
+    # Sanitize and truncate candidates individually so even a single candidate fits comfortably
     bounded_candidates: List[Dict[str, Any]] = []
+    dummy_req_id = "req_dummy"
     for cand in candidates:
         c_copy = dict(cand)
         ctx = str(c_copy.get("context_snippet", ""))
-        # Hard truncate context if candidate alone exceeds 60% of available batch budget
-        max_ctx_chars = int(available_batch_tokens * 0.6 * 3.5)
-        if len(ctx) > max_ctx_chars:
-            c_copy["context_snippet"] = ctx[:max_ctx_chars] + "..."
+        # Test candidate single-item prompt size
+        test_prompt = build_candidate_prompt([c_copy], dummy_req_id, document_revision, document_hash)
+        while estimate_tokens(test_prompt) > max_user_tokens and len(ctx) > 10:
+            ctx = ctx[:max(0, len(ctx) - 50)]
+            c_copy["context_snippet"] = ctx + "..."
+            test_prompt = build_candidate_prompt([c_copy], dummy_req_id, document_revision, document_hash)
+
         bounded_candidates.append(c_copy)
 
     batches: List[List[Dict[str, Any]]] = []
     current_batch: List[Dict[str, Any]] = []
-    current_tokens = system_tokens + base_envelope_tokens
 
     for cand in bounded_candidates:
-        ctx = cand.get("context_snippet", "")
-        orig = cand.get("original_text", "")
-        # Estimate prompt tokens + expected response tokens (~80 tokens per item)
-        item_prompt_tokens = estimate_tokens(ctx) + estimate_tokens(orig) + 50
-        item_response_tokens = 80
-        total_item_tokens = item_prompt_tokens + item_response_tokens
+        if not current_batch:
+            current_batch.append(cand)
+            continue
 
-        would_exceed_tokens = (current_tokens + total_item_tokens) > max_tokens_per_batch
-        would_exceed_count = len(current_batch) >= max_items_per_batch
+        candidate_test_batch = current_batch + [cand]
+        test_prompt = build_candidate_prompt(candidate_test_batch, dummy_req_id, document_revision, document_hash)
+        would_exceed_tokens = (system_tokens + estimate_tokens(test_prompt)) > max_tokens_per_batch
+        would_exceed_count = len(candidate_test_batch) > max_items_per_batch
 
-        if current_batch and (would_exceed_tokens or would_exceed_count):
+        if would_exceed_tokens or would_exceed_count:
             batches.append(current_batch)
             current_batch = [cand]
-            current_tokens = system_tokens + base_envelope_tokens + total_item_tokens
         else:
-            current_batch.append(cand)
-            current_tokens += total_item_tokens
+            current_batch = candidate_test_batch
 
     if current_batch:
         batches.append(current_batch)
@@ -172,6 +175,19 @@ def prepare_triage_batches(
             doc_rev=document_revision,
             doc_hash=document_hash,
         )
+        # Verify hard budget guarantee
+        total_tokens = system_tokens + estimate_tokens(user_prompt)
+        if total_tokens > max_tokens_per_batch:
+            # Emergency trim if boundary estimation was off by a fraction of token
+            while batch_cands and (system_tokens + estimate_tokens(user_prompt)) > max_tokens_per_batch and len(batch_cands) > 1:
+                batch_cands.pop()
+                user_prompt = build_candidate_prompt(
+                    batch_cands,
+                    request_id=req_id,
+                    doc_rev=document_revision,
+                    doc_hash=document_hash,
+                )
+
         occ_ids = [c["occ_id"] for c in batch_cands]
         result_batches.append(
             TriageBatch(

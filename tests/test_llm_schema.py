@@ -159,7 +159,7 @@ def test_validate_batch_response_missing_id():
         ],
     )
     with pytest.raises(ValueError, match="missing"):
-        validate_batch_response(envelope, expected_ids, 2, "snap_123")
+        validate_batch_response(envelope, expected_ids, 2, "snap_123", expected_request_id="req-1")
 
 
 def test_validate_batch_response_hallucinated_id():
@@ -175,7 +175,7 @@ def test_validate_batch_response_hallucinated_id():
         ],
     )
     with pytest.raises(ValueError, match="unexpected"):
-        validate_batch_response(envelope, expected_ids, 2, "snap_123")
+        validate_batch_response(envelope, expected_ids, 2, "snap_123", expected_request_id="req-1")
 
 
 def test_validate_batch_response_duplicate_id():
@@ -191,7 +191,7 @@ def test_validate_batch_response_duplicate_id():
         ],
     )
     with pytest.raises(ValueError, match="Duplicate"):
-        validate_batch_response(envelope, expected_ids, 2, "snap_123")
+        validate_batch_response(envelope, expected_ids, 2, "snap_123", expected_request_id="req-1")
 
 
 def test_validate_batch_response_revision_mismatch():
@@ -204,7 +204,7 @@ def test_validate_batch_response_revision_mismatch():
         items=[TriageKeepItem(occ_id="id-1", confidence="high")],
     )
     with pytest.raises(ValueError, match="Document revision mismatch"):
-        validate_batch_response(envelope, expected_ids, 2, "snap_123")
+        validate_batch_response(envelope, expected_ids, 2, "snap_123", expected_request_id="req-1")
 
 
 def test_validate_batch_response_snapshot_mismatch():
@@ -217,4 +217,4 @@ def test_validate_batch_response_snapshot_mismatch():
         items=[TriageKeepItem(occ_id="id-1", confidence="high")],
     )
     with pytest.raises(ValueError, match="Snapshot hash mismatch"):
-        validate_batch_response(envelope, expected_ids, 2, "snap_new")
+        validate_batch_response(envelope, expected_ids, 2, "snap_new", expected_request_id="req-1")

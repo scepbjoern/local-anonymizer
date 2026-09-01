@@ -468,7 +468,26 @@ def reset_app_state(st: "AppState") -> None:
     st.is_llm_running = False
     st.llm_partial_failure = False
     st.llm_unprocessed_occ_ids.clear()
-    st.llm_active_task = None
+    if getattr(st, "llm_provider", None) is not None:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(st.close_llm_provider())
+        except Exception:
+            pass
+
+
+async def reset_app_state_async(st: "AppState") -> None:
+    """Asynchronously cancel active LLM tasks, close provider session, and reset state."""
+    if getattr(st, "llm_active_task", None) and not st.llm_active_task.done():
+        st.llm_active_task.cancel()
+        try:
+            await st.llm_active_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        st.llm_active_task = None
+    await st.close_llm_provider()
+    reset_app_state(st)
 
 
 def load_document_into_state(
@@ -1346,6 +1365,8 @@ def create_ui():
 
     def load_content_into_workspace(text: str, filename: str, raw_bytes: Optional[bytes] = None):
         """Unified workspace loader."""
+        if not check_mutation_allowed():
+            return
         load_document_into_state(state, text, filename, raw_bytes=raw_bytes)
         if raw_text_area is not None:
             raw_text_area.value = text
@@ -1365,6 +1386,8 @@ def create_ui():
 
     async def extract_and_load_file_bytes(raw_bytes: bytes, filename: str):
         """Asynchronously extract structured text from document bytes with live UI progress."""
+        if not check_mutation_allowed():
+            return
         if extraction_progress_card is not None and extraction_progress_bar is not None and extraction_progress_label is not None:
             extraction_progress_card.set_visibility(True)
             extraction_progress_bar.set_value(0.0)
@@ -1399,6 +1422,8 @@ def create_ui():
 
     async def open_native_file_dialog():
         """Open native OS file picker with full Win32 lock-sharing support."""
+        if not check_mutation_allowed():
+            return
         try:
             import tkinter as tk
             from tkinter import filedialog
@@ -1428,6 +1453,8 @@ def create_ui():
 
     def reset_workspace():
         """Reset raw text, filename, and analysis table."""
+        if not check_mutation_allowed():
+            return
         reset_app_state(state)
         if raw_text_area is not None:
             raw_text_area.value = ""
@@ -1552,6 +1579,8 @@ def create_ui():
                 return
 
             def on_llm_toggle(e):
+                if not check_mutation_allowed():
+                    return
                 state.config.llm_enabled = bool(e.value)
                 save_current_config(state)
                 render_llm_settings_ui()
@@ -1564,6 +1593,8 @@ def create_ui():
                 ui.label("API-Endpunkt (OpenAI-kompatibel, z. B. Ollama/LM Studio):").classes("text-[11px] text-slate-600 font-medium")
 
                 def on_base_url_change(e):
+                    if not check_mutation_allowed():
+                        return
                     state.config.llm_base_url = (e.value or "").strip()
                     save_current_config(state)
                     if state.llm_provider:
@@ -1579,6 +1610,8 @@ def create_ui():
                 ui.label("Modellname (z. B. phi4:latest, qwen2.5:3b):").classes("text-[11px] text-slate-600 font-medium")
 
                 def on_model_name_change(e):
+                    if not check_mutation_allowed():
+                        return
                     state.config.llm_model_name = (e.value or "").strip()
                     save_current_config(state)
                     if state.llm_provider:
@@ -1592,6 +1625,8 @@ def create_ui():
                 ).props("dense outlined bg-white").classes("w-full text-xs mb-2")
 
                 def on_auto_review_toggle(e):
+                    if not check_mutation_allowed():
+                        return
                     state.config.llm_auto_review = bool(e.value)
                     save_current_config(state)
 
@@ -1721,6 +1756,8 @@ def create_ui():
     ]
 
     async def run_analysis():
+        if not check_mutation_allowed():
+            return
         if not state.raw_text or not state.raw_text.strip():
             ui.notify("Bitte laden Sie zuerst ein Dokument hoch oder fügen Sie Text ein.", type="warning")
             return
@@ -1865,7 +1902,12 @@ def create_ui():
             # Check if LLM review should immediately chain into execution (Decision 1 from Handoff 1316)
             if state.config.llm_enabled and state.config.llm_auto_review and LLM_AVAILABLE and state.entity_groups:
                 await asyncio.sleep(0.5)
-                await run_llm_triage(triggered_from_analysis=True)
+                task = launch_llm_triage(triggered_from_analysis=True)
+                if task is not None:
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
             # Keep visible for 1.2s so user sees all checkmarks, then auto-disappear
             await asyncio.sleep(1.2)
@@ -1880,6 +1922,16 @@ def create_ui():
                 analyze_btn.props(remove="loading")
             if progress_holder:
                 progress_holder.clear()
+
+    def launch_llm_triage(triggered_from_analysis: bool = False) -> Optional[asyncio.Task]:
+        """Central launcher for LLM triage runs, creating exactly one tracked task in state.llm_active_task."""
+        if state.is_llm_running or (state.llm_active_task and not state.llm_active_task.done()):
+            if not triggered_from_analysis:
+                ui.notify("Eine LLM-Prüfung läuft bereits.", type="info")
+            return state.llm_active_task
+
+        state.llm_active_task = asyncio.create_task(run_llm_triage(triggered_from_analysis=triggered_from_analysis))
+        return state.llm_active_task
 
     def check_mutation_allowed() -> bool:
         """Central guard against mutating state while LLM triage is running."""
@@ -2157,7 +2209,7 @@ def create_ui():
                             def start_triage_click():
                                 if not check_mutation_allowed():
                                     return
-                                state.llm_active_task = asyncio.create_task(run_llm_triage())
+                                launch_llm_triage(triggered_from_analysis=False)
                             triage_start_btn = ui.button(btn_label, icon="auto_awesome", color="primary", on_click=start_triage_click).props("unelevated dense size=sm")
                             is_start_enabled = has_entities and has_model and not state.is_llm_running
                             triage_start_btn.set_enabled(is_start_enabled)
@@ -2284,12 +2336,13 @@ def create_ui():
         ui.notify(f"Starte LLM-Triage ({len(candidates)} Fundstellen in {len(batches)} Batches)...", type="info")
 
         try:
-            for batch in batches:
+            for batch_idx, batch in enumerate(batches):
                 current_snap = compute_triage_snapshot(state.raw_text, state.analysis_revision, state.entity_groups)
                 if current_snap != snapshot_hash or state.document_revision != batch.document_revision:
                     logging.info("Dokument- oder Reviewzustand während LLM-Lauf geändert -> Lauf abgebrochen.")
                     state.llm_partial_failure = True
-                    state.llm_unprocessed_occ_ids.update(batch.occ_id_set)
+                    for rem_b in batches[batch_idx:]:
+                        state.llm_unprocessed_occ_ids.update(rem_b.occ_id_set)
                     break
 
                 try:
@@ -2302,7 +2355,8 @@ def create_ui():
                     if post_snap != snapshot_hash or state.document_revision != batch.document_revision:
                         logging.info("Dokument- oder Reviewzustand nach Inferenz geändert -> Batch verworfen.")
                         state.llm_partial_failure = True
-                        state.llm_unprocessed_occ_ids.update(batch.occ_id_set)
+                        for rem_b in batches[batch_idx:]:
+                            state.llm_unprocessed_occ_ids.update(rem_b.occ_id_set)
                         break
 
                     envelope = TriageEnvelope.model_validate_json(raw_json)
@@ -2316,8 +2370,6 @@ def create_ui():
 
                     for item in envelope.items:
                         state.llm_triage_results[item.occ_id] = item
-                        if item.action in ("recategorize", "discard") or (item.action == "keep" and getattr(item, "descriptor_suggestion", None)):
-                            state.llm_staged_selections.add(item.occ_id)
 
                 except asyncio.CancelledError:
                     raise
@@ -2369,6 +2421,7 @@ def create_ui():
     def build_review_table():
         if not table_holder:
             return
+        state.mutating_ui_elements.clear()
         table_holder.clear()
         with table_holder:
             if not state.entity_groups:
@@ -2411,10 +2464,12 @@ def create_ui():
                     ui.label("Sortierung:").classes("text-xs font-semibold text-slate-700")
 
                     def on_sort_change(e):
+                        if not check_mutation_allowed():
+                            return
                         state.sort_by = e.value
                         build_review_table()
 
-                    ui.select(
+                    sort_sel = ui.select(
                         options=[
                             "Alphabetisch (A–Z)",
                             "Erstes Auftreten im Text",
@@ -2425,9 +2480,14 @@ def create_ui():
                         value=state.sort_by,
                         on_change=on_sort_change,
                     ).props("dense outlined bg-white").classes("w-64 text-xs")
+                    state.mutating_ui_elements.append(sort_sel)
+                    if state.is_llm_running:
+                        sort_sel.disable()
 
                 with ui.row().classes("items-center gap-2"):
                     def select_all():
+                        if not check_mutation_allowed():
+                            return
                         for g in state.entity_groups:
                             g.enabled = True
                             sync_group_overrides(state, g)
@@ -2435,14 +2495,21 @@ def create_ui():
                         build_review_table()
 
                     def deselect_all():
+                        if not check_mutation_allowed():
+                            return
                         for g in state.entity_groups:
                             g.enabled = False
                             sync_group_overrides(state, g)
                         refresh_preview_and_exports()
                         build_review_table()
 
-                    ui.button("Alle aktivieren", icon="select_all", on_click=select_all, color="slate").props("outline dense size=sm")
-                    ui.button("Alle abwählen", icon="deselect", on_click=deselect_all, color="slate").props("outline dense size=sm")
+                    sel_all_btn = ui.button("Alle aktivieren", icon="select_all", on_click=select_all, color="slate").props("outline dense size=sm")
+                    desel_all_btn = ui.button("Alle abwählen", icon="deselect", on_click=deselect_all, color="slate").props("outline dense size=sm")
+                    state.mutating_ui_elements.extend([sel_all_btn, desel_all_btn])
+                    if state.is_llm_running:
+                        sel_all_btn.disable()
+                        desel_all_btn.disable()
+
                     toggle_expand_btn = ui.button(
                         "Alle aufklappen",
                         icon="unfold_more",
@@ -2489,6 +2556,8 @@ def create_ui():
                                         with ui.row().classes("items-center gap-2 min-w-[280px]"):
                                             def make_group_check(grp):
                                                 def on_change(e):
+                                                    if not check_mutation_allowed():
+                                                        return
                                                     grp.enabled = e.value
                                                     sync_group_overrides(state, grp)
                                                     refresh_preview_and_exports()
@@ -2496,29 +2565,14 @@ def create_ui():
                                                 return on_change
 
                                             master_check = ui.checkbox(value=master.enabled, on_change=make_group_check(master)).props("dense")
-                                            if not is_category_enabled(state, master.entity_type):
+                                            state.mutating_ui_elements.append(master_check)
+                                            if not is_category_enabled(state, master.entity_type) or state.is_llm_running:
                                                 master_check.disable()
                                             ui.label(master.original_text).classes("font-mono text-sm font-bold text-slate-800")
                                             ui.badge(f"{master.count}x", color="primary" if master.count > 1 else "grey-6").props("dense")
 
                                             # Master Placeholder Badge
                                             master_badge = ui.badge(master.placeholder, color="blue-9").props("outline dense").classes("text-xs font-mono font-bold")
-
-                                            # LLM Sparse Action Badges (Decision 2 from Handoff 1316)
-                                            has_recat_or_desc = False
-                                            has_discard = False
-                                            for occ in master.occurrences:
-                                                if occ.occ_id in state.llm_triage_results:
-                                                    verdict = state.llm_triage_results[occ.occ_id]
-                                                    if verdict.action == "recategorize" or (verdict.action == "keep" and getattr(verdict, "descriptor_suggestion", None)):
-                                                        has_recat_or_desc = True
-                                                    elif verdict.action == "discard":
-                                                        has_discard = True
-
-                                            if has_recat_or_desc:
-                                                ui.badge("LLM: Änderungsvorschlag", color="amber-8").props("dense").tooltip("Lokales LLM schlägt Kategorie- oder Rollenanpassung vor")
-                                            if has_discard:
-                                                ui.badge("LLM: Ignorieren vorgeschlagen", color="grey-8").props("dense").tooltip("Lokales LLM stuft Fundstelle als False Positive ein")
 
                                             if is_split:
                                                 ui.badge("✂️ Ausgliederung", color="purple-7").props("dense").tooltip("Abgespaltene Homonym-Gruppe mit eigener Zuweisung")
@@ -2532,22 +2586,29 @@ def create_ui():
                                         with ui.row().classes("items-center gap-1"):
                                             def make_group_select(grp):
                                                 def on_change(e):
+                                                    if not check_mutation_allowed():
+                                                        return
                                                     grp.entity_type = e.value
                                                     sync_group_overrides(state, grp)
                                                     refresh_preview_and_exports()
                                                     build_review_table()
                                                 return on_change
 
-                                            ui.select(
+                                            m_sel = ui.select(
                                                 options=AVAILABLE_ENTITIES,
                                                 value=master.entity_type,
                                                 on_change=make_group_select(master),
                                             ).props("dense outlined bg-white").classes("w-36 text-xs")
+                                            state.mutating_ui_elements.append(m_sel)
+                                            if state.is_llm_running:
+                                                m_sel.disable()
 
                                         # 3. Role Input Field (In-place badge update WITHOUT losing focus!)
                                         with ui.row().classes("items-center gap-1"):
                                             def make_role_change(grp, m_badge, c_badges):
                                                 def on_change(e):
+                                                    if not check_mutation_allowed():
+                                                        return
                                                     grp.role = (e.value or "").strip()
                                                     sync_group_overrides(state, grp)
                                                     compute_reactive_preview(state)
@@ -2557,12 +2618,15 @@ def create_ui():
                                                     refresh_preview_and_exports()
                                                 return on_change
 
-                                            ui.input(
+                                            m_role_inp = ui.input(
                                                 label="Rolle (optional)",
                                                 value=master.role,
                                                 placeholder="z.B. Student",
                                                 on_change=make_role_change(master, master_badge, child_badge_refs),
                                             ).props("dense outlined bg-white debounce=300").classes("w-32 text-xs")
+                                            state.mutating_ui_elements.append(m_role_inp)
+                                            if state.is_llm_running:
+                                                m_role_inp.disable()
 
                                         # 4. Interactive Smart-Linking Proposal (Confirmation Model) or Link Dropdown
                                         if not has_children:
@@ -2570,6 +2634,8 @@ def create_ui():
                                                 with ui.row().classes("items-center gap-1"):
                                                     def make_apply_suggestion(grp, p_target_id, tag):
                                                         def on_click():
+                                                            if not check_mutation_allowed():
+                                                                return
                                                             grp.parent_group_id = p_target_id
                                                             grp.surface_tag = tag
                                                             grp.suggested_parent = None
@@ -2592,12 +2658,15 @@ def create_ui():
                                                         p_target_text = p_match.original_text if p_match else p_target_id
 
                                                     tag_label = SURFACE_TAG_OPTIONS.get(master.suggested_tag, master.suggested_tag or "Vorname")
-                                                    ui.button(
+                                                    sugg_btn = ui.button(
                                                         f"💡 Mit '{p_target_text}' verknüpfen",
                                                         icon="auto_awesome",
                                                         color="teal-8",
                                                         on_click=make_apply_suggestion(master, p_target_id, master.suggested_tag or "VORNAME"),
                                                     ).props("outline dense size=sm").tooltip(f"Vorschlag übernehmen: Als {tag_label} verknüpfen")
+                                                    state.mutating_ui_elements.append(sugg_btn)
+                                                    if state.is_llm_running:
+                                                        sugg_btn.disable()
 
                                             elif master.suggested_candidates:
                                                 ui.badge(f"💡 {len(master.suggested_candidates)} Namenskandidaten", color="amber-8").props("outline dense").tooltip("Mehrere passende Personen gefunden. Bitte im Dropdown rechts auswählen.")
@@ -2612,6 +2681,8 @@ def create_ui():
                                                 with ui.row().classes("items-center gap-1"):
                                                     def make_link_to_master(grp):
                                                         def on_change(e):
+                                                            if not check_mutation_allowed():
+                                                                return
                                                             val = (e.value or "").strip()
                                                             if not val or val == "Eigenständig":
                                                                 grp.parent_group_id = None
@@ -2638,12 +2709,15 @@ def create_ui():
                                                         return on_change
 
                                                     current_val = master.parent_group_id if (master.parent_group_id and master.parent_group_id in link_options) else ""
-                                                    ui.select(
+                                                    link_sel = ui.select(
                                                         options=link_options,
                                                         value=current_val,
                                                         label="Verknüpfen mit:",
                                                         on_change=make_link_to_master(master),
                                                     ).props('dense outlined bg-white options-dense menu-props="{ maxHeight: \'300px\' }"').classes("min-w-[200px] max-w-[320px] text-xs").tooltip("Zielperson / Bezug auswählen")
+                                                    state.mutating_ui_elements.append(link_sel)
+                                                    if state.is_llm_running:
+                                                        link_sel.disable()
 
                                         # 5. Score & Action
                                         with ui.row().classes("items-center gap-2"):
@@ -2657,6 +2731,8 @@ def create_ui():
 
                                             def make_group_ignore(term, grp):
                                                 def on_click():
+                                                    if not check_mutation_allowed():
+                                                        return
                                                     current_ignores = parse_ignore_terms(state.ignore_terms_text)
                                                     if term not in current_ignores:
                                                         current_ignores.append(term)
@@ -2672,6 +2748,8 @@ def create_ui():
 
                                             def make_add_to_glossary(term, grp):
                                                 def on_click():
+                                                    if not check_mutation_allowed():
+                                                        return
                                                     lines = [line.strip() for line in state.glossary_text.splitlines() if line.strip()]
                                                     lines = [
                                                         line for line in lines
@@ -2698,6 +2776,8 @@ def create_ui():
 
                                             def make_mark_manual(term, grp):
                                                 def on_click():
+                                                    if not check_mutation_allowed():
+                                                        return
                                                     for occurrence in grp.occurrences:
                                                         occurrence.source = "manual"
                                                         occurrence.method = "manual"
@@ -2711,11 +2791,11 @@ def create_ui():
                                                     ui.notify(f"'{term}' nur für diesen Durchlauf manuell markiert.", type="info", icon="edit_note")
                                                 return on_click
 
-                                            ui.button(
+                                            ign_btn = ui.button(
                                                 icon="block",
                                                 on_click=make_group_ignore(master.original_text, master),
                                             ).props("flat round dense size=sm color=grey-8").tooltip("Begriff ignorieren und zur Ignore-Liste hinzufügen")
-                                            ui.button(
+                                            gloss_btn = ui.button(
                                                 icon="library_add",
                                                 on_click=make_add_to_glossary(master.original_text, master),
                                             ).props("flat round dense size=sm color=teal-8").tooltip("Diesen Begriff dauerhaft mit diesem Entitätstyp zum Glossar hinzufügen")
@@ -2723,8 +2803,12 @@ def create_ui():
                                                 icon="edit_note",
                                                 on_click=make_mark_manual(master.original_text, master),
                                             ).props("flat round dense size=sm color=orange-8").tooltip("Diesen Begriff nur für den aktuellen Durchlauf als manuell markiert behandeln")
-                                            if not is_category_enabled(state, master.entity_type):
+                                            state.mutating_ui_elements.extend([ign_btn, gloss_btn, manual_button])
+                                            if not is_category_enabled(state, master.entity_type) or state.is_llm_running:
                                                 manual_button.disable()
+                                            if state.is_llm_running:
+                                                ign_btn.disable()
+                                                gloss_btn.disable()
 
                                 # Expanded content: Context occurrences
                                 with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
@@ -2766,6 +2850,8 @@ def create_ui():
 
                                                     rev_btn = ui.button("↩️ Zusammenführen", on_click=make_revert_occ(master, occ)).props("flat dense size=sm color=teal-8").tooltip("Ausgliederung rückgängig machen und mit Basisgruppe vereinen")
                                                     state.mutating_ui_elements.append(rev_btn)
+                                                    if state.is_llm_running:
+                                                        rev_btn.disable()
                                                 elif master.count > 1:
                                                     def make_split_occ(grp, o):
                                                         def on_click():
@@ -2780,6 +2866,8 @@ def create_ui():
 
                                                     split_btn = ui.button("✂️ Ausgliedern", on_click=make_split_occ(master, occ)).props("flat dense size=sm color=primary").tooltip("Als eigene Gruppe ausgliedern (Homonym-Behandlung)")
                                                     state.mutating_ui_elements.append(split_btn)
+                                                    if state.is_llm_running:
+                                                        split_btn.disable()
 
                             # Render Indented Linked Children
                             for child_node in root_node.children:
@@ -2793,28 +2881,12 @@ def create_ui():
                                                 ui.label("↳").classes("text-teal-700 font-bold text-base")
                                                 child_check = ui.checkbox(value=child.enabled, on_change=make_group_check(child)).props("dense")
                                                 state.mutating_ui_elements.append(child_check)
-                                                if not is_category_enabled(state, child.entity_type):
+                                                if not is_category_enabled(state, child.entity_type) or state.is_llm_running:
                                                     child_check.disable()
                                                 ui.label(child.original_text).classes("font-mono text-sm font-bold text-teal-900")
                                                 ui.badge(f"{child.count}x", color="teal-6").props("dense")
                                                 c_badge = ui.badge(child.placeholder, color="teal-9").props("outline dense").classes("text-xs font-mono font-bold")
                                                 child_badge_refs.append((child, c_badge))
-
-                                                # LLM Sparse Action Badges for child
-                                                c_has_recat = False
-                                                c_has_discard = False
-                                                for c_occ in child.occurrences:
-                                                    if c_occ.occ_id in state.llm_triage_results:
-                                                        c_verdict = state.llm_triage_results[c_occ.occ_id]
-                                                        if c_verdict.action == "recategorize" or (c_verdict.action == "keep" and getattr(c_verdict, "descriptor_suggestion", None)):
-                                                            c_has_recat = True
-                                                        elif c_verdict.action == "discard":
-                                                            c_has_discard = True
-
-                                                if c_has_recat:
-                                                    ui.badge("LLM: Änderungsvorschlag", color="amber-8").props("dense").tooltip("Lokales LLM schlägt Kategorie- oder Rollenanpassung vor")
-                                                if c_has_discard:
-                                                    ui.badge("LLM: Ignorieren vorgeschlagen", color="grey-8").props("dense").tooltip("Lokales LLM stuft Fundstelle als False Positive ein")
 
                                             # Surface Form Selector
                                             with ui.row().classes("items-center gap-1"):
@@ -2834,6 +2906,8 @@ def create_ui():
                                                     on_change=make_surface_change(child),
                                                 ).props("dense outlined bg-white").classes("w-44 text-xs")
                                                 state.mutating_ui_elements.append(surf_sel)
+                                                if state.is_llm_running:
+                                                    surf_sel.disable()
 
                                             # Explicit UNLINK Action
                                             with ui.row().classes("items-center gap-2"):
@@ -2855,6 +2929,8 @@ def create_ui():
                                                     on_click=make_unlink_action(child),
                                                 ).props("flat dense size=sm").tooltip("Verknüpfung aufheben und als separate Entität führen")
                                                 state.mutating_ui_elements.append(unlink_btn)
+                                                if state.is_llm_running:
+                                                    unlink_btn.disable()
 
                                     # Child Occurrences
                                     with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
@@ -2885,6 +2961,8 @@ def create_ui():
                                                     if is_split_occ:
                                                         def make_revert_child_occ(grp, o):
                                                             def on_click():
+                                                                if not check_mutation_allowed():
+                                                                    return
                                                                 revert_occurrence_to_base(state, grp, o)
                                                                 compute_reactive_preview(state)
                                                                 refresh_preview_and_exports()
@@ -2892,10 +2970,15 @@ def create_ui():
                                                                 ui.notify(f"Fundstelle wieder mit der Hauptgruppe '{grp.original_text}' zusammengeführt.", type="info", icon="merge")
                                                             return on_click
 
-                                                        ui.button("↩️ Zusammenführen", on_click=make_revert_child_occ(child, occ)).props("flat dense size=sm color=teal-8").tooltip("Ausgliederung rückgängig machen und mit Basisgruppe vereinen")
+                                                        rev_child_btn = ui.button("↩️ Zusammenführen", on_click=make_revert_child_occ(child, occ)).props("flat dense size=sm color=teal-8").tooltip("Ausgliederung rückgängig machen und mit Basisgruppe vereinen")
+                                                        state.mutating_ui_elements.append(rev_child_btn)
+                                                        if state.is_llm_running:
+                                                            rev_child_btn.disable()
                                                     elif child.count > 1:
                                                         def make_split_child_occ(grp, o):
                                                             def on_click():
+                                                                if not check_mutation_allowed():
+                                                                    return
                                                                 split_occurrence_to_new_group(state, grp, o)
                                                                 compute_reactive_preview(state)
                                                                 refresh_preview_and_exports()
@@ -2903,7 +2986,10 @@ def create_ui():
                                                                 ui.notify(f"Fundstelle als eigene Gruppe ausgegliedert.", type="info", icon="call_split")
                                                             return on_click
 
-                                                        ui.button("✂️ Ausgliedern", on_click=make_split_child_occ(child, occ)).props("flat dense size=sm color=primary").tooltip("Als eigene Gruppe ausgliedern (Homonym-Behandlung)")
+                                                        split_child_btn = ui.button("✂️ Ausgliedern", on_click=make_split_child_occ(child, occ)).props("flat dense size=sm color=primary").tooltip("Als eigene Gruppe ausgliedern (Homonym-Behandlung)")
+                                                        state.mutating_ui_elements.append(split_child_btn)
+                                                        if state.is_llm_running:
+                                                            split_child_btn.disable()
 
     # --- Main Layout ---
     with ui.row().classes("w-full no-wrap p-4 gap-6"):
@@ -3344,6 +3430,8 @@ def create_ui():
 
                     with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note", value=True).classes("w-full mb-2"):
                         def on_raw_text_change(e):
+                            if not check_mutation_allowed():
+                                return
                             state.raw_text = e.value or ""
                             state.document_revision += 1
                             state.llm_triage_results.clear()
@@ -3405,6 +3493,8 @@ def create_ui():
                                 save_perm_check = ui.checkbox("Dauerhaft in Begriffsliste speichern", value=False).props("dense").classes("text-xs text-slate-600")
 
                                 async def add_manual_entity():
+                                    if not check_mutation_allowed():
+                                        return
                                     term = manual_input.value.strip()
                                     if not term:
                                         ui.notify("Bitte einen Begriff eingeben.", type="warning")
