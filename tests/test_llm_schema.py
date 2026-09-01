@@ -6,6 +6,7 @@ from local_anonymizer.llm.schema import (
     TriageDiscardItem,
     TriageEnvelope,
     validate_batch_response,
+    extract_json_from_llm_response,
 )
 
 
@@ -65,11 +66,115 @@ def test_missing_confidence_rejected():
 
 def test_extra_fields_forbidden():
     with pytest.raises(ValidationError):
-        TriageKeepItem(
-            occ_id="occ-1",
-            confidence="high",
-            unknown_property="unexpected",  # forbidden
-        )
+        TriageKeepItem.model_validate({
+            "occ_id": "occ-1",
+            "confidence": "high",
+            "action": "keep",
+            "unknown_property": "unexpected",
+        })
+
+    with pytest.raises(ValidationError):
+        TriageEnvelope.model_validate({
+            "schema_version": "1.0",
+            "request_id": "req-1",
+            "document_revision": 1,
+            "document_hash": "abc",
+            "items": [],
+            "unknown_envelope_field": "error",
+        })
+
+
+def test_keep_item_rejects_non_null_new_entity_type():
+    # keep with explicit null is allowed
+    item = TriageKeepItem.model_validate({
+        "occ_id": "occ-1",
+        "action": "keep",
+        "confidence": "high",
+        "new_entity_type": None,
+        "descriptor_suggestion": "Chefärztin",
+    })
+    assert item.action == "keep"
+    assert item.descriptor_suggestion == "Chefärztin"
+
+    # keep with string new_entity_type must fail validation
+    with pytest.raises(ValidationError):
+        TriageKeepItem.model_validate({
+            "occ_id": "occ-1",
+            "action": "keep",
+            "confidence": "high",
+            "new_entity_type": "ORGANIZATION",
+        })
+
+
+def test_discard_item_rejects_non_null_fields():
+    # discard with explicit null is allowed
+    item = TriageDiscardItem.model_validate({
+        "occ_id": "occ-1",
+        "action": "discard",
+        "confidence": "low",
+        "new_entity_type": None,
+        "descriptor_suggestion": None,
+    })
+    assert item.action == "discard"
+
+    # discard with non-null new_entity_type must fail
+    with pytest.raises(ValidationError):
+        TriageDiscardItem.model_validate({
+            "occ_id": "occ-1",
+            "action": "discard",
+            "confidence": "low",
+            "new_entity_type": "PERSON",
+        })
+
+    # discard with non-null descriptor_suggestion must fail
+    with pytest.raises(ValidationError):
+        TriageDiscardItem.model_validate({
+            "occ_id": "occ-1",
+            "action": "discard",
+            "confidence": "low",
+            "descriptor_suggestion": "Kunde",
+        })
+
+
+def test_validate_batch_response_partial_acceptance():
+    expected_ids = {"id-1", "id-2"}
+    envelope = TriageEnvelope(
+        schema_version="1.0",
+        request_id="req-1",
+        document_revision=2,
+        document_hash="snap_123",
+        items=[
+            TriageKeepItem(occ_id="id-1", confidence="high"),
+        ],
+    )
+    # When strict_count is False, missing items are accepted without error
+    validate_batch_response(envelope, expected_ids, 2, "snap_123", expected_request_id="req-1", strict_count=False)
+
+
+
+def test_extract_json_from_markdown_and_thinking():
+    raw_markdown = """
+    <think>
+    Hier ist mein Gedankengang...
+    </think>
+    Hier ist das Ergebnis:
+    ```json
+    {
+      "schema_version": "1.0",
+      "request_id": "req-1",
+      "document_revision": 1,
+      "document_hash": "h123",
+      "items": [
+        {"occ_id": "occ-1", "action": "keep", "confidence": "high"}
+      ]
+    }
+    ```
+    """
+    clean = extract_json_from_llm_response(raw_markdown)
+    env = TriageEnvelope.model_validate_json(clean)
+    assert env.schema_version == "1.0"
+    assert len(env.items) == 1
+    assert env.items[0].occ_id == "occ-1"
 
 
 def test_invalid_confidence_rejected():

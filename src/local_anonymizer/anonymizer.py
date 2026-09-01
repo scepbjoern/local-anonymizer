@@ -91,10 +91,10 @@ REVIEW_SCORE_THRESHOLD = 0.85
 
 
 def clean_tag(text: str) -> str:
-    """Clean a role or surface tag to be uppercase alphanumeric with underscores."""
+    """Clean a role or surface tag to be uppercase alphanumeric with underscores, preserving German umlauts."""
     if not text:
         return ""
-    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", text.strip().upper())
+    cleaned = re.sub(r"[^A-Za-z0-9_ÄÖÜäöüß]+", "_", text.strip().upper())
     return cleaned.strip("_")
 
 
@@ -1109,7 +1109,7 @@ class LocalAnonymizer:
         #    the surname entirely, so absorption in step 3 never had a container to merge into).
         #    Heuristic, not proof: German capitalizes all nouns, so this can also fire on ordinary
         #    sentence continuations. Surfaced as a review flag only, never auto-corrected.
-        residue_pattern = re.compile(r"(\[[A-Z0-9_]+\])\s+([A-ZÄÖÜ][a-zäöüßA-ZÄÖÜ\-]{2,})")
+        residue_pattern = re.compile(r"(\[[A-Z0-9_ÄÖÜ]+\])\s+([A-ZÄÖÜ][a-zäöüßA-ZÄÖÜ\-]{2,})")
         residue_by_placeholder: Dict[str, str] = {}
         for m in residue_pattern.finditer(anonymized_text):
             placeholder, trailing_word = m.group(1), m.group(2)

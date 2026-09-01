@@ -8,14 +8,25 @@ from typing import Any, Dict, List, Optional, Set
 
 
 SYSTEM_TRIAGE_PROMPT = """Du bist ein hochpräziser Assistent zur Überprüfung von erkannten personenbezogenen Daten (PII) und Entitäten in Texten (Triage-Layer).
+
 Deine Aufgabe:
 1. Bewerte die vorgelegten Entitäts-Kandidaten im jeweiligen Kontext.
-2. Entscheide für jeden Kandidaten (identifiziert über seine eindeutige 'occ_id'):
-   - "keep": Die Entitäts-Kategorie ist korrekt. Optional kannst du eine präzisierende Rolle/Deskriptor als 'descriptor_suggestion' (z. B. "Kläger", "Projektleiter", "Kunde") vorschlagen.
-   - "recategorize": Die Entität gehört zu einer anderen Kategorie (z. B. von LOCATION zu ORGANIZATION oder PERSON). Gib 'new_entity_type' an und optional 'descriptor_suggestion'.
-   - "discard": Es handelt sich um ein False Positive (z. B. ein normales Wort, Berufsbezeichnung ohne Personenname, etc.) und soll ignoriert werden.
-3. Gib für jede Entscheidung eine kurze Begründung ('reasoning', max. 1-2 Sätze) und eine Konfidenz ('high', 'medium', 'low') an.
-4. Antworte AUSSCHLIESSLICH im geforderten JSON-Schema mit schema_version "1.0". Gib GENAU für jede übergebene occ_id einen Eintrag im Array 'items' zurück. Keine Markdown-Formatierung um das JSON herum."""
+2. Grundregel für PII: E-Mail-Adressen, Telefonnummern, Personennamen, Organisationen, Orte, Gesundheitsdaten und Datumsangaben sind schützenswerte Entitäten und dürfen NICHT verworfen (discard) werden, es sei denn, es handelt sich um rein allgemeine Füllwörter ohne jeglichen Personen- oder Datenbezug.
+3. Entscheide für jeden Kandidaten (identifiziert über seine 'occ_id'):
+   - "keep": Die Entitäts-Kategorie (current_type) ist inhaltlich korrekt.
+   - "recategorize": Die Entität gehört in Wahrheit zu einer anderen Kategorie. Gib 'new_entity_type' an.
+   - "discard": Echtes False Positive ohne Datenbezug.
+4. ROLLEN & DESKRIPTOREN (FÜR ALLE ENTITÄTEN):
+   - Wir möchten für ALLE Entitäten, bei denen es inhaltlich Sinn ergibt, einen Deskriptor ('descriptor_suggestion') setzen.
+   - PERSONEN: Eine kurze, präzise Berufs- oder Funktionsrolle (z. B. "Chefärztin", "Patientin", "Teamleiter", "Kunde").
+   - ORGANISATIONEN: Die Art der Organisation oder Branche (z. B. "Spital", "Gesundheitsdienstleister", "Firma", "Behörde").
+   - ORTE (LOCATION): Die Art des Ortes (z. B. "Stadt", "Gemeinde", "Land", "Klinik").
+   - DATUMSANGABEN: Die Bedeutung des Datums (z. B. "Geburtsdatum", "Eintragsdatum", "Sitzungsdatum").
+   - KONTAKTDATEN (E-Mail, Telefon, Adresse): ZWINGEND die Rolle des Besitzers eintragen (z. B. "Chefärztin" oder "Spital"), falls aus dem Text ableitbar. Wenn nicht ableitbar, null eintragen. Auf keinen Fall "Kontaktdaten" schreiben.
+   - DATENSCHUTZ-GRUNDREGEL: Verwende in 'descriptor_suggestion' NIEMALS echte Klarnamen oder Originaldaten (niemals "Elena Weber", "Zürich" oder "15.08.2026"), sondern IMMER nur generische, funktionale Beschreibungen!
+   - Erfinde keine Rollen für Krankheiten, Medikamente oder bedeutungslose Fachbegriffe (diese bleiben null).
+5. Gib eine kurze, sachliche Begründung ('reasoning', max. 1 Satz auf Deutsch) und eine Konfidenz ('high', 'medium', 'low') an.
+6. Antworte AUSSCHLIESSLICH im geforderten JSON-Schema mit schema_version "1.0". Gib für JEDEN übergebenen Kandidaten GENAU EINEN Eintrag im Array 'items' zurück."""
 
 
 @dataclass
@@ -68,7 +79,7 @@ def build_candidate_prompt(
 
     candidates_formatted = "\n\n".join(candidate_lines)
 
-    # Valid JSON example template demonstrating schema structure
+    # Valid JSON example template demonstrating schema structure without biasing copy-paste content
     example_json = json.dumps(
         {
             "schema_version": "1.0",
@@ -77,11 +88,11 @@ def build_candidate_prompt(
             "document_hash": doc_hash,
             "items": [
                 {
-                    "occ_id": "<jeweilige_occ_id>",
+                    "occ_id": "<occ_id_des_kandidaten>",
                     "action": "keep",
                     "new_entity_type": None,
-                    "descriptor_suggestion": "Projektleiter",
-                    "reasoning": "Eindeutiger Personenname im Berichtsabschnitt.",
+                    "descriptor_suggestion": None,
+                    "reasoning": "<konkrete_begruendung_aus_kontext>",
                     "confidence": "high",
                 }
             ],
@@ -97,9 +108,9 @@ def build_candidate_prompt(
 Regeln für das JSON-Output:
 - 'action' muss einer der Werte ["keep", "recategorize", "discard"] sein.
 - 'new_entity_type' ist nur bei action "recategorize" anzugeben, sonst null.
-- 'descriptor_suggestion' ist optional (z. B. "Kläger", "Patientin"), sonst null.
+- 'descriptor_suggestion' ist optional (spezifische Rolle aus dem Kontext), sonst null.
 - 'confidence' muss einer der Werte ["high", "medium", "low"] sein.
-- 'reasoning' enthält eine kurze sachliche Begründung (max. 1-2 Sätze).
+- 'reasoning' enthält eine kurze Begründung für die Einstufung basierend auf dem Textkontext.
 
 Antworte ausschließlich als striktes JSON-Objekt gemäß folgendem Schema-Beispiel:
 {example_json}"""
@@ -111,7 +122,7 @@ def prepare_triage_batches(
     document_revision: int,
     document_hash: str,
     max_tokens_per_batch: int = 3000,
-    max_items_per_batch: int = 15,
+    max_items_per_batch: int = 5,
 ) -> List[TriageBatch]:
     """
     Split a list of candidate occurrences into token-budgeted sequential batches.

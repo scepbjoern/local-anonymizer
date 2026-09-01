@@ -150,11 +150,37 @@ class LocalApiProvider(LlmProvider):
                 "model": self.model_name,
                 "messages": messages,
                 "temperature": 0.0,
-                "max_tokens": 2048,
+                "max_tokens": 4096,
                 "response_format": {"type": "json_object"},
+                "reasoning_effort": "none",
             }
 
             headers = {"Content-Type": "application/json"}
+
+            async def _read_response_body(resp_obj: Any) -> str:
+                raw_content_type = resp_obj.headers.get("Content-Type", "")
+                mime_type = raw_content_type.split(";")[0].strip().lower()
+                is_valid_json_mime = (
+                    mime_type == "application/json"
+                    or bool(re.fullmatch(r"application/[a-z0-9_.\-]+(?:\+[a-z0-9_.\-]+)*\+json", mime_type))
+                )
+                if not is_valid_json_mime:
+                    raise ValueError(
+                        f"Unerwarteter Content-Type '{raw_content_type}': Erwartet wurde 'application/json' oder 'application/*+json'."
+                    )
+
+                # Stream response to enforce max response size limit
+                chunks = []
+                total_bytes = 0
+                async for chunk in resp_obj.content.iter_chunked(8192):
+                    total_bytes += len(chunk)
+                    if total_bytes > self.max_response_bytes:
+                        raise ValueError(
+                            f"Antwortgröße des LLMs überschreitet das Limit von {self.max_response_bytes} Bytes."
+                        )
+                    chunks.append(chunk)
+
+                return b"".join(chunks).decode("utf-8", errors="replace")
 
             try:
                 async with session.post(
@@ -163,32 +189,23 @@ class LocalApiProvider(LlmProvider):
                     headers=headers,
                     allow_redirects=False,
                 ) as resp:
-                    if resp.status != 200:
+                    if resp.status in (400, 422) and "reasoning_effort" in payload:
+                        # Fallback: Retry exactly once without reasoning_effort for servers (e.g. LM Studio) rejecting this parameter
+                        payload_retry = dict(payload)
+                        payload_retry.pop("reasoning_effort", None)
+                        async with session.post(
+                            endpoint,
+                            json=payload_retry,
+                            headers=headers,
+                            allow_redirects=False,
+                        ) as retry_resp:
+                            if retry_resp.status != 200:
+                                raise ValueError(f"Lokaler LLM-Provider meldete HTTP Status {retry_resp.status}")
+                            raw_body = await _read_response_body(retry_resp)
+                    elif resp.status != 200:
                         raise ValueError(f"Lokaler LLM-Provider meldete HTTP Status {resp.status}")
-
-                    raw_content_type = resp.headers.get("Content-Type", "")
-                    mime_type = raw_content_type.split(";")[0].strip().lower()
-                    is_valid_json_mime = (
-                        mime_type == "application/json"
-                        or bool(re.fullmatch(r"application/[a-z0-9_.\-]+(?:\+[a-z0-9_.\-]+)*\+json", mime_type))
-                    )
-                    if not is_valid_json_mime:
-                        raise ValueError(
-                            f"Unerwarteter Content-Type '{raw_content_type}': Erwartet wurde 'application/json' oder 'application/*+json'."
-                        )
-
-                    # Stream response to enforce max response size limit
-                    chunks = []
-                    total_bytes = 0
-                    async for chunk in resp.content.iter_chunked(8192):
-                        total_bytes += len(chunk)
-                        if total_bytes > self.max_response_bytes:
-                            raise ValueError(
-                                f"Antwortgröße des LLMs überschreitet das Limit von {self.max_response_bytes} Bytes."
-                            )
-                        chunks.append(chunk)
-
-                    raw_body = b"".join(chunks).decode("utf-8", errors="replace")
+                    else:
+                        raw_body = await _read_response_body(resp)
 
             except asyncio.CancelledError:
                 logger.info("LLM-Anfrage wurde abgebrochen (Task Cancelled).")

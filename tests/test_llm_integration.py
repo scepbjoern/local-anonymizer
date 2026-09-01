@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from app import (
@@ -209,3 +210,55 @@ def test_optional_llm_extra_isolation():
     from local_anonymizer.llm.apply_service import compute_triage_snapshot
     assert TriageEnvelope is not None
     assert compute_triage_snapshot is not None
+
+
+@pytest.mark.asyncio
+async def test_run_triage_batch_loop_no_pii_leakage_on_failure(caplog, capsys):
+    st = AppState()
+    st.raw_text = "Test document"
+    st.analysis_revision = 1
+    st.document_revision = 1
+
+    grp = EntityGroup(original_text="Patient", entity_type="PERSON", group_id="g1")
+    occ = EntityOccurrence(
+        start=0,
+        end=7,
+        score=0.95,
+        context_html="Patient",
+        needs_review=False,
+        occ_id="occ-secret-1",
+    )
+    grp.occurrences.append(occ)
+    st.entity_groups = [grp]
+
+    snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+    candidates = [
+        {"occ_id": "occ-secret-1", "original_text": "Patient", "entity_type": "PERSON", "role": "", "context_snippet": "Patient"}
+    ]
+    batches = prepare_triage_batches(candidates, st.document_revision, snap)
+
+    sensitive_leak_probe = "HIGHLY_CONFIDENTIAL_MEDICAL_RECORD_999"
+
+    # Simulate provider returning invalid schema containing sensitive probe text
+    mock_provider = MagicMock(spec=LocalApiProvider)
+    mock_provider.generate = AsyncMock(return_value=f'{{"schema_version": "1.0", "request_id": "{batches[0].request_id}", "document_revision": 1, "document_hash": "{snap}", "invalid_field": "{sensitive_leak_probe}"}}')
+    st.llm_provider = mock_provider
+    st.is_llm_running = True
+    st.llm_triage_snapshot = snap
+
+    with caplog.at_level(logging.DEBUG):
+        await run_triage_batch_loop(st, batches, snap)
+
+    # 1. Partial failure flagged, unprocessed occ_id recorded
+    assert st.llm_partial_failure is True
+    assert "occ-secret-1" in st.llm_unprocessed_occ_ids
+    assert "occ-secret-1" not in st.llm_triage_results
+
+    # 2. Verify sensitive probe string is NOT present in stdout or stderr
+    captured = capsys.readouterr()
+    assert sensitive_leak_probe not in captured.out
+    assert sensitive_leak_probe not in captured.err
+
+    # 3. Verify sensitive probe string is NOT present in any logging records
+    for record in caplog.records:
+        assert sensitive_leak_probe not in record.message

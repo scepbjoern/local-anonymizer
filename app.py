@@ -63,6 +63,7 @@ try:
         TriageEnvelope,
         TriageBatch,
         validate_batch_response,
+        extract_json_from_llm_response,
         LocalApiProvider,
         prepare_triage_batches,
         ApplyCommand,
@@ -77,6 +78,7 @@ except ImportError:
     LLM_AVAILABLE = False
     compute_triage_snapshot = None  # type: ignore
     TriageBatch = None  # type: ignore
+    extract_json_from_llm_response = None  # type: ignore
 
 # Silence presidio analyzer language mismatch warnings
 logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
@@ -568,6 +570,7 @@ def reset_app_state(st: "AppState") -> None:
     """Reset all document-specific state in AppState cleanly."""
     if getattr(st, "llm_active_task", None) and not st.llm_active_task.done():
         st.llm_active_task.cancel()
+    st.llm_active_task = None
     st.filename = ""
     st.raw_text = ""
     st.last_raw_bytes = None
@@ -632,22 +635,43 @@ async def run_triage_batch_loop(
                     state.llm_unprocessed_occ_ids.update(rem_b.occ_id_set)
                 break
 
-            envelope = TriageEnvelope.model_validate_json(raw_json)
+            clean_json = extract_json_from_llm_response(raw_json) if extract_json_from_llm_response else raw_json
+            envelope = TriageEnvelope.model_validate_json(clean_json)
             validate_batch_response(
                 envelope,
                 batch.occ_id_set,
                 state.document_revision,
                 snapshot_hash,
                 expected_request_id=batch.request_id,
+                strict_count=False,
             )
 
+            batch_received_occ_ids = set()
             for item in envelope.items:
-                state.llm_triage_results[item.occ_id] = item
+                if item.occ_id in batch.occ_id_set:
+                    state.llm_triage_results[item.occ_id] = item
+                    batch_received_occ_ids.add(item.occ_id)
+
+            missing_in_batch = batch.occ_id_set - batch_received_occ_ids
+            if missing_in_batch:
+                state.llm_partial_failure = True
+                state.llm_unprocessed_occ_ids.update(missing_in_batch)
 
         except asyncio.CancelledError:
             raise
         except Exception as ex:
-            logging.warning(f"Batch {batch.batch_index}/{batch.total_batches} fehlgeschlagen: {type(ex).__name__}")
+            err_cls = type(ex).__name__
+            logging.warning(f"Batch {batch.batch_index}/{batch.total_batches} fehlgeschlagen ({err_cls})")
+            try:
+                ui.notify(
+                    f"Batch {batch.batch_index}/{batch.total_batches} konnte nicht verarbeitet werden ({err_cls}).",
+                    type="warning",
+                    close_button=True,
+                    timeout=10000,
+                )
+            except Exception:
+                pass
+
             state.llm_partial_failure = True
             for rem_b in batches[batch_idx:]:
                 state.llm_unprocessed_occ_ids.update(rem_b.occ_id_set)
@@ -1288,10 +1312,23 @@ async def ensure_models_downloaded_with_dialog(state: AppState) -> bool:
     return True
 
 
-def extract_context_snippet(raw_text: str, start: int, end: int, window: int = 40) -> str:
-    """Extract contextual snippet around entity with highlighted keyword."""
+def extract_context_snippet(raw_text: str, start: int, end: int, window: int = 150) -> str:
+    """Extract contextual snippet around entity with highlighted keyword, prioritizing full sentences."""
     ctx_start = max(0, start - window)
     ctx_end = min(len(raw_text), end + window)
+
+    # Versuche, den Satzanfang zu finden (bis max. 250 Zeichen zurück)
+    while ctx_start > 0 and raw_text[ctx_start - 1] not in ".!?\n" and (start - ctx_start) < 250:
+        ctx_start -= 1
+    # Wenn wir an einem Leerzeichen/Satzzeichen gestoppt haben, dieses überspringen
+    if ctx_start > 0 and raw_text[ctx_start] in " \n":
+        ctx_start += 1
+
+    # Versuche, das Satzende zu finden (bis max. 250 Zeichen nach vorn)
+    while ctx_end < len(raw_text) and raw_text[ctx_end] not in ".!?\n" and (ctx_end - end) < 250:
+        ctx_end += 1
+    if ctx_end < len(raw_text) and raw_text[ctx_end] in ".!?":
+        ctx_end += 1
 
     before = raw_text[ctx_start:start].replace("\r", " ").replace("\n", " ")
     match = raw_text[start:end].replace("\r", " ").replace("\n", " ")
@@ -1812,23 +1849,39 @@ def create_ui(client: Optional[Client] = None):
                 ).props("dense outlined bg-white").classes("w-full text-xs mb-2")
                 state.register_mutating_element(base_url_input, "llm_settings")
 
-                ui.label("Modellname (z. B. phi4:latest, qwen2.5:3b):").classes("text-[11px] text-slate-600 font-medium")
+                ui.label("Modellname (z. B. qwen3:8b, ministral-3:8b, qwen3.5:9b):").classes("text-[11px] text-slate-600 font-medium")
 
                 def on_model_name_change(e):
                     if not check_mutation_allowed():
                         return
-                    state.config.llm_model_name = (e.value or "").strip()
+                    new_val = (e.value or "").strip()
+                    state.config.llm_model_name = new_val
                     save_current_config(state)
                     if state.llm_provider:
                         asyncio.create_task(state.close_llm_provider())
                     build_llm_panel()
 
                 model_name_input = ui.input(
-                    value=state.config.llm_model_name,
-                    placeholder="phi4:latest",
+                    value=state.config.llm_model_name or DEFAULT_LLM_MODEL_NAME,
+                    placeholder="qwen3:8b",
                     on_change=on_model_name_change,
-                ).props("dense outlined bg-white").classes("w-full text-xs mb-2")
+                ).props("dense outlined bg-white").classes("w-full text-xs mb-1")
                 state.register_mutating_element(model_name_input, "llm_settings")
+
+                with ui.row().classes("w-full items-center gap-1 mb-2 flex-wrap"):
+                    ui.label("Schnellwahl:").classes("text-[10px] text-slate-500")
+                    for m_tag, m_lbl in [("qwen3:8b", "Qwen3 8B (Standard)"), ("ministral-3:8b", "Ministral 3 8B"), ("qwen3.5:9b", "Qwen3.5 9B")]:
+                        def make_set_m(m):
+                            def _set():
+                                model_name_input.value = m
+                                state.config.llm_model_name = m
+                                save_current_config(state)
+                                if state.llm_provider:
+                                    asyncio.create_task(state.close_llm_provider())
+                                build_llm_panel()
+                            return _set
+                        ui.button(m_lbl, on_click=make_set_m(m_tag)).props("flat dense size=xs color=primary").classes("text-[10px] px-1.5 py-0.5 bg-indigo-50 border border-indigo-200 rounded")
+
 
                 def on_auto_review_toggle(e):
                     if not check_mutation_allowed():
@@ -2137,7 +2190,14 @@ def create_ui(client: Optional[Client] = None):
                 ui.notify("Eine LLM-Prüfung läuft bereits.", type="info")
             return state.llm_active_task
 
-        state.llm_active_task = asyncio.create_task(run_llm_triage(triggered_from_analysis=triggered_from_analysis))
+        async def _runner():
+            if client is not None:
+                with client:
+                    await run_llm_triage(triggered_from_analysis=triggered_from_analysis)
+            else:
+                await run_llm_triage(triggered_from_analysis=triggered_from_analysis)
+
+        state.llm_active_task = asyncio.create_task(_runner())
         return state.llm_active_task
 
     def check_mutation_allowed() -> bool:
@@ -2220,14 +2280,22 @@ def create_ui(client: Optional[Client] = None):
                             if imp["will_split"]:
                                 ui.badge("✂️ Eigene Gruppe", color="purple-7").props("dense")
                             if imp["action"] == "discard":
-                                ui.badge("Ignorieren", color="grey-8").props("dense")
+                                ui.badge("Ignorieren", color="grey-8")
                             elif imp["action"] == "recategorize":
-                                ui.badge(f"{imp['old_type']} ➔ {imp['new_type']}", color="amber-8").props("dense")
+                                ui.badge(f"{imp['old_type']} ➔ {imp['new_type']}", color="amber-8")
                             elif imp["action"] == "keep":
-                                ui.badge("Bestätigt", color="emerald-7").props("dense outline")
+                                ui.badge("Bestätigt", color="green-7").props("outline")
 
                             if imp.get("new_role") != imp.get("old_role"):
-                                ui.badge(f"Rolle: {imp['new_role']}", color="blue-7").props("dense")
+                                ui.badge(f"Rolle: {imp['new_role']}", color="blue-7")
+
+                        # Target category/descriptor preview badge in apply dialog
+                        clean_r = clean_tag(imp.get("new_role") or "")
+                        typ = imp.get("new_type") or imp.get("old_type")
+                        preview_tag = f"[{typ} · {clean_r}]" if clean_r else f"[{typ}]"
+                        if imp["action"] == "discard":
+                            preview_tag = "(ignoriert)"
+                        ui.badge(preview_tag, color="indigo-8").props("dense").classes("font-mono font-semibold").tooltip("Unverbindliche Kategorie-/Deskriptorvorschau (Nummerierung wird bei Übernahme ermittelt)")
 
             with ui.row().classes("w-full items-center justify-between gap-2"):
                 ui.button("Abbrechen", on_click=dialog.close).props("flat")
@@ -2272,6 +2340,20 @@ def create_ui(client: Optional[Client] = None):
                 state.llm_staged_selections.discard(item.occ_id)
             build_llm_panel()
 
+        def compute_card_target_placeholder(custom_role: Optional[str] = None) -> str:
+            if item.action == "discard":
+                return "(wird ignoriert)"
+            target_type = item.new_entity_type if (item.action == "recategorize" and getattr(item, "new_entity_type", None)) else grp.entity_type
+            target_role = custom_role if custom_role is not None else getattr(item, "descriptor_suggestion", None)
+            if target_role is None:
+                target_role = grp.role or ""
+
+            clean_r = clean_tag(target_role) if target_role else ""
+            if clean_r:
+                return f"➔ [{target_type} · {clean_r}]"
+            else:
+                return f"➔ [{target_type}]"
+
         border_cls = "border-primary ring-1 ring-primary/40 bg-white" if is_staged else "border-slate-200 bg-white"
 
         with ui.card().props(f'id="llm_card_{item.occ_id}"').classes(f"w-full p-2.5 my-1 border rounded shadow-none {border_cls}"):
@@ -2280,25 +2362,44 @@ def create_ui(client: Optional[Client] = None):
                     stage_chk = ui.checkbox(value=is_staged, on_change=on_stage_toggle).props("dense").tooltip("Für Sammelübernahme vormerken")
                     state.register_mutating_element(stage_chk, "llm")
                     ui.label(grp.original_text).classes("font-mono font-bold text-xs text-slate-900")
-                    ui.badge(grp.entity_type, color="slate").props("dense outline")
+                    ui.badge(grp.entity_type, color="blue-grey").props("outline")
                     if grp.role:
-                        ui.badge(f"Rolle: {grp.role}", color="teal").props("dense outline")
+                        ui.badge(f"Ist: {grp.role}", color="teal").props("outline")
                     if occ.context_html:
                         ui.html(occ.context_html).classes("text-xs text-slate-700 ml-2 flex-1")
 
-                with ui.row().classes("items-center gap-2"):
+                with ui.row().classes("items-center gap-2 flex-wrap"):
                     if item.action == "discard":
-                        ui.badge("Ignorieren", color="grey-8").props("dense")
+                        ui.badge("Ignorieren", color="grey-8")
                     elif item.action == "recategorize":
-                        ui.badge(f"➔ {item.new_entity_type}", color="amber-8").props("dense")
+                        ui.badge(f"➔ {item.new_entity_type}", color="amber-8")
                     elif item.action == "keep":
-                        ui.badge("Bestätigt", color="emerald-7").props("dense outline")
+                        ui.badge("Bestätigt", color="green-7").props("outline")
 
-                    if getattr(item, "descriptor_suggestion", None):
-                        ui.badge(f"Rolle: {item.descriptor_suggestion}", color="blue-7").props("dense")
+                    current_suggestion = getattr(item, "descriptor_suggestion", None) or ""
+
+                    # Target placeholder live preview badge
+                    target_badge = ui.badge(
+                        compute_card_target_placeholder(current_suggestion),
+                        color="indigo-8",
+                    ).props("dense").classes("font-mono text-xs font-bold").tooltip("Vorschau des finalen Platzhalters")
+
+                    # Inline editable input for descriptor/role
+                    def on_role_edit(e):
+                        val = (e.value or "").strip()
+                        item.descriptor_suggestion = val if val else None
+                        target_badge.set_text(compute_card_target_placeholder(val))
+
+                    if item.action != "discard":
+                        role_inp = ui.input(
+                            value=current_suggestion,
+                            placeholder="Rolle anpassen...",
+                            on_change=on_role_edit,
+                        ).props("dense outlined dense-input").classes("w-36 text-xs h-7").tooltip("Deskriptor / Rolle direkt anpassen")
+                        state.register_mutating_element(role_inp, "llm")
 
                     conf_color = "positive" if item.confidence == "high" else ("warning" if item.confidence == "medium" else "grey")
-                    ui.badge(f"{item.confidence}", color=conf_color).props("dense outline").tooltip(f"Modell-Konfidenz: {item.confidence}")
+                    ui.badge(f"{item.confidence}", color=conf_color).props("outline").tooltip(f"Modell-Konfidenz: {item.confidence}")
 
                     def single_apply():
                         open_apply_dialog([item.occ_id])
@@ -2349,6 +2450,28 @@ def create_ui(client: Optional[Client] = None):
             else:
                 for item in pure_keeps:
                     render_proposal_card(item, "emerald")
+
+        if state.llm_unprocessed_occ_ids:
+            unprocessed_items = []
+            for occ_id in state.llm_unprocessed_occ_ids:
+                grp, occ = ApplyService._find_occurrence_and_group(state.entity_groups, occ_id)
+                if grp and occ:
+                    unprocessed_items.append((grp, occ))
+
+            with ui.expansion(
+                f"⚠️ Ungeprüft / Vom Modell übersprungen ({len(unprocessed_items)})",
+                value=True,
+            ).classes("w-full bg-amber-50/70 border border-amber-300 rounded-lg mb-2"):
+                for grp, occ in unprocessed_items:
+                    with ui.card().classes("w-full p-2.5 my-1 border border-amber-200 rounded bg-white shadow-none"):
+                        with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+                            with ui.row().classes("items-center gap-2 flex-1 min-w-[280px]"):
+                                ui.label(grp.original_text).classes("font-mono font-bold text-xs text-slate-900")
+                                ui.badge(grp.entity_type, color="blue-grey").props("outline")
+                                if occ.context_html:
+                                    ui.html(occ.context_html).classes("text-xs text-slate-700 ml-2 flex-1")
+                            with ui.row().classes("items-center gap-2"):
+                                ui.badge("Vom LLM nicht beantwortet", color="amber-9").props("dense outline").tooltip("Das lokale Modell hat für diese Fundstelle im JSON-Output keinen Eintrag generiert.")
 
     def build_llm_panel():
         if not llm_panel_holder:
@@ -2438,9 +2561,16 @@ def create_ui(client: Optional[Client] = None):
                     pure_keeps = [item for item in keep_items if not getattr(item, "descriptor_suggestion", None)]
 
                     if state.llm_partial_failure:
+                        unprocessed_names = []
+                        for occ_id in list(state.llm_unprocessed_occ_ids)[:3]:
+                            grp, occ = ApplyService._find_occurrence_and_group(state.entity_groups, occ_id)
+                            if grp:
+                                unprocessed_names.append(f"„{grp.original_text}“")
+                        extra_info = f" (u. a. {', '.join(unprocessed_names)})" if unprocessed_names else ""
+
                         with ui.row().classes("w-full items-center gap-2 p-2 bg-amber-100/70 border border-amber-300 rounded text-amber-950 text-xs my-2"):
                             ui.icon("warning", size="xs").classes("text-amber-700")
-                            ui.label(f"Einige Batches konnten nicht verarbeitet werden ({len(state.llm_unprocessed_occ_ids)} Fundstellen ungeprüft). Sammelübernahme ist gesperrt; Einzelübernahmen sind möglich.").classes("font-medium")
+                            ui.label(f"Einige Batches konnten nicht verarbeitet werden ({len(state.llm_unprocessed_occ_ids)} Fundstellen ungeprüft{extra_info}). Sammelübernahme ist gesperrt; Einzelübernahmen sind möglich.").classes("font-medium")
 
                     with ui.row().classes("w-full items-center justify-between p-2 bg-white/80 border rounded text-xs my-2 flex-wrap gap-2"):
                         with ui.row().classes("items-center gap-2"):
@@ -2525,7 +2655,13 @@ def create_ui(client: Optional[Client] = None):
         batches = prepare_triage_batches(candidates, state.document_revision, snapshot_hash)
 
         try:
-            if state.llm_provider is None:
+            if (
+                state.llm_provider is None
+                or getattr(state.llm_provider, "model_name", "") != state.config.llm_model_name.strip()
+                or getattr(state.llm_provider, "base_url", "") != state.config.llm_base_url.strip()
+            ):
+                if state.llm_provider is not None:
+                    await state.close_llm_provider()
                 state.llm_provider = LocalApiProvider(
                     base_url=state.config.llm_base_url,
                     model_name=state.config.llm_model_name,

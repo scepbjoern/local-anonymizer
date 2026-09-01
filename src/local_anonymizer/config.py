@@ -45,7 +45,7 @@ logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
 DEFAULT_GLINER_MODEL_NAME = "urchade/gliner_multi_pii-v1"
 DEFAULT_EUPII_MODEL_NAME = "bardsai/eu-pii-anonimization-multilang"
 DEFAULT_LLM_BASE_URL = "http://127.0.0.1:11434/v1"
-DEFAULT_LLM_MODEL_NAME = ""
+DEFAULT_LLM_MODEL_NAME = "qwen3:8b"
 
 
 class AppConfig:

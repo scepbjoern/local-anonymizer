@@ -15,6 +15,7 @@ from local_anonymizer.llm.schema import (
     TriageDiscardItem,
     TriageEnvelope,
     validate_batch_response,
+    extract_json_from_llm_response,
 )
 from local_anonymizer.llm.provider import LlmProvider, LocalApiProvider
 from local_anonymizer.llm.batching import TriageBatch, prepare_triage_batches

@@ -1,5 +1,5 @@
-"""Pydantic V2 schema definitions for LLM Triage Layer (Phase 6A)."""
-
+import json
+import re
 from typing import Annotated, Any, Dict, List, Literal, Optional, Set, Union
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +18,7 @@ class BaseTriageItem(BaseModel):
 
 class TriageKeepItem(BaseTriageItem):
     action: Literal["keep"] = Field("keep", description="Confirm existing entity classification")
+    new_entity_type: Optional[Literal[None]] = Field(None, description="Must be null if present")
     descriptor_suggestion: Optional[str] = Field(
         None,
         max_length=100,
@@ -37,6 +38,8 @@ class TriageRecategorizeItem(BaseTriageItem):
 
 class TriageDiscardItem(BaseTriageItem):
     action: Literal["discard"] = Field("discard", description="Mark occurrence as false positive (ignore)")
+    new_entity_type: Optional[Literal[None]] = Field(None, description="Must be null if present")
+    descriptor_suggestion: Optional[Literal[None]] = Field(None, description="Must be null if present")
 
 
 TriageItem = Annotated[
@@ -55,15 +58,40 @@ class TriageEnvelope(BaseModel):
     items: List[TriageItem] = Field(..., description="List of triage verdicts for this batch")
 
 
+def extract_json_from_llm_response(text: str) -> str:
+    """
+    Robustly extract JSON payload from raw LLM output, stripping reasoning tags (<think>...</think>),
+    markdown code blocks (```json ... ```), and extraneous leading/trailing text.
+    """
+    if not text:
+        return ""
+    # Strip <think>...</think> tags from reasoning models (e.g. DeepSeek R1)
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    # Match markdown code block
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+
+    # Extract outermost JSON object { ... }
+    first_brace = cleaned.find("{")
+    last_brace = cleaned.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        cleaned = cleaned[first_brace : last_brace + 1].strip()
+
+    return cleaned
+
+
 def validate_batch_response(
     envelope: TriageEnvelope,
     expected_occ_ids: Set[str],
     expected_doc_rev: int,
     expected_doc_hash: str,
     expected_request_id: str,
+    strict_count: bool = True,
 ) -> None:
     """
-    Perform strict atomic verification of a batch response envelope against expectations.
+    Perform verification of a batch response envelope against expectations.
     Raises ValueError with a descriptive message if any check fails.
     """
     if envelope.schema_version != "1.0":
@@ -86,10 +114,11 @@ def validate_batch_response(
     if len(received_ids) != len(received_set):
         raise ValueError("Duplicate occurrence IDs detected in LLM response")
 
-    missing = expected_occ_ids - received_set
-    if missing:
-        raise ValueError(f"Incomplete batch: missing {len(missing)} expected occurrence IDs")
-
     foreign = received_set - expected_occ_ids
     if foreign:
         raise ValueError(f"Invalid batch: received {len(foreign)} unexpected occurrence IDs")
+
+    if strict_count:
+        missing = expected_occ_ids - received_set
+        if missing:
+            raise ValueError(f"Incomplete batch: missing {len(missing)} expected occurrence IDs")
