@@ -61,10 +61,10 @@ pip install -e ".[gui]"
 ## 4. First-Run Behavior & Model Weights
 
 * **Dual-Model Ensemble Downloads:**
-  * **GLiNER (`urchade/gliner_multi_pii-v1`, ~150 MB):** Zero-shot model for organizations, roles, and open-vocabulary safety net.
-  * **EU-PII (`bardsai/eu-pii-anonimization-multilang`, ~1.1 GB):** Specialized token-classification model for European names, locations, IDs, and health data.
-* **Transparent Confirmation on First Download:** On the very first run, if required models are not yet cached locally under `~/.cache/huggingface/hub/`, the application presents an interactive confirmation dialog detailing the exact model names and download sizes before fetching any weights.
-* **100% Offline After Caching:** Once models are downloaded, all subsequent runs operate completely offline (`HF_HUB_OFFLINE=1`).
+  * **GLiNER (`urchade/gliner_multi_pii-v1`, ~1.10 GB):** Zero-shot model for organizations, roles, and open-vocabulary safety net.
+  * **EU-PII (`bardsai/eu-pii-anonimization-multilang`, ~1.10 GB):** Specialized token-classification model for European names, locations, IDs, and health data.
+* **Transparent Confirmation on First Download:** On the very first run, if required models are not yet cached locally under `~/.cache/huggingface/hub/`, the application presents an interactive confirmation dialog detailing the exact model names and download sizes (~1.10 GB each) before fetching any weights.
+* **Offline-First Operation:** Inferences, entity analyses, and normal operations run strictly locally. Model loaders attempt loading from the local cache first under thread-safe offline context management (`set_huggingface_offline_mode`); external connections are only initiated temporarily during an explicitly confirmed download.
 * **Async Background Warmup:** The NiceGUI application launches immediately (<0.5s startup). Cached ML models initialize asynchronously in a background thread. The status badge in the UI transitions to *"Modell bereit"* once warmup completes.
 
 ---

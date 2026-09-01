@@ -59,7 +59,7 @@ Das Tool ermöglicht es Studierenden, Dozierenden und Wissensarbeitern, vertraul
   * Zuordnung interner Firmenkürzel (z. B. `"abcd"` $\rightarrow$ `PERSON`).
   * Fehlertolerantes Matching bei Tippfehlern (z. B. `"ZHW"` $\rightarrow$ `"ZHAW"`).
 * **Globale & Session-Ignore-Listen:** Schutz generischer Rollen, Grade und Feldbezeichnungen (`CAS`, `BSc`, `Studierende`, `Dozent`, `Unternehmen`, `E-Mail`, `App`, `Applikation`). Eingebaute Standard-Ignores können durch bewusste Glossar-Einträge überschrieben werden; persönliche Ignore-Einträge behalten immer Vorrang.
-* **Dreistufige Erkennungssteuerung:** `Aus` blockiert alle Quellen einer Kategorie, `Nur Glossar & manuell` lässt nur explizite und manuelle Einträge zu, `Alle Quellen` aktiviert KI-, Bibliotheks-, Regex- und explizite Erkennung.
+* **Vierstufige Erkennungssteuerung:** `Aus` (`off`) blockiert alle Quellen einer Kategorie, `Nur Glossar & manuell` (`explicit_only`) lässt nur explizite und manuelle Einträge zu, `Nur Glossar, manuell & EU-PII` (`explicit_eupii`, für unterstützte Kategorien) kombiniert deterministische Validatoren und das EU-PII-Spezialmodell unter Ausschluss von GLiNER, und `Alle Quellen` (`all`) aktiviert sämtliche KI-, Bibliotheks-, Regex- und expliziten Quellen.
 * **Optionale Rollen-Erkennung:** Präzisere PERSON-Prompts reduzieren Falschpositive bei generischen Rollennomen. `ROLE`/`JOB_TITLE` erkennt Funktionsbezeichnungen, ist aber standardmässig deaktiviert und kann bei Bedarf über KI oder Glossar aktiviert werden.
 
 ---
@@ -163,8 +163,8 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 * 99 automatisierte Regressionstests bestanden (100% Pass-Rate) + 1 EU-PII Live-Modell-Integrationstest.
 * **Dual-Modell Ensemble:** Integration des europäischen Token-Klassifikators `bardsai/eu-pii-anonimization-multilang` (Stufe 2) mit Subtoken-Span-Score-Aggregation und kanonischem Schutz deterministischer PII (Stufe 3) und Glossareinträgen (Stufe 4).
 * **4-Stufen Quellenhierarchie:** Klare Vorrangregelung (`Glossar > Deterministisch/Bibliotheken > EU-PII > GLiNER`) mit differenzierten Quell-Badges in der Review-Tabelle.
-* **Granulare Erkennungssteuerung:** Dreistufige Steuerung pro Kategorie (`Alle Quellen`, `Nur Glossar & manuell`, `Aus`) sowie `explicit_eupii`-Modus semantics.
-* **Transparente Modell-Downloads:** Interaktiver Bestätigungsdialog mit Modellnamen und Download-Größen vor dem Erstbezug von Hugging Face; thread-sichere Offline-Modus-Verwaltung (`HF_HUB_OFFLINE=1`).
+* **Granulare Erkennungssteuerung:** Vierstufige Steuerung pro Kategorie (`Alle Quellen`, `Nur Glossar, manuell & EU-PII`, `Nur Glossar & manuell`, `Aus`) sowie `explicit_eupii`-Modus semantics.
+* **Transparente Modell-Downloads:** Interaktiver Bestätigungsdialog mit Modellnamen und Download-Größen vor dem Erstbezug von Hugging Face; thread-sichere Offline-Zustandsverwaltung (`set_huggingface_offline_mode`).
 * **Robuste PDF-Multiprocessing-Extraktion:** Multi-Core `ProcessPoolExecutor` mit serialisierendem `_pdf_env_lock`, altersbasiertem Schutz gegen konkurrierende App-Starts (30-Minuten-Betriebsgrenze) und sicherem `finally`-Cleanup.
 
 ### 🔮 Phase 5a: Homonym-Zuordnung pro Fundstelle (Geplant nach CAS-Deliverable)

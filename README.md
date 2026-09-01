@@ -98,7 +98,7 @@ On Windows, you can also double-click `start_windows.vbs` for a silent backgroun
 
 > [!NOTE]
 > **First-Run Model Downloads & Offline-First Operation:**
-> On the very first run, if required local ML models (GLiNER ~150 MB, EU-PII ~1.1 GB) are not yet cached under `~/.cache/huggingface/hub/`, the application displays an interactive confirmation dialog with the exact model names and download sizes before fetching any files. Once cached, the application operates 100% offline (`HF_HUB_OFFLINE=1`).
+> On the very first run, if required local ML models (GLiNER ~1.10 GB, EU-PII ~1.10 GB) are not yet cached under `~/.cache/huggingface/hub/`, the application displays an interactive confirmation dialog with the exact model names and download sizes before fetching any files. Inferences and document analyses run strictly locally; model loaders attempt local cache access first under thread-safe offline context management (`set_huggingface_offline_mode`), connecting only temporarily during an authorized download.
 
 > [!WARNING]
 > **Hinweis für macOS-Nutzer:**

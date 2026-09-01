@@ -10,12 +10,12 @@ Die Seitenleiste steuert jede Kategorie unabhängig:
 
 | Modus | Bedeutung |
 |---|---|
-| **Alle Quellen** | KI, Regex, Bibliothek, Glossar und manuelle Einträge |
-| **Nur Glossar & manuell** | keine automatische Erkennung; nur explizite Einträge |
+| **Alle Quellen** | Sämtliche Quellen (KI, Bibliotheken, Regex, Glossar und manuelle Einträge) |
+| **Nur Glossar, manuell, deterministisch & EU-PII** | Glossar, manuelle Einträge, deterministische Bibliotheken & EU-PII, aber ohne GLiNER (für PERSON, LOCATION, ID_NUMBER, HEALTH_DATA) |
+| **Nur Glossar & manuell** | keine automatische Erkennung; nur explizite und manuelle Einträge |
 | **Aus** | auch Glossar- und manuelle Treffer dieser Kategorie werden deaktiviert |
 
-Die Farben unterstützen die Orientierung: Grün steht für **Alle Quellen**,
-Orange für **Nur Glossar & manuell** und Rot für **Aus**.
+Die Farben unterstützen die Orientierung: Grün steht für **Alle Quellen**, Blau für **Nur Glossar, manuell, deterministisch & EU-PII**, Orange für **Nur Glossar & manuell** und Rot für **Aus**.
 
 Wenn du einen Modus nach der Analyse änderst, werden bereits vorhandene Treffer
 sofort nach der neuen Regel gefiltert. Für neu aktivierte automatische Quellen

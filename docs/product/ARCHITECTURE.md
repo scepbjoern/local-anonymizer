@@ -109,9 +109,9 @@
   - `AHVNumberRecognizer` validiert die AHV-Kontrollziffer; `UIDNumberRecognizer` validiert CHE/UID nach Modulo 11. Formal korrekte, aber prüfziffern-ungültige Nummern werden nicht als Entitäten ausgegeben.
   - `IT_SYSTEM` wird über das dynamisch aus dem Glossar abgeleitete Zieltypenset sowie separate GLiNER-Sicherheitsnetz-Prompts erkannt.
 
-Die optionale Kategorie `ROLE` wird wie andere Kategorien über die drei UI-Modi gesteuert und standardmässig nicht aktiviert. Dadurch bleiben fachlich wichtige Formulierungen wie „Der Sachbearbeiter prüft …“ standardmässig erhalten; bei erhöhtem Identifikationsrisiko können Funktionsbezeichnungen wie `CEO` oder `Leiter Prozessmanagement` gezielt anonymisiert werden. Generische Rollennomen werden zusätzlich über die eingebaute Ignore-Liste gegen typische PERSON-Falschpositive geschützt.
+Die optionale Kategorie `ROLE` wird über die UI-Modi gesteuert und standardmässig nicht aktiviert. Dadurch bleiben fachlich wichtige Formulierungen wie „Der Sachbearbeiter prüft …“ standardmässig erhalten; bei erhöhtem Identifikationsrisiko können Funktionsbezeichnungen wie `CEO` oder `Leiter Prozessmanagement` gezielt anonymisiert werden. Generische Rollennomen werden zusätzlich über die eingebaute Ignore-Liste gegen typische PERSON-Falschpositive geschützt.
 
-Die UI-Schalter für Entitätstypen verwenden drei Modi: `Aus` blockiert alle Quellen, `Nur Glossar & manuell` deaktiviert KI-/Bibliotheks-/Regex-Erkennung und `Alle Quellen` aktiviert sämtliche Quellen. Glossar-Treffer werden in einem getrennten, direkten Pass geprüft; dadurch kann beispielsweise `IT_SYSTEM` auf „Nur Glossar & manuell“ stehen, während ein vollständiges „Aus“ auch `SAP` blockiert. Manuelle, dokumentbezogene Markierungen folgen derselben Kategorie-Richtlinie.
+Die UI-Schalter für Entitätstypen verwenden bis zu vier Modi: `Aus` blockiert alle Quellen, `Nur Glossar & manuell` beschränkt sich auf explizite Einträge, `Nur Glossar, manuell, deterministisch & EU-PII (ohne GLiNER)` schliesst GLiNER für sensible Kernkategorien gezielt aus, und `Alle Quellen` aktiviert sämtliche Quellen. Glossar-Treffer werden in einem getrennten, direkten Pass geprüft; dadurch kann beispielsweise `IT_SYSTEM` auf „Nur Glossar & manuell“ stehen, während ein vollständiges „Aus“ auch `SAP` blockiert. Manuelle, dokumentbezogene Markierungen folgen derselben Kategorie-Richtlinie.
 
 ### 2.3 Platzhalter-Engine & Entity-Linking (`anonymizer.py`) *(Umgesetzt in Phase 3)*
 - **Format-Modi:**
@@ -146,7 +146,7 @@ Die UI-Schalter für Entitätstypen verwenden drei Modi: `Aus` blockiert alle Qu
 
 | Aspekt | Garantie | Technische Umsetzung |
 | :--- | :--- | :--- |
-| **Datenabfluss** | 0% externe Datenübertragung | Offline-Modus für HuggingFace (`HF_HUB_OFFLINE=1`), kein Telemetrie-Code in NiceGUI/Presidio |
+| **Datenabfluss** | 0% externe Datenübertragung im Normalbetrieb | Thread-sicherer lokaler Cache-First-Modus (`set_huggingface_offline_mode`), temporäre Online-Schaltung nur bei explizit autorisiertem Erstdownload, kein Telemetrie-Code in NiceGUI/Presidio |
 | **Persistenz** | Keine absichtliche dauerhafte Speicherung von PII durch die Pipeline | Entitäten und Mappings werden im Python-State verarbeitet. Beim Drag-and-drop kann ein Upload kurzzeitig im lokalen Ordner `temp_uploads` liegen; er wird nach dem RAM-Transfer und zusätzlich beim Beenden bereinigt. |
 | **Reversibilität** | 100% mathematische Wiederherstellbarkeit | Deterministische JSON-Mappingtabelle, Single-Pass-Regex |
 | **Admin-Rechte** | 0% Admin-Rechte erforderlich | Reine User-Space-Dependencies (`uv pip install`) |
