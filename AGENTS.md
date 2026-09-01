@@ -79,7 +79,7 @@ Agents making code modifications must ensure all tests pass:
 ```bash
 uv run pytest -q
 ```
-* Expected outcome: 152 passed unit and regression tests (1 integration test deselected by default).
+* Expected outcome: 188 passed unit and regression tests (1 integration test deselected by default).
 * Run the live EU-PII integration test when modifying recognizer lifecycle:
   ```bash
   uv run pytest -m integration -q

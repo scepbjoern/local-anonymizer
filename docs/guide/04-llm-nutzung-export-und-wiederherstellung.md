@@ -9,11 +9,16 @@ Informationen speichern. Beim vollständigen Export entstehen typischerweise:
 2. eine Mapping-Datei (`*_mapping.json`);
 3. ein Prüfbericht (`*_report.json`).
 
-Die anonymisierte Datei ist für die Weitergabe an ein externes LLM vorgesehen.
+Die anonymisierte Datei ist für die Weitergabe an ein externes oder internes Verarbeitungs-LLM vorgesehen (z. B. ChatGPT, Claude, Microsoft Copilot oder ein lokales Modell für Textzusammenfassungen).
+
+> [!NOTE]
+> **Begriffliche Unterscheidung:**
+> Unterscheide klar zwischen der **lokalen LLM-Review-Assistenz** (die während der Triage auf deinem Rechner läuft und einzelne Fundstellen prüft) und dem **nachgelagerten Verarbeitungs-LLM** (an das du den fertig anonymisierten Gesamttext für deine eigentliche Arbeitsaufgabe sendest).
+
 Die Mapping-Datei enthält die Zuordnung zwischen Platzhaltern und Originalwerten
 und muss lokal beziehungsweise geschützt aufbewahrt werden.
 
-## Arbeit mit einem externen LLM
+## Arbeit mit einem Verarbeitungs-LLM (Cloud oder On-Premise)
 
 Übermittle nur die anonymisierte Datei und deinen Arbeitsauftrag. Kontrolliere
 vorher, dass keine Originalnamen, E-Mail-Adressen, internen Systeme oder

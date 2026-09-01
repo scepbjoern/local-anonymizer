@@ -167,14 +167,24 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 * **Transparente Modell-Downloads:** Interaktiver Bestätigungsdialog mit Modellnamen und Download-Größen vor dem Erstbezug von Hugging Face; thread-sichere Offline-Zustandsverwaltung (`set_huggingface_offline_mode`).
 * **Robuste PDF-Multiprocessing-Extraktion:** Multi-Core `ProcessPoolExecutor` mit serialisierendem `_pdf_env_lock`, altersbasiertem Schutz gegen konkurrierende App-Starts (30-Minuten-Betriebsgrenze) und sicherem `finally`-Cleanup.
 
-### 🔮 Phase 5a: Homonym-Zuordnung pro Fundstelle (Geplant nach CAS-Deliverable)
-* Granulare Disambiguierung identischer Textstellen innerhalb eines Dokuments direkt über Einzelauswahlen in den aufklappbaren Kontext-Akkordeons des Review-GUIs.
+### ✅ Phase 5a: Homonym-Zuordnung pro Fundstelle (Abgeschlossen)
+* Granulare Disambiguierung identischer Textstellen innerhalb eines Dokuments: Einzelne Vorkommen können in den aufklappbaren Kontext-Akkordeons direkt in eine eigenständige Gruppe mit separater Rolle und Nummerierung abgespalten werden (`split_occurrence_to_new_group`).
+
+### ✅ Phase 6A: Lokaler LLM-Triage-Layer (Abgeschlossen)
+* **Pydantic-v2 Schema-Vertrag (`schema.py`):** Strikte Validierung (`extra="forbid"`), Snapshot- und Revisionsbindung zur Vermeidung von Drift.
+* **Deterministisches Batching (`batching.py`):** Dynamisches Token-Budgeting, Kontext-Snippets mit Schutz vor Prompt-Injection, sequenzielle Abarbeitung.
+* **Lokaler Loopback-Provider (`provider.py`):** Strikte Beschränkung auf `127.0.0.1`/`localhost`, automatischer HTTP-400/422-Retry ohne `reasoning_effort`, Streaming-Größenbegrenzung (2 MB), kein Cloud-Fallback. Getestet mit Referenzmodell `qwen3:8b` via Ollama.
+* **Atomare Mutation & Rollback (`apply_service.py`):** Vorvalidierung kanonischer Entitätstypen, Auswirkungsprüfung mit unverbindlicher Vorschau, atomare Übernahme mit automatischem Rollback bei Fehlern.
+* **Human-in-the-Loop Triage-Panel (`app.py`):** Vorschlagskarten (Keep, Recategorize, Discard) mit Inline-Rollenanpassung, Vormerkung für Sammelübernahme, Auswirkungsdialog und transparenter Kennzeichnung ungeprüfter Teilantworten.
+* **Umfassende Testabdeckung:** 188 automatisierte Unit- und Regressionstests bestanden (100% Pass-Rate) + 1 EU-PII Live-Modell-Integrationstest.
 
 ### 🔮 Phase 5b: Projekt-Registry für dokumentübergreifende Mappings (Geplant nach CAS-Deliverable)
 * Verschlüsselte, strikt projekt- und kontextbezogene Mapping-Registry (Passphrase-geschützt via KeePass) zur Wiederverwendung konsistenter Pseudonyme über mehrere Dokumente hinweg.
 * Projektbezogene Glossare, Ignore-Listen, Entitätseinstellungen und manuell vergebene Rollen, beispielsweise `LEHRPERSON` oder `STUDIENGANGSLEITUNG`, sollen über mehrere Dokumente einer CAS-Abschlussarbeit konsistent verfügbar sein.
 * Eine kontrollierte projektübergreifende Wiederverwendung kann später geprüft werden; Speicherform und genaue Berechtigungsgrenzen sind noch offen.
 
-### 🔮 Phase 6: Lokaler SLM-Triage-Layer (Geplant / Ausblick)
-* Optionaler lokaler LLM-/SLM-Prüflayer (z. B. via Ollama / LM Studio), der Begriffe, Kontext und Tabellenentscheidung gemeinsam bewertet und Empfehlungen für Entitätstyp, Anonymisierung, Glossar und Rolle abgibt.
-* Unterstützung bei schwierigen Fällen sowie optionaler Sicherheitscheck des bereits anonymisierten Dokuments auf verbliebene sensible Angaben.
+### 🔮 Phase 6B: Finale Ausgangskontrolle (Geplant / Ausblick)
+* Automatisierter Sicherheitscheck des bereits anonymisierten Dokuments vor dem Export: Das lokale LLM sucht nach übersehenen Rest-Identifikatoren oder Kontextlecks.
+
+### 🔮 Smart-Linking (Geplant / Ausblick)
+* LLM-unterstütztes Co-Reference Linking für komplexe Koreferenzen (z. B. Pronomen, Spitznamen, Berufsbezeichnungen im Textfluss) mit menschlicher Freigabe.

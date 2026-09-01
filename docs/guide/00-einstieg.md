@@ -13,19 +13,19 @@ verwenden möchten.
 
 ```mermaid
 flowchart LR
-    A[Originaldokument] --> B[Lokale Analyse]
-    B --> C[Review-Tabelle]
-    C --> D[Anonymisierte Datei]
-    C --> E[Mapping bleibt lokal]
-    D --> F[Externes oder später lokales LLM]
-    F --> G[Antwort mit Platzhaltern]
-    G --> H[Lokale Wiederherstellung]
-    E --> H
+    A[Originaldokument] --> B[Lokale Erkennung<br/>GLiNER, EU-PII, Regex]
+    B --> C{Optionale lokale<br/>LLM-Triage}
+    C -->|Vorschläge| D[Menschliche Review-Tabelle<br/>Human-in-the-Loop]
+    B -->|Direkt| D
+    D --> E[Anonymisierte Datei]
+    D --> F[Mapping bleibt lokal]
+    E --> G[Externes oder internes<br/>Verarbeitungs-LLM]
+    G --> H[Antwort mit Platzhaltern]
+    H --> I[Lokale Wiederherstellung]
+    F --> I
 ```
 
-Du prüfst die Fundstellen zuerst selbst. Danach gibst du nur die
-anonymisierte Datei weiter. Die Mapping-Datei bleibt bei dir und wird erst
-für die spätere Wiederherstellung benötigt.
+Du behältst jederzeit die volle Kontrolle (Human-in-the-Loop): Nach der Erkennung kannst du optional einen lokalen LLM-Review-Assistenten zuschalten, der Vorschläge zur Bereinigung von False Positives und Rollen-Deskriptoren macht. Erst durch deine explizite Bestätigung in der Review-Tabelle werden Anpassungen wirksam. Danach gibst du nur die anonymisierte Datei an dein Ziel-LLM weiter. Die geheime Mapping-Tabelle bleibt auf deinem Rechner und wird für die spätere Wiederherstellung genutzt.
 
 ## Wichtiger Plattformhinweis
 

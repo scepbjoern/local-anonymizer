@@ -107,3 +107,26 @@ Platzhalter, ändert aber nicht automatisch den Entitätstyp.
 Verwandte Schreibweisen wie ein Vorname, eine Anrede oder ein Genitiv können
 mit einer Hauptperson verknüpft werden. Überprüfe solche Vorschläge immer im
 Kontext, bevor du sie übernimmst.
+
+## Optionale lokale LLM-Review-Assistenz (Triage-Panel)
+
+Wenn du das optionale Zusatzpaket `[llm]` installiert und in der Seitenleiste ein lokales Modell (z. B. `qwen3:8b` über Ollama) eingerichtet hast, steht dir das **LLM-Triage-Panel** zur Verfügung.
+
+### Wie die Assistenz funktioniert
+1. **Sequenzielle Batches:** Die erkannten Fundstellen werden in kleinen, tokenbegrenzten Portionen mit ihrem jeweiligen Textkontext an das lokale Modell übergeben.
+2. **Snapshot-Schutz:** Jede Triage bindet sich kryptografisch an den aktuellen Bearbeitungsstand (Snapshot-Hash). Bearbeitest du den Text währenddessen im Editor, werden veraltete Antworten verworfen.
+3. **Drei Vorschlagskategorien:**
+   - **Bestätigt (`keep`):** Das Modell stuft die Fundstelle als echte PII ein (oft mit Vorschlag für einen präzisen Rollen-Deskriptor wie `CHEFÄRZTIN` oder `DOZENT`).
+   - **Rekategorisieren (`recategorize`):** Die Fundstelle ist sensibel, gehört aber zu einer anderen Kategorie (z. B. `PERSON` ➔ `ORGANIZATION`).
+   - **Ignorieren / False Positive (`discard`):** Das Wort ist im Kontext ein gewöhnliches Nomen oder Verb und sollte nicht anonymisiert werden.
+4. **Direkte Anpassung:** Deskriptor-Vorschläge können direkt auf der Karte im Eingabefeld angepasst werden.
+5. **Human-in-the-Loop & Auswirkungsprüfung:**
+   - Die Vorschläge des Modells verändern **nichts automatisch**.
+   - Du wählst Vorschläge einzeln oder über Kontrollkästchen aus („Alle vormerken“).
+   - Ein Klick auf **Übernehmen** öffnet den **Auswirkungsdialog**. Dieser zeigt übersichtlich alle betroffenen Gruppen, allfällige Gruppen-Splits und die neue unverbindliche Kategorie-/Deskriptorvorschau.
+   - Erst nach deiner expliziten Bestätigung mit **Bestätigen & Übernehmen** wird die Review-Tabelle atomar aktualisiert. Tritt ein unerwarteter Fehler auf, erfolgt ein automatischer Rollback auf den vorherigen Stand.
+
+### Umgang mit unvollständigen Läufen (Teilantworten)
+Bricht die Modellverbindung ab oder kann ein Batch wegen eines Timeouts nicht verarbeitet werden, zeigt die Anwendung einen amberfarbenen Hinweis mit den betroffenen ungeprüften Fundstellen.
+- **Sicherheit:** Die Sammelübernahme („Ausgewählte Änderungen übernehmen“) wird bei unvollständigen Läufen gesperrt.
+- **Einzelübernahme:** Erfolgreich geprüfte Vorschläge können weiterhin einzeln geprüft und übernommen werden. Ungeprüfte Fundstellen verbleiben im ursprünglichen Zustand der Review-Tabelle.

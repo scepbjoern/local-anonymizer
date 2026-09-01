@@ -1,51 +1,25 @@
 # Ausblick
 
-Die aktuelle Auslieferung konzentriert sich auf lokale Erkennung, menschliche
-Prüfung und reversible Anonymisierung. Die folgenden Erweiterungen sind noch
-nicht Bestandteil dieser Version.
+Die aktuelle Auslieferung umfasst die lokale hybride Erkennung (GLiNER, EU-PII, Regex, Schweizer Prüfziffern), die Homonym-Trennung (Phase 5a) sowie die optionale lokale LLM-Review-Assistenz (Phase 6A).
 
-## Lokales LLM als zusätzliche Prüfung
+Die folgenden Erweiterungen sind Gegenstand künftiger Entwicklungsphasen:
 
-Später kann ein lokales LLM die Review-Tabelle unterstützen. Es könnte für jede
-Fundstelle den Begriff und seinen Kontext betrachten und Empfehlungen abgeben:
+## 1. Finale Ausgangskontrolle (Phase 6B)
 
-- Ist die erkannte Kategorie plausibel?
-- Handelt es sich um eine Person, eine Organisation oder einen harmlosen
-  Fachbegriff?
-- Sollte die Fundstelle anonymisiert werden?
-- Ist eine Rolle oder ein Glossar-Eintrag sinnvoll?
+Als zweiter optionaler Prüfschritt ist eine automatisierte Sicherheits-Endkontrolle des fertig anonymisierten Textes vorgesehen:
+- Das lokale LLM liest das fertige Dokument vor dem Export und sucht nach übersehenen Rest-Identifikatoren oder Kontextlecks (z. B. unmaskierte Funktionsbezeichnungen in Kombination mit seltenen Abteilungsnamen).
+- Erkannte Restrisiken werden als Prüfhinweis vor dem Export signalisiert.
 
-Das wäre besonders hilfreich bei kniffligen Fällen wie einem Namen, der als
-Organisation erkannt wurde, oder einem internen Begriff, der nur in einem
-bestimmten Kontext sensibel ist.
+## 2. LLM-unterstütztes Smart-Linking
 
-Zusätzlich könnte das lokale LLM nach dem Review einen Sicherheitscheck des
-anonymisierten Dokuments durchführen und nach verbliebenen sensiblen Angaben
-suchen.
+Erweiterung des deterministischen Linking-Algorithmus:
+- Erkennung komplexerer Koreferenzen (z. B. Pronomen, Spitznamen, Berufsbezeichnungen im Textfluss), die deterministisch schwer auflösbar sind.
+- Vorschlag von Verknüpfungen zur Hauptentität mit menschlicher Freigabe.
 
-Das LLM würde Empfehlungen liefern. Die endgültige Entscheidung sollte bei der
-Person bleiben, die das Dokument kennt und freigibt.
+## 3. Projektbezogene Mappings & Registry (Phase 5b)
 
-## Projektbezogene Einstellungen
-
-Eine spätere Projektfunktion könnte Einstellungen, Begriffe und Entscheidungen
-für einen bestimmten Arbeitszusammenhang sichern, beispielsweise für eine
-CAS-Abschlussarbeit.
-
-Dann könnte unter anderem festgelegt werden:
-
-- dass `SAP` in diesem Projekt immer als `IT_SYSTEM` behandelt wird;
-- welche Begriffe projektweit ignoriert werden;
-- welche Rollen verwendet werden, etwa `LEHRPERSON` oder
-  `STUDIENGANGSLEITUNG`;
-- welche Person welchem projektbezogenen Platzhalter entspricht;
-- wie dieselben Begriffe über mehrere Dokumente hinweg konsistent behandelt
-  werden.
-
-Später könnte ein Teil dieser Einstellungen auch projektübergreifend genutzt
-werden. Ob die Daten dafür in JSON-Dateien, einer Datenbank oder einer anderen
-Form gespeichert werden, ist noch offen.
-
-Diese Funktionen werden erst in späteren Entwicklungsphasen konkret geplant
-und umgesetzt.
+Eine künftige Projektfunktion könnte Einstellungen, Begriffe und Mappings für einen zusammenhängenden Arbeitskontext sichern (z. B. eine mehrteilige CAS-Abschlussarbeit oder eine Fallaktenserie):
+- Konsistente Platzhaltervergabe über mehrere Dokumente hinweg (`[PERSON_1_PROJEKTLEITER]` bleibt in Dokument A und B dieselbe reale Person).
+- Projektweite Begriffs- und Ignore-Listen.
+- Speicherung und Berechtigungsgrenzen (z. B. per SQLite oder verschlüsselter Projekt-JSON) werden zu gegebener Zeit spezifiziert.
 

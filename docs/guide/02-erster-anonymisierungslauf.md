@@ -27,18 +27,23 @@ Nach dem Laden kannst du den extrahierten Originaltext anzeigen und bei Bedarf d
 ## 2. Erkennung konfigurieren
 
 In der Seitenleiste findest du **Erkennung je Entitätstyp**. Für jede Kategorie
-gibt es drei Modi:
+gibt es vier Modi:
 
-- **Alle Quellen**: automatische Erkennung, Regex beziehungsweise Bibliothek
+- **Alle Quellen**: automatische KI-/ML-Erkennung, Regex beziehungsweise Bibliothek
   sowie Glossar und manuelle Einträge;
+- **Nur ML & Regex**: automatische Erkennung ohne Berücksichtigung des Glossars;
 - **Nur Glossar & manuell**: keine automatische Erkennung, aber explizite
-  Einträge und manuelle Markierungen;
+  Glossareinträge und manuelle Markierungen;
 - **Aus**: die Kategorie ist vollständig deaktiviert.
 
 Für den ersten Lauf kannst du die Voreinstellungen verwenden. Die optionale
 Kategorie `ROLE` ist standardmässig ausgeschaltet, weil Funktionsbezeichnungen
 wie `Lehrperson` oder `Studiengangsleitung` oft als fachlicher Inhalt erhalten
 bleiben sollen.
+
+In den **LLM-Einstellungen** der Seitenleiste kannst du optional festlegen, ob
+nach der deterministischen Analyse automatisch eine **LLM-Review-Assistenz**
+ausgeführt werden soll.
 
 ![Konfiguration und Texteingabe im lokalen Browser](assets/01-review-konfiguration.png)
 
@@ -49,6 +54,10 @@ je nach Konfiguration und Projekt abweichen.*
 
 Klicke auf **Text / Dokument analysieren**. Die Anwendung verarbeitet den Text
 lokal und baut anschliessend die Review-Tabelle auf.
+
+Ist die lokale LLM-Review-Assistenz aktiviert und ein lokales Modell (z. B. `qwen3:8b`)
+bereit, führt die Anwendung im Anschluss sequenziell die Kontextprüfung der
+Fundstellen durch und bereitet Vorschläge im Triage-Panel auf.
 
 Die Tabelle fasst gleiche Begriffe zusammen. Über die jeweilige Zeile kannst du
 die einzelnen Fundstellen und ihren Kontext aufklappen.

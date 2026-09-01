@@ -74,7 +74,7 @@ pip install -e ".[gui]"
 
 #### Optional: Local LLM Triage Layer Extra (`[llm]`)
 
-To enable the optional local LLM review assistance with local OpenAI-compatible endpoints:
+To enable the optional local LLM review assistance with local OpenAI-compatible endpoints (e.g. Ollama):
 
 ```bash
 # Via uv:
@@ -83,6 +83,23 @@ uv sync --extra gui --extra llm
 # Via pip:
 pip install -e ".[gui,llm]"
 ```
+
+**Local Model Setup with Ollama:**
+1. Install [Ollama](https://ollama.com/) and start the local service (default: `http://127.0.0.1:11434/v1`).
+2. Pull the reference model (separate multi-GB download):
+   ```bash
+   ollama pull qwen3:8b
+   ```
+   *(Tested alternatives: `ministral-3:8b`, `qwen3.5:9b`)*
+3. In the Desktop GUI sidebar, enable LLM review and set the model name (`qwen3:8b`).
+
+> [!NOTE]
+> **Hardware & Performance:**
+> The core deterministic anonymization pipeline (GLiNER, EU-PII, Regex, Swiss Checksums) is lightweight and runs efficiently on standard CPU-only laptops. The optional LLM Triage Layer is designed for systems with dedicated GPU acceleration (approx. 8B parameter models).
+
+> [!IMPORTANT]
+> **Strict Human-in-the-Loop:**
+> The LLM Triage Layer makes recommendations only. It never mutates entity groups or placeholders automatically. Changes are only applied when the user explicitly reviews them, selects them, and confirms them in the impact dialog.
 
 ---
 
@@ -171,12 +188,12 @@ uv run cli.py restore path/to/llm_response.txt path/to/original_mapping.json
 
 ### 4. Automated Testing (pytest)
 
-Run the full automated test suite (covers all recognizers, extractors, multi-encoding fallbacks, smart linking, and roundtrip reversibility):
+Run the full automated test suite (covers all recognizers, extractors, multi-encoding fallbacks, smart linking, LLM triage layer, and roundtrip reversibility):
 
 ```bash
 uv run pytest
 ```
-* **99 passed** unit and regression tests (default execution).
+* **188 passed, 1 deselected** in default execution.
 * Run the live EU-PII model integration test with `uv run pytest -m integration`.
 
 Weitere Dokumentation ist über den [Dokumentations-Wegweiser](docs/INDEX.md)

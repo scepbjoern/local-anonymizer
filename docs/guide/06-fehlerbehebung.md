@@ -54,6 +54,17 @@ insbesondere Sonderzeichen, Leerzeichen und die tatsächliche Schreibweise im
 Dokument. `eClaims` und `eClaims+` sind beispielsweise unterschiedliche
 Begriffe.
 
+## Probleme bei der lokalen LLM-Review-Assistenz
+
+- **Fehlendes Zusatzpaket:** Erscheint der Hinweis `LLM-Paket nicht verfügbar`, installiere das Extra:
+  ```powershell
+  uv sync --extra gui --extra llm
+  ```
+- **Ollama nicht erreichbar:** Überprüfe, ob der Ollama-Dienst im Hintergrund läuft (standardmässig unter `http://127.0.0.1:11434`). Teste im Browser oder Terminal, ob `http://127.0.0.1:11434` antwortet.
+- **Modell nicht gefunden / Tippfehler:** Stelle sicher, dass das Modell lokal heruntergeladen ist (`ollama list`) und der Name in den Einstellungen exakt übereinstimmt (z. B. `qwen3:8b`). Falls noch nicht vorhanden: `ollama pull qwen3:8b`.
+- **Falscher Endpunkt:** Der Endpunkt muss eine lokale Loopback-Adresse sein und den Pfad `/v1` enthalten (Standard: `http://127.0.0.1:11434/v1`).
+- **Unvollständige Batches / Timeout:** Wenn das Modell überlastet ist oder die GPU zu wenig VRAM hat, können einzelne Batches abbrechen. Die Applikation zeigt die ungeprüften Fundstellen transparent an. Du kannst geprüfte Fundstellen einzeln übernehmen oder den Lauf nach Entlastung des Systems wiederholen.
+
 ## macOS
 
 Die Anwendung wurde bisher nicht praktisch auf macOS getestet. Wenn der

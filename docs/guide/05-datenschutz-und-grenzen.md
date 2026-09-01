@@ -16,6 +16,16 @@ Festplatte liegt. Bei besonders schützenswerten Dokumenten solltest du deshalb
 auch lokale Zugriffsrechte, Backups, Virenscanner und temporäre Systemkopien
 berücksichtigen.
 
+## Datenschutz bei Nutzung des lokalen LLM-Triage-Layers
+
+Wenn du die optionale LLM-Review-Assistenz aktivierst:
+
+- **Strikter Loopback-Schutz:** Die Anwendung erzwingt strikt lokale Loopback-Adressen (`127.0.0.1`, `localhost`, `[::1]`). Verbindungen zu externen Cloud-APIs oder fremden LAN-IPs werden technisch blockiert.
+- **Kein Cloud-Fallback:** Schlägt der lokale LLM-Endpunkt fehl, bricht der Lauf sicher ab – es gibt keinen stillen Ausweichpfad in die Cloud.
+- **Lokale Schnittstelle:** Zur Prüfung werden Text-Snippets lokal per HTTP an den separaten Dienst (z. B. Ollama) übertragen. Beachte, dass solche lokalen Server eigene Logs auf deiner Festplatte anlegen können.
+- **Keine Rohdaten-Protokollierung:** Die Applikation selbst schreibt keine LLM-Rohantworten oder sensiblen Pydantic-Inhalte in Anwendungslogs oder die Konsole.
+- **Menschliche Letztkontrolle:** Das LLM entscheidet nie autonom; alle Aktionen erfordern deine explizite Bestätigung in der Review-Tabelle.
+
 ## Was du weitergeben darfst
 
 Vor der Weitergabe an ein externes LLM sollte nur die anonymisierte Datei

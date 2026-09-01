@@ -21,8 +21,7 @@ Für die Kernpipeline brauchst du:
 - keine Administratorrechte, sofern die lokale Geräteverwaltung die
   Installation von `uv` nicht zusätzlich einschränkt.
 
-Die Kernpipeline benötigt kein lokales Chat-LLM. Ein solches Modell ist erst
-für spätere optionale Erweiterungen vorgesehen.
+Die Kernpipeline (GLiNER, EU-PII, Regex, Schweizer Prüfziffern) benötigt kein lokales Chat-LLM und läuft flüssig auf Standard-Laptops mit reiner CPU. Für Systeme mit dedizierter GPU steht optional ein lokaler LLM-Triage-Layer zur Verfügung.
 
 ## Option A: Einrichtung durch einen Programmierassistenten
 
@@ -141,6 +140,22 @@ uv sync --extra gui
 Dabei werden eine lokale `.venv`-Umgebung und die benötigten Abhängigkeiten
 angelegt. Der erste Vorgang kann je nach Internetverbindung mehrere Minuten
 dauern.
+
+#### Optional: Lokalen LLM-Review-Assistenten einrichten (`[llm]`)
+
+Wenn du eine dedizierte GPU besitzt und den optionalen lokalen LLM-Review-Assistenten nutzen möchtest:
+
+1. Installiere das Zusatzpaket:
+   ```powershell
+   uv sync --extra gui --extra llm
+   ```
+2. Installiere und starte [Ollama](https://ollama.com/) (Standard: `http://127.0.0.1:11434/v1`).
+3. Lade das getestete Referenzmodell herunter (mehrere GB Download):
+   ```powershell
+   ollama pull qwen3:8b
+   ```
+   *(Als Alternativen wurden auch `ministral-3:8b` und `qwen3.5:9b` getestet; `qwen3:8b` ist die Standardempfehlung).*
+4. Aktiviere in den Einstellungen der Applikation die Option **Lokale LLM-Review-Assistenz** und trage `qwen3:8b` ein.
 
 ### 5. Anwendung starten
 

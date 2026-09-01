@@ -153,7 +153,73 @@ Die UI-Schalter für Entitätstypen verwenden bis zu vier Modi: `Aus` blockiert 
 
 ---
 
-## 4. Abgrenzung: Warum keine echte PDF-Content-Stream-Redaktion?
+## 4. Lokaler LLM-Triage-Layer (Phase 6A)
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              AppState (app.py)                              │
+│  - raw_text                                                                 │
+│  - analysis_revision / document_revision                                    │
+│  - entity_groups (mit eindeutigen occ_id pro Occurrence)                    │
+│  - llm_triage_snapshot (kryptografischer Snapshot-Hash)                     │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 Batching & Token Budgeting (batching.py)                    │
+│  - Extraktion kontextueller Snippets um occ_id                              │
+│  - Dynamische Partitionierung in sequenzielle Batches (Token-Budget)        │
+│  - Adversarial Escaping (Schutz vor Prompt-Injection im Dokumententext)     │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 Local API Provider & Security (provider.py)                 │
+│  - Strikte Loopback-Validierung (127.0.0.1, localhost, [::1])               │
+│  - Kein Cloud-Fallback, Session-lokaler Concurrency-Lock                    │
+│  - Initiales Senden von reasoning_effort: "none"                            │
+│  - 1x Fallback-Retry ohne reasoning_effort bei HTTP 400/422                │
+│  - 2 MB Streaming-Größenbegrenzung & PII-sichere Fehlerbehandlung           │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  Pydantic v2 Schema & Envelope (schema.py)                  │
+│  - TriageEnvelope (schema_version="1.0", request_id, document_hash)         │
+│  - Strikte Validierung: extra="forbid", str_strip_whitespace=True           │
+│  - Polymorphe Items: keep, recategorize, discard                            │
+│  - Aktionsabhängige Null-Typen (Optional[Literal[None]])                    │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 ApplyService & Rollback (apply_service.py)                  │
+│  - Snapshot-Hash-Validierung gegen State-Drift                              │
+│  - Vorvalidierung kanonischer Entitätstypen & Auswirkungsberechnung         │
+│  - Atomare Mutation von EntityGroup / Occurrences & Group-Splits            │
+│  - Automatischer Rollback bei unerwartetem Fehler                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Kernprinzipien des Triage-Layers
+
+1. **Strikte Datenschutz- und Netzwerkgrenze:**
+   - Provider akzeptiert ausschliesslich lokale Loopback-Verbindungen. LAN-IPs oder Remote-URLs werfen `ValueError`.
+   - Bei Modellfehlern oder ungültigem JSON werden keine Modell-Rohantworten oder Validierungsdaten in Logs oder Konsole geschrieben.
+2. **Kryptografischer Drift-Schutz (Snapshot-Binding):**
+   - Jede Anfrage bindet den SHA-256-Hash des Rohtexts, die Revisionsnummer und die Entitätenkonfiguration (`compute_triage_snapshot`).
+   - Ändert der Nutzer den Text während der Analyse, werden verspätet eintreffende Batches sicher verworfen.
+3. **Deterministische Batches:**
+   - Große Dokumente werden in sequenzielle Batches aufgeteilt.
+   - Bricht ein Batch ab, verbleiben ungeprüfte Fundstellen im Zustand `unprocessed`. Sammelübernahmen werden gesperrt; Einzelübernahmen bleiben möglich.
+4. **Human-in-the-Loop & Atomare Übernahme:**
+   - LLM-Ergebnisse sind reine Vorschläge in `llm_triage_results`.
+   - Vor jeder Mutation öffnet sich ein Auswirkungsdialog mit unverbindlicher Vorschau.
+   - Die Übernahme erfolgt atomar über `ApplyService.apply_mutations` mit automatischem Rollback.
+
+---
+
+## 5. Abgrenzung: Warum keine echte PDF-Content-Stream-Redaktion?
 
 > [!NOTE]
 > **Bewusste Scope-Entscheidung:**
