@@ -25,13 +25,13 @@ cd local-anonymizer
 ```
 
 ### Step 2: Install Virtual Environment & GUI Dependencies
-Always include the `gui` extra so NiceGUI and desktop components are installed:
+Always include the `gui` and `llm` extras so NiceGUI, desktop components, and local LLM triage are installed:
 ```bash
 # Recommended via uv:
-uv sync --extra gui
+uv sync --extra gui --extra llm
 
 # Standard pip alternative:
-pip install -e ".[gui]"
+pip install -e ".[gui,llm]"
 ```
 
 ---
@@ -66,6 +66,7 @@ pip install -e ".[gui]"
 * **Transparent Confirmation on First Download:** On the very first run, if required models are not yet cached locally under `~/.cache/huggingface/hub/`, the application presents an interactive confirmation dialog detailing the exact model names and download sizes (~1.10 GB each) before fetching any weights.
 * **Offline-First Operation:** Inferences, entity analyses, and normal operations run strictly locally. Model loaders attempt loading from the local cache first under thread-safe offline context management (`set_huggingface_offline_mode`); external connections are only initiated temporarily during an explicitly confirmed download.
 * **Async Background Warmup:** The NiceGUI application launches immediately (<0.5s startup). Cached ML models initialize asynchronously in a background thread. The status badge in the UI transitions to *"Modell bereit"* once warmup completes.
+* **Local LLM Triage Layer:** Optionally connects to local OpenAI-compatible endpoints (e.g. Ollama, LM Studio at `http://127.0.0.1:11434/v1`) without downloading external models into the Python runtime.
 
 ---
 
@@ -75,7 +76,7 @@ Agents making code modifications must ensure all tests pass:
 ```bash
 uv run pytest -q
 ```
-* Expected outcome: 99 passed unit and regression tests (1 integration test deselected by default).
+* Expected outcome: 152 passed unit and regression tests (1 integration test deselected by default).
 * Run the live EU-PII integration test when modifying recognizer lifecycle:
   ```bash
   uv run pytest -m integration -q

@@ -30,6 +30,7 @@ Für die praktische Nutzung steht ein deutschsprachiger [Benutzerleitfaden](docs
 - **👔 Optional Role Detection:** `ROLE` recognizes job titles such as `CEO`, `CFO`, or `Leiter Prozessmanagement`; it is off by default because process roles are often meaningful content.
 - **🇨🇭 Deterministic Swiss/CH-PII Detection:** Recognizes Swiss/German addresses plus checksum-validated AHV and CHE/UID numbers; internal IT systems are supported through the glossary and GLiNER safety-net prompts.
 - **🔎 Transparent Review Sources & Bulk Toggles:** Each finding shows whether it came from `🤖 GLiNER`, `🤖 EU-PII`, `🔤 Regex`, `📚 Bibliothek` (Google `phonenumbers`), `📖 Glossar` (direct/fuzzy), or `✍ Manuell`. The toolbar includes "Alle aktivieren", "Alle abwählen" and an interactive "Alle aufklappen / zuklappen" toggle.
+- **🧠 Optional Local LLM Triage Layer:** Verifies detected entities in context via local OpenAI-compatible endpoints (e.g. Ollama, LM Studio). Provides snapshot-protected recommendations for false-positive filtering, category corrections, and role descriptors with one-click atomic reviews.
 - **📄 Multi-Format Document Support:** Structured text and Markdown extraction for Word `.docx`, `.pdf`, `.csv`, `.json`, `.txt`, and `.md` with robust multi-encoding fallback (`utf-8-sig`, `cp1252`, `iso-8859-15`).
 - **📊 Advanced PDF-to-Markdown Extraction:** Structured Markdown extraction powered by PyMuPDF RAG (preserving headers, lists, bold/italic, and clean tables without tearing words across columns), picture text toggle, and recurring header/footer suppression with Page-1 title protection.
 - **🖥️ Native Desktop GUI:** Responsive, instant-startup NiceGUI interface running as a native desktop window (with `--browser` option for web workflows).
@@ -49,7 +50,7 @@ If you use a local AI coding assistant with terminal and filesystem permissions 
 > *"Klone das Repository https://github.com/scepbjoern/local-anonymizer in <Zielordner> und installiere die Applikation."*
 > *(Or in English: "Clone https://github.com/scepbjoern/local-anonymizer into <target_folder> and install the application.")*
 
-The AI assistant will inspect [`AGENTS.md`](AGENTS.md) and [`pyproject.toml`](pyproject.toml) to automatically handle environment setup, `uv sync --extra gui`, and verification tests.
+The AI assistant will inspect [`AGENTS.md`](AGENTS.md) and [`pyproject.toml`](pyproject.toml) to automatically handle environment setup, `uv sync --extra gui --extra llm`, and verification tests.
 
 > [!NOTE]
 > **Empirical Verification & Security Disclosure:**
@@ -62,13 +63,13 @@ Using [`uv`](https://github.com/astral-sh/uv) (recommended):
 ```bash
 git clone https://github.com/scepbjoern/local-anonymizer.git
 cd local-anonymizer
-uv sync --extra gui
+uv sync --extra gui --extra llm
 ```
 
 Or using standard `pip`:
 
 ```bash
-pip install -e ".[gui]"
+pip install -e ".[gui,llm]"
 ```
 
 ---

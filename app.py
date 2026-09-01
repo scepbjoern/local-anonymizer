@@ -56,6 +56,23 @@ from local_anonymizer.extractors import (
     strip_html_markup,
 )
 
+# Optional LLM Triage Layer (Phase 6A)
+try:
+    from local_anonymizer.llm import (
+        TriageItem,
+        TriageEnvelope,
+        validate_batch_response,
+        LocalApiProvider,
+        prepare_triage_batches,
+        ApplyCommand,
+        ApplyService,
+    )
+    from local_anonymizer.llm.apply_service import compute_triage_snapshot
+    LLM_AVAILABLE = True
+except ImportError:
+    LLM_AVAILABLE = False
+    compute_triage_snapshot = None  # type: ignore
+
 # Silence presidio analyzer language mismatch warnings
 logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
 
@@ -442,6 +459,13 @@ def reset_app_state(st: "AppState") -> None:
     st.current_mapping = {}
     st.current_anon_text = ""
     st.current_report = {}
+    st.document_revision += 1
+    st.llm_triage_results.clear()
+    st.llm_triage_snapshot = ""
+    st.llm_staged_selections.clear()
+    st.is_llm_running = False
+    st.llm_partial_failure = False
+    st.llm_unprocessed_occ_ids.clear()
 
 
 def load_document_into_state(
@@ -549,6 +573,21 @@ class AppState:
         self.include_headers_footers: bool = False
         self.extract_picture_text: bool = True
         self.last_raw_bytes: Optional[bytes] = None
+
+        # Document and review revision tracking (PR 1 / Phase 6A)
+        self.document_revision: int = 0
+        self.analysis_revision: int = 0
+        self.preview_revision: int = 0
+
+        # LLM Triage Layer State
+        self.llm_provider: Optional[Any] = None
+        self.llm_triage_results: Dict[str, Any] = {}
+        self.llm_triage_snapshot: str = ""
+        self.llm_staged_selections: Set[str] = set()
+        self.is_llm_running: bool = False
+        self.llm_partial_failure: bool = False
+        self.llm_unprocessed_occ_ids: Set[str] = set()
+        self.llm_active_task: Optional[asyncio.Task] = None
 
 
 # Background model warmup state
@@ -1053,6 +1092,7 @@ def compute_reactive_preview(st: AppState) -> Tuple[str, Dict[str, str], Dict]:
     """
     Recalculate placeholder substitution based on current active groups, roles, format mode, and entity links.
     """
+    st.preview_revision += 1
     if not st.raw_text:
         return "", {}, {}
 
@@ -1281,6 +1321,12 @@ def create_ui():
     extraction_progress_bar = None
     ignore_container = None
     glossary_container = None
+    llm_settings_container = None
+    llm_panel_holder = None
+    manual_input = None
+    manual_type = None
+    save_perm_check = None
+    add_manual_btn = None
     restore_anon_input = None
     map_json_input = None
     restored_preview = None
@@ -1300,6 +1346,8 @@ def create_ui():
                 file_badge_card.set_visibility(True)
             else:
                 file_badge_card.set_visibility(False)
+        if llm_panel_holder is not None:
+            build_llm_panel()
         ui.notify(f"Datei '{filename}' geladen ({len(text)} Zeichen).", type="positive")
 
     async def extract_and_load_file_bytes(raw_bytes: bytes, filename: str):
@@ -1384,6 +1432,8 @@ def create_ui():
             reset_btn.set_visibility(False)
         if reanalysis_warning_card is not None:
             reanalysis_warning_card.set_visibility(False)
+        if llm_panel_holder is not None:
+            build_llm_panel()
         ui.notify("Workspace zurückgesetzt.", type="info", icon="delete_sweep")
 
 
@@ -1477,6 +1527,64 @@ def create_ui():
                                 ui.label(term).classes("font-mono font-bold text-xs text-slate-900")
                                 ui.label(f"({ent_type})").classes("text-[10px] font-semibold text-blue-800 bg-blue-100 px-1 rounded")
                                 ui.button(icon="close", on_click=make_remove_g(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-0.5 hover:bg-red-100")
+
+    def render_llm_settings_ui():
+        if llm_settings_container is None:
+            return
+        llm_settings_container.clear()
+        with llm_settings_container:
+            if not LLM_AVAILABLE:
+                ui.label("Das Extra `[llm]` ist nicht installiert. Installieren Sie es mit:").classes("text-[11px] text-amber-800 font-semibold mb-1")
+                ui.code("pip install local-anonymizer[llm]").classes("text-[10px] w-full mb-2")
+                return
+
+            def on_llm_toggle(e):
+                state.config.llm_enabled = bool(e.value)
+                save_current_config(state)
+                render_llm_settings_ui()
+                build_llm_panel()
+                build_review_table()
+
+            ui.switch("LLM-Assistenz aktivieren", value=state.config.llm_enabled, on_change=on_llm_toggle).props("dense").classes("text-xs mb-2 font-semibold")
+
+            if state.config.llm_enabled:
+                ui.label("API-Endpunkt (OpenAI-kompatibel, z. B. Ollama/LM Studio):").classes("text-[11px] text-slate-600 font-medium")
+
+                def on_base_url_change(e):
+                    state.config.llm_base_url = (e.value or "").strip()
+                    save_current_config(state)
+                    state.llm_provider = None
+
+                ui.input(
+                    value=state.config.llm_base_url,
+                    placeholder="http://127.0.0.1:11434/v1",
+                    on_change=on_base_url_change,
+                ).props("dense outlined bg-white").classes("w-full text-xs mb-2")
+
+                ui.label("Modellname (z. B. phi4:latest, qwen2.5:3b):").classes("text-[11px] text-slate-600 font-medium")
+
+                def on_model_name_change(e):
+                    state.config.llm_model_name = (e.value or "").strip()
+                    save_current_config(state)
+                    state.llm_provider = None
+
+                ui.input(
+                    value=state.config.llm_model_name,
+                    placeholder="phi4:latest",
+                    on_change=on_model_name_change,
+                ).props("dense outlined bg-white").classes("w-full text-xs mb-2")
+
+                def on_auto_review_toggle(e):
+                    state.config.llm_auto_review = bool(e.value)
+                    save_current_config(state)
+
+                ui.checkbox(
+                    "LLM-Review direkt an die Textanalyse anschließen",
+                    value=state.config.llm_auto_review,
+                    on_change=on_auto_review_toggle,
+                ).props("dense").classes("text-xs text-slate-700 mb-2").tooltip(
+                    "Wenn aktiviert, startet nach der lokalen Erkennung automatisch die LLM-Triage der Fundstellen."
+                )
 
     def refresh_preview_and_exports():
         if not preview_holder or not export_holder:
@@ -1722,14 +1830,25 @@ def create_ui():
             update_step_ui(4, 0.98, "Generiere Vorschau & Mapping...")
             await asyncio.sleep(0.05)
 
+            state.analysis_revision += 1
+            state.llm_triage_results.clear()
+            state.llm_triage_snapshot = ""
+            state.llm_staged_selections.clear()
+
             compute_reactive_preview(state)
             total_occurrences = sum(g.count for g in state.entity_groups)
+            build_llm_panel()
             build_review_table()
             refresh_preview_and_exports()
 
             # Mark all complete (green)
             update_step_ui(5, 1.0, f"Abgeschlossen: {len(state.entity_groups)} Begriffe ({total_occurrences} Fundstellen)")
             ui.notify(f"Analyse abgeschlossen: {len(state.entity_groups)} Begriffe ({total_occurrences} Fundstellen).", type="positive")
+
+            # Check if LLM review should immediately chain into execution (Decision 1 from Handoff 1316)
+            if state.config.llm_enabled and state.config.llm_auto_review and LLM_AVAILABLE and state.entity_groups:
+                await asyncio.sleep(0.5)
+                await run_llm_triage(triggered_from_analysis=True)
 
             # Keep visible for 1.2s so user sees all checkmarks, then auto-disappear
             await asyncio.sleep(1.2)
@@ -1744,6 +1863,421 @@ def create_ui():
                 analyze_btn.props(remove="loading")
             if progress_holder:
                 progress_holder.clear()
+
+    def set_mutating_controls_disabled(disabled: bool):
+        """Disable/enable all mutating UI controls during active LLM inference."""
+        if analyze_btn:
+            analyze_btn.set_enabled(not disabled and bool(state.raw_text and state.raw_text.strip()))
+        if reset_btn:
+            reset_btn.set_enabled(not disabled)
+        if raw_text_area:
+            if disabled:
+                raw_text_area.props("readonly")
+            else:
+                raw_text_area.props(remove="readonly")
+        if add_manual_btn:
+            add_manual_btn.set_enabled(not disabled)
+
+    def open_apply_dialog(selected_occ_ids: List[str]):
+        """Open modal impact preview dialog and execute confirmed mutations atomically via ApplyService."""
+        if not selected_occ_ids:
+            ui.notify("Keine Fundstellen ausgewählt.", type="warning")
+            return
+
+        commands: List[ApplyCommand] = []
+        for occ_id in selected_occ_ids:
+            item = state.llm_triage_results.get(occ_id)
+            if item is None:
+                continue
+            cmd = ApplyCommand(
+                occ_id=occ_id,
+                action=item.action,
+                new_entity_type=getattr(item, "new_entity_type", None),
+                descriptor_suggestion=getattr(item, "descriptor_suggestion", None),
+            )
+            commands.append(cmd)
+
+        if not commands:
+            ui.notify("Keine gültigen Befehle gefunden.", type="warning")
+            return
+
+        is_valid, err, impacts = ApplyService.prevalidate_and_preview_impact(
+            state,
+            state.llm_triage_snapshot,
+            commands,
+        )
+
+        if not is_valid:
+            ui.notify(f"Übernahme nicht möglich: {err}", type="warning", timeout=8000)
+            build_llm_panel()
+            return
+
+        with ui.dialog() as dialog, ui.card().classes("w-[650px] max-w-full p-4"):
+            ui.label("Vorschau: Ausgewählte Änderungen übernehmen").classes("text-base font-bold text-slate-800 mb-1")
+            ui.label(
+                f"Es werden {len(commands)} Fundstellen atomar über den kanonischen Override-Service angepasst:"
+            ).classes("text-xs text-slate-600 mb-3")
+
+            with ui.column().classes("w-full max-h-80 overflow-y-auto border rounded divide-y mb-4"):
+                for imp in impacts:
+                    with ui.row().classes("w-full items-center justify-between p-2 text-xs bg-slate-50"):
+                        with ui.column().classes("gap-0.5 flex-1"):
+                            ui.label(f"'{imp['original_text']}'").classes("font-mono font-bold text-slate-800")
+                            if imp["action"] == "discard":
+                                ui.label("Aktion: Fundstelle deaktivieren / ignorieren (False Positive)").classes("text-rose-700 font-semibold")
+                            elif imp["action"] == "recategorize":
+                                role_msg = f" · Rolle: '{imp['new_role']}'" if imp["new_role"] else ""
+                                ui.label(f"Aktion: Typ {imp['old_type']} ➔ {imp['new_type']}{role_msg}").classes("text-amber-700 font-semibold")
+                            elif imp["action"] == "keep":
+                                role_msg = f"Rolle: '{imp['new_role']}'" if imp["new_role"] else "Kategorie bestätigt"
+                                ui.label(f"Aktion: Typ {imp['old_type']} ({role_msg})").classes("text-emerald-700")
+
+                        with ui.column().classes("items-end gap-0.5"):
+                            if imp["will_split"]:
+                                ui.badge("✂️ Ausgliederung", color="purple-7").props("dense")
+                            else:
+                                ui.badge("Basis-Gruppe", color="slate").props("dense outline")
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Abbrechen", on_click=dialog.close).props("flat dense color=slate")
+
+                def confirm_apply():
+                    success, msg = ApplyService.apply_mutations(
+                        state,
+                        state.llm_triage_snapshot,
+                        commands,
+                        split_fn=split_occurrence_to_new_group,
+                        sync_fn=sync_group_overrides,
+                        preview_fn=compute_reactive_preview,
+                    )
+                    dialog.close()
+                    if success:
+                        ui.notify(msg, type="positive", icon="check")
+                        build_llm_panel()
+                        build_review_table()
+                        refresh_preview_and_exports()
+                    else:
+                        ui.notify(f"Fehler bei Übernahme: {msg}", type="negative", timeout=8000)
+                        build_llm_panel()
+                        build_review_table()
+
+                ui.button("Bestätigen & Übernehmen", icon="check", color="positive", on_click=confirm_apply).props("unelevated dense")
+
+        dialog.open()
+
+    def render_proposal_card(item: Any, tone: str):
+        grp, occ = ApplyService._find_occurrence_and_group(state.entity_groups, item.occ_id)
+        if grp is None or occ is None:
+            return
+
+        is_staged = item.occ_id in state.llm_staged_selections
+
+        def on_stage_toggle(e):
+            if e.value:
+                state.llm_staged_selections.add(item.occ_id)
+            else:
+                state.llm_staged_selections.discard(item.occ_id)
+            build_llm_panel()
+
+        border_cls = "border-primary ring-1 ring-primary/40 bg-white" if is_staged else "border-slate-200 bg-white"
+
+        with ui.card().classes(f"w-full p-2.5 my-1 border rounded shadow-none {border_cls}"):
+            with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+                with ui.row().classes("items-center gap-2 flex-1 min-w-[280px]"):
+                    ui.checkbox(value=is_staged, on_change=on_stage_toggle).props("dense").tooltip("Für Sammelübernahme vormerken")
+                    ui.label(grp.original_text).classes("font-mono font-bold text-xs text-slate-900")
+                    ui.badge(grp.entity_type, color="slate").props("dense outline")
+                    if grp.role:
+                        ui.badge(f"Rolle: {grp.role}", color="teal").props("dense outline")
+                    if occ.context_html:
+                        ui.html(occ.context_html).classes("text-xs text-slate-700 ml-2 flex-1")
+
+                with ui.row().classes("items-center gap-2"):
+                    if item.action == "discard":
+                        ui.badge("Ignorieren", color="grey-8").props("dense")
+                    elif item.action == "recategorize":
+                        ui.badge(f"➔ {item.new_entity_type}", color="amber-8").props("dense")
+                    elif item.action == "keep":
+                        ui.badge("Bestätigt", color="emerald-7").props("dense outline")
+
+                    if getattr(item, "descriptor_suggestion", None):
+                        ui.badge(f"Rolle: {item.descriptor_suggestion}", color="blue-7").props("dense")
+
+                    conf_color = "positive" if item.confidence == "high" else ("warning" if item.confidence == "medium" else "grey")
+                    ui.badge(f"{item.confidence}", color=conf_color).props("dense outline").tooltip(f"Modell-Konfidenz: {item.confidence}")
+
+                    def single_apply():
+                        open_apply_dialog([item.occ_id])
+
+                    ui.button("Übernehmen", icon="check", color="positive", on_click=single_apply).props("outline dense size=xs")
+
+            if getattr(item, "reasoning", None):
+                with ui.row().classes("w-full mt-1 text-[11px] text-slate-600 italic px-7"):
+                    ui.label(f"Begründung: {item.reasoning}")
+
+    def render_proposal_categories(keep_items: List[Any], recat_items: List[Any], discard_items: List[Any]):
+        recat_and_desc = []
+        pure_keeps = []
+        for item in keep_items:
+            if getattr(item, "descriptor_suggestion", None):
+                recat_and_desc.append(item)
+            else:
+                pure_keeps.append(item)
+        recat_and_desc = recat_items + recat_and_desc
+
+        with ui.expansion(
+            f"🟡 Änderung vorgeschlagen – menschlich ungeprüft ({len(recat_and_desc)})",
+            value=bool(recat_and_desc),
+        ).classes("w-full bg-amber-50/50 border border-amber-200 rounded-lg mb-2"):
+            if not recat_and_desc:
+                ui.label("Keine Änderungsvorschläge.").classes("text-xs text-slate-500 italic p-2")
+            else:
+                for item in recat_and_desc:
+                    render_proposal_card(item, "amber")
+
+        with ui.expansion(
+            f"⚪ Ignorieren vorgeschlagen – menschlich ungeprüft ({len(discard_items)})",
+            value=bool(discard_items),
+        ).classes("w-full bg-slate-50 border border-slate-200 rounded-lg mb-2"):
+            if not discard_items:
+                ui.label("Keine Ignorier-Vorschläge.").classes("text-xs text-slate-500 italic p-2")
+            else:
+                for item in discard_items:
+                    render_proposal_card(item, "slate")
+
+        with ui.expansion(
+            f"🟢 LLM bestätigt – menschlich ungeprüft ({len(pure_keeps)})",
+            value=False,
+        ).classes("w-full bg-emerald-50/40 border border-emerald-200 rounded-lg mb-2"):
+            if not pure_keeps:
+                ui.label("Keine reinen Bestätigungen.").classes("text-xs text-slate-500 italic p-2")
+            else:
+                for item in pure_keeps:
+                    render_proposal_card(item, "emerald")
+
+    def build_llm_panel():
+        if not llm_panel_holder:
+            return
+        llm_panel_holder.clear()
+        with llm_panel_holder:
+            if not LLM_AVAILABLE:
+                with ui.card().classes("w-full p-3 bg-slate-50 border border-slate-200 rounded-lg"):
+                    with ui.row().classes("items-center justify-between gap-2"):
+                        with ui.row().classes("items-center gap-2 text-slate-600 text-xs"):
+                            ui.icon("info", size="sm").classes("text-slate-400")
+                            ui.label("Lokale LLM-Review-Assistenz: Paket nicht installiert. Nutzen Sie `pip install local-anonymizer[llm]`.").classes("font-medium")
+                return
+
+            if not state.config.llm_enabled:
+                with ui.card().classes("w-full p-3 bg-slate-50 border border-slate-200 rounded-lg"):
+                    with ui.row().classes("items-center justify-between gap-2 flex-wrap"):
+                        with ui.row().classes("items-center gap-2 text-slate-700 text-xs"):
+                            ui.icon("psychology", size="sm").classes("text-slate-400")
+                            ui.label("Lokale LLM-Review-Assistenz ist deaktiviert.").classes("font-semibold")
+                            ui.label("Aktivieren Sie die Option in der Konfiguration (Seitenleiste), um Fundstellen automatisch durch ein lokales LLM prüfen zu lassen.").classes("text-slate-500")
+                        def enable_in_config():
+                            state.config.llm_enabled = True
+                            save_current_config(state)
+                            render_llm_settings_ui()
+                            build_llm_panel()
+                        ui.button("In Konfiguration aktivieren", icon="toggle_on", on_click=enable_in_config).props("flat dense size=sm color=primary")
+                return
+
+            has_entities = bool(state.entity_groups)
+            has_results = bool(state.llm_triage_results)
+
+            card_bg = "bg-indigo-50/50 border-indigo-200" if has_results else "bg-slate-50 border-slate-200"
+            with ui.card().classes(f"w-full p-3.5 border rounded-lg {card_bg}"):
+                with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.icon("psychology", size="md").classes("text-indigo-700")
+                        ui.label("Lokale LLM-Review-Assistenz").classes("font-bold text-sm text-indigo-950")
+                        if state.is_llm_running:
+                            ui.spinner(size="xs", color="primary")
+                            ui.badge("Prüfung läuft...", color="primary").props("dense")
+                        elif has_results:
+                            if state.llm_partial_failure:
+                                ui.badge("⚠️ Prüfung unvollständig", color="warning").props("dense")
+                            else:
+                                ui.badge("✓ Prüfung abgeschlossen", color="positive").props("dense outline")
+                        else:
+                            ui.badge("Bereit", color="grey-6").props("dense outline")
+
+                    with ui.row().classes("items-center gap-2"):
+                        if state.is_llm_running:
+                            def cancel_triage():
+                                if state.llm_active_task and not state.llm_active_task.done():
+                                    state.llm_active_task.cancel()
+                                    ui.notify("LLM-Triage wird abgebrochen...", type="info")
+                            ui.button("⏹️ Abbrechen", icon="cancel", color="negative", on_click=cancel_triage).props("dense outline size=sm")
+                        else:
+                            btn_label = "🔄 LLM-Review erneut starten" if has_results else "🤖 Fundstellen mit lokalem LLM prüfen"
+                            def start_triage_click():
+                                state.llm_active_task = asyncio.create_task(run_llm_triage())
+                            triage_start_btn = ui.button(btn_label, icon="auto_awesome", color="primary", on_click=start_triage_click).props("unelevated dense size=sm")
+                            triage_start_btn.set_enabled(has_entities and not state.is_llm_running)
+
+                if state.is_llm_running:
+                    with ui.column().classes("w-full mt-2"):
+                        ui.label("Überprüfe Fundstellen sequenziell in Batches über lokalen LLM-Endpunkt...").classes("text-xs text-slate-600 italic")
+                elif has_results:
+                    keep_items = [item for item in state.llm_triage_results.values() if item.action == "keep"]
+                    recat_items = [item for item in state.llm_triage_results.values() if item.action == "recategorize"]
+                    discard_items = [item for item in state.llm_triage_results.values() if item.action == "discard"]
+                    descriptor_changes = [item for item in keep_items if getattr(item, "descriptor_suggestion", None)]
+                    pure_keeps = [item for item in keep_items if not getattr(item, "descriptor_suggestion", None)]
+
+                    if state.llm_partial_failure:
+                        with ui.row().classes("w-full items-center gap-2 p-2 bg-amber-100/70 border border-amber-300 rounded text-amber-950 text-xs my-2"):
+                            ui.icon("warning", size="xs").classes("text-amber-700")
+                            ui.label(f"Einige Batches konnten nicht verarbeitet werden ({len(state.llm_unprocessed_occ_ids)} Fundstellen ungeprüft). Sammelübernahme ist gesperrt; Einzelübernahmen sind möglich.").classes("font-medium")
+
+                    with ui.row().classes("w-full items-center justify-between p-2 bg-white/80 border rounded text-xs my-2 flex-wrap gap-2"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.label(f"Geprüft: {len(state.llm_triage_results)} Fundstellen ({len(pure_keeps)} bestätigt, {len(recat_items) + len(descriptor_changes)} Änderungsvorschläge, {len(discard_items)} False Positives)").classes("text-slate-700 font-semibold")
+
+                        with ui.row().classes("items-center gap-2"):
+                            def stage_all():
+                                state.llm_staged_selections = set(state.llm_triage_results.keys())
+                                build_llm_panel()
+                            def unstage_all():
+                                state.llm_staged_selections.clear()
+                                build_llm_panel()
+
+                            ui.button("Alle vormerken", on_click=stage_all).props("flat dense size=xs color=slate")
+                            ui.button("Auswahl leeren", on_click=unstage_all).props("flat dense size=xs color=slate")
+
+                            selected_count = len(state.llm_staged_selections)
+                            apply_bulk_btn = ui.button(
+                                f"Ausgewählte Änderungen übernehmen ({selected_count})",
+                                icon="done_all",
+                                color="positive",
+                                on_click=lambda: open_apply_dialog(list(state.llm_staged_selections)),
+                            ).props("unelevated dense size=sm")
+
+                            if selected_count == 0 or state.llm_partial_failure:
+                                apply_bulk_btn.disable()
+                                if state.llm_partial_failure:
+                                    apply_bulk_btn.tooltip("Sammelübernahme bei unvollständigem Gesamtlauf gesperrt. Bitte Einzelübernahmen nutzen.")
+
+                    render_proposal_categories(keep_items, recat_items, discard_items)
+
+    async def run_llm_triage(triggered_from_analysis: bool = False):
+        if not LLM_AVAILABLE:
+            ui.notify("LLM-Paket nicht verfügbar. Bitte `pip install local-anonymizer[llm]` installieren.", type="warning")
+            return
+
+        if not state.config.llm_enabled:
+            if not triggered_from_analysis:
+                ui.notify("Lokale LLM-Review-Assistenz ist deaktiviert. Bitte in den Einstellungen aktivieren.", type="info")
+            return
+
+        if not state.config.llm_model_name or not state.config.llm_model_name.strip():
+            ui.notify("Bitte geben Sie einen Modellnamen in den LLM-Einstellungen an (z. B. phi4:latest).", type="warning")
+            return
+
+        if not state.raw_text or not state.entity_groups:
+            if not triggered_from_analysis:
+                ui.notify("Keine analysierten Fundstellen vorhanden.", type="info")
+            return
+
+        candidates = []
+        for g in state.entity_groups:
+            if not g.enabled:
+                continue
+            for occ in g.occurrences:
+                ctx_snippet = strip_html_markup(occ.context_html) if occ.context_html else g.original_text
+                candidates.append({
+                    "occ_id": occ.occ_id,
+                    "original_text": g.original_text,
+                    "entity_type": g.entity_type,
+                    "role": g.role,
+                    "context_snippet": ctx_snippet,
+                })
+
+        if not candidates:
+            if not triggered_from_analysis:
+                ui.notify("Keine aktiven Fundstellen zum Prüfen gefunden.", type="info")
+            return
+
+        snapshot_hash = compute_triage_snapshot(state.raw_text, state.analysis_revision, state.entity_groups)
+        batches = prepare_triage_batches(candidates, state.document_revision, snapshot_hash)
+
+        try:
+            if state.llm_provider is None:
+                state.llm_provider = LocalApiProvider(
+                    base_url=state.config.llm_base_url,
+                    model_name=state.config.llm_model_name,
+                )
+        except Exception as e:
+            ui.notify(f"Fehler bei LLM-Initialisierung: {e}", type="negative")
+            return
+
+        state.is_llm_running = True
+        state.llm_partial_failure = False
+        state.llm_unprocessed_occ_ids.clear()
+        state.llm_triage_results.clear()
+        state.llm_staged_selections.clear()
+        state.llm_triage_snapshot = snapshot_hash
+
+        set_mutating_controls_disabled(True)
+        build_llm_panel()
+        build_review_table()
+
+        ui.notify(f"Starte LLM-Triage ({len(candidates)} Fundstellen in {len(batches)} Batches)...", type="info")
+
+        try:
+            for batch in batches:
+                current_snap = compute_triage_snapshot(state.raw_text, state.analysis_revision, state.entity_groups)
+                if current_snap != snapshot_hash:
+                    logging.info("Dokument- oder Reviewzustand während LLM-Lauf geändert -> Lauf abgebrochen.")
+                    state.llm_triage_results.clear()
+                    state.llm_triage_snapshot = ""
+                    break
+
+                try:
+                    raw_json = await state.llm_provider.generate(
+                        prompt=batch.user_prompt,
+                        system_prompt=batch.system_prompt,
+                    )
+                    envelope = TriageEnvelope.model_validate_json(raw_json)
+                    validate_batch_response(envelope, batch.occ_id_set, state.document_revision, snapshot_hash)
+
+                    for item in envelope.items:
+                        state.llm_triage_results[item.occ_id] = item
+                        if item.action in ("recategorize", "discard") or (item.action == "keep" and getattr(item, "descriptor_suggestion", None)):
+                            state.llm_staged_selections.add(item.occ_id)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    logging.warning(f"Batch {batch.batch_index}/{batch.total_batches} fehlgeschlagen: {type(ex).__name__}")
+                    state.llm_partial_failure = True
+                    state.llm_unprocessed_occ_ids.update(batch.occ_id_set)
+
+                build_llm_panel()
+                await asyncio.sleep(0.01)
+
+            if state.llm_partial_failure:
+                ui.notify(
+                    f"LLM-Triage unvollständig ({len(state.llm_triage_results)} geprüft, {len(state.llm_unprocessed_occ_ids)} ungeprüft).",
+                    type="warning",
+                )
+            else:
+                ui.notify(f"LLM-Triage abgeschlossen ({len(state.llm_triage_results)} Fundstellen geprüft).", type="positive")
+
+        except asyncio.CancelledError:
+            ui.notify("LLM-Triage abgebrochen.", type="info")
+            state.llm_triage_results.clear()
+            state.llm_triage_snapshot = ""
+            state.llm_staged_selections.clear()
+        except Exception as e:
+            ui.notify(f"Fehler bei LLM-Triage: {e}", type="negative")
+        finally:
+            state.is_llm_running = False
+            set_mutating_controls_disabled(False)
+            build_llm_panel()
+            build_review_table()
 
     def get_sorted_groups() -> List[EntityGroup]:
         """Return entity groups sorted according to user selection."""
@@ -1897,6 +2431,22 @@ def create_ui():
 
                                             # Master Placeholder Badge
                                             master_badge = ui.badge(master.placeholder, color="blue-9").props("outline dense").classes("text-xs font-mono font-bold")
+
+                                            # LLM Sparse Action Badges (Decision 2 from Handoff 1316)
+                                            has_recat_or_desc = False
+                                            has_discard = False
+                                            for occ in master.occurrences:
+                                                if occ.occ_id in state.llm_triage_results:
+                                                    verdict = state.llm_triage_results[occ.occ_id]
+                                                    if verdict.action == "recategorize" or (verdict.action == "keep" and getattr(verdict, "descriptor_suggestion", None)):
+                                                        has_recat_or_desc = True
+                                                    elif verdict.action == "discard":
+                                                        has_discard = True
+
+                                            if has_recat_or_desc:
+                                                ui.badge("LLM: Änderungsvorschlag", color="amber-8").props("dense").tooltip("Lokales LLM schlägt Kategorie- oder Rollenanpassung vor")
+                                            if has_discard:
+                                                ui.badge("LLM: Ignorieren vorgeschlagen", color="grey-8").props("dense").tooltip("Lokales LLM stuft Fundstelle als False Positive ein")
 
                                             if is_split:
                                                 ui.badge("✂️ Ausgliederung", color="purple-7").props("dense").tooltip("Abgespaltene Homonym-Gruppe mit eigener Zuweisung")
@@ -2158,6 +2708,22 @@ def create_ui():
                                                 ui.badge(f"{child.count}x", color="teal-6").props("dense")
                                                 c_badge = ui.badge(child.placeholder, color="teal-9").props("outline dense").classes("text-xs font-mono font-bold")
                                                 child_badge_refs.append((child, c_badge))
+
+                                                # LLM Sparse Action Badges for child
+                                                c_has_recat = False
+                                                c_has_discard = False
+                                                for c_occ in child.occurrences:
+                                                    if c_occ.occ_id in state.llm_triage_results:
+                                                        c_verdict = state.llm_triage_results[c_occ.occ_id]
+                                                        if c_verdict.action == "recategorize" or (c_verdict.action == "keep" and getattr(c_verdict, "descriptor_suggestion", None)):
+                                                            c_has_recat = True
+                                                        elif c_verdict.action == "discard":
+                                                            c_has_discard = True
+
+                                                if c_has_recat:
+                                                    ui.badge("LLM: Änderungsvorschlag", color="amber-8").props("dense").tooltip("Lokales LLM schlägt Kategorie- oder Rollenanpassung vor")
+                                                if c_has_discard:
+                                                    ui.badge("LLM: Ignorieren vorgeschlagen", color="grey-8").props("dense").tooltip("Lokales LLM stuft Fundstelle als False Positive ein")
 
                                             # Surface Form Selector
                                             with ui.row().classes("items-center gap-1"):
@@ -2429,6 +2995,11 @@ def create_ui():
                 glossary_container = ui.column().classes("w-full")
                 render_glossary_list_ui()
 
+            # Interactive LLM Configuration
+            with ui.expansion("🤖 Lokale LLM-Review-Assistenz", icon="psychology").classes("w-full text-xs mt-1"):
+                llm_settings_container = ui.column().classes("w-full")
+                render_llm_settings_ui()
+
         # Main Workspace
         with ui.column().classes("flex-grow"):
             with ui.tabs().classes("w-full border-b") as tabs:
@@ -2665,6 +3236,12 @@ def create_ui():
                     with ui.expansion("Originaltext ansehen / direkt bearbeiten (Markdown)", icon="edit_note", value=True).classes("w-full mb-2"):
                         def on_raw_text_change(e):
                             state.raw_text = e.value or ""
+                            state.document_revision += 1
+                            state.llm_triage_results.clear()
+                            state.llm_triage_snapshot = ""
+                            state.llm_staged_selections.clear()
+                            if llm_panel_holder is not None:
+                                build_llm_panel()
                             has_content = bool(state.raw_text and state.raw_text.strip())
                             if analyze_btn is not None:
                                 analyze_btn.set_enabled(has_content)
@@ -2807,7 +3384,11 @@ def create_ui():
                                     ui.notify(f"'{term}' ({len(new_occurrences)} Treffer) im aktuellen Dokument erfasst.", type="positive", icon="check")
                                     manual_input.value = ""
 
-                                ui.button("➕ Hinzufügen", icon="add", color="positive", on_click=add_manual_entity).props("unelevated dense size=sm")
+                                add_manual_btn = ui.button("➕ Hinzufügen", icon="add", color="positive", on_click=add_manual_entity).props("unelevated dense size=sm")
+
+                    # LLM Proposal Panel (Review-Assistenz)
+                    llm_panel_holder = ui.column().classes("w-full mb-3")
+                    build_llm_panel()
 
                     table_holder = ui.column().classes("w-full mb-4")
 

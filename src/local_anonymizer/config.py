@@ -44,6 +44,8 @@ logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
 
 DEFAULT_GLINER_MODEL_NAME = "urchade/gliner_multi_pii-v1"
 DEFAULT_EUPII_MODEL_NAME = "bardsai/eu-pii-anonimization-multilang"
+DEFAULT_LLM_BASE_URL = "http://127.0.0.1:11434/v1"
+DEFAULT_LLM_MODEL_NAME = ""
 
 
 class AppConfig:
@@ -67,6 +69,10 @@ class AppConfig:
         self.ignore_terms: str = "CAS, DAS, MAS, BSc, MSc, PhD, MBA, Studierende, Studierenden, Dozent, Dozenten, Lehrperson, Berater, Aufgabensteller"
         self.glossary: str = "ZHAW: ORGANIZATION\nHWZ: ORGANIZATION\nUZH: ORGANIZATION\nETH: ORGANIZATION"
         self.export_format: str = "txt"
+        self.llm_enabled: bool = False
+        self.llm_base_url: str = DEFAULT_LLM_BASE_URL
+        self.llm_model_name: str = DEFAULT_LLM_MODEL_NAME
+        self.llm_auto_review: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -81,6 +87,10 @@ class AppConfig:
             "ignore_terms": self.ignore_terms,
             "glossary": self.glossary,
             "export_format": self.export_format,
+            "llm_enabled": self.llm_enabled,
+            "llm_base_url": self.llm_base_url,
+            "llm_model_name": self.llm_model_name,
+            "llm_auto_review": self.llm_auto_review,
         }
 
     @classmethod
@@ -103,6 +113,10 @@ class AppConfig:
         config.ignore_terms = data.get("ignore_terms", config.ignore_terms)
         config.glossary = data.get("glossary", config.glossary)
         config.export_format = data.get("export_format", config.export_format)
+        config.llm_enabled = bool(data.get("llm_enabled", False))
+        config.llm_base_url = str(data.get("llm_base_url", DEFAULT_LLM_BASE_URL)).strip()
+        config.llm_model_name = str(data.get("llm_model_name", DEFAULT_LLM_MODEL_NAME)).strip()
+        config.llm_auto_review = bool(data.get("llm_auto_review", True))
         return config
 
     def save(self):
