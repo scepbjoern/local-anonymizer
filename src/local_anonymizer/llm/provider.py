@@ -166,10 +166,15 @@ class LocalApiProvider(LlmProvider):
                     if resp.status != 200:
                         raise ValueError(f"Lokaler LLM-Provider meldete HTTP Status {resp.status}")
 
-                    content_type = resp.headers.get("Content-Type", "").lower()
-                    if not re.search(r"application/(?:[a-zA-Z0-9\.\-\_]+\+)?json", content_type):
+                    raw_content_type = resp.headers.get("Content-Type", "")
+                    mime_type = raw_content_type.split(";")[0].strip().lower()
+                    is_valid_json_mime = (
+                        mime_type == "application/json"
+                        or bool(re.fullmatch(r"application/[a-z0-9_.\-]+(?:\+[a-z0-9_.\-]+)*\+json", mime_type))
+                    )
+                    if not is_valid_json_mime:
                         raise ValueError(
-                            f"Unerwarteter Content-Type '{content_type}': Erwartet wurde 'application/json' oder 'application/*+json'."
+                            f"Unerwarteter Content-Type '{raw_content_type}': Erwartet wurde 'application/json' oder 'application/*+json'."
                         )
 
                     # Stream response to enforce max response size limit

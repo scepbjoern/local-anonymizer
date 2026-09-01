@@ -96,30 +96,84 @@ async def test_local_api_provider_generate_success():
 
 
 @pytest.mark.asyncio
-async def test_local_api_provider_content_type_validation():
+async def test_local_api_provider_content_type_validation_negative():
     provider = LocalApiProvider(
         base_url="http://127.0.0.1:11434/v1",
         model_name="phi4:latest",
     )
 
-    mock_resp = MagicMock()
-    mock_resp.status = 200
-    mock_resp.headers = {"Content-Type": "text/html"}  # Invalid content type
-    mock_resp.content = MagicMock()
+    invalid_content_types = [
+        "text/html",
+        "text/application/json",
+        "application/jsonp",
+        "application/javascript",
+        "text/plain",
+    ]
 
-    mock_post_cm = MagicMock()
-    mock_post_cm.__aenter__ = AsyncMock(return_value=mock_resp)
-    mock_post_cm.__aexit__ = AsyncMock(return_value=None)
+    for ct in invalid_content_types:
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.headers = {"Content-Type": ct}
+        mock_resp.content = MagicMock()
 
-    mock_session = MagicMock()
-    mock_session.post.return_value = mock_post_cm
-    mock_session.close = AsyncMock()
-    mock_session.closed = False
+        mock_post_cm = MagicMock()
+        mock_post_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_post_cm.__aexit__ = AsyncMock(return_value=None)
 
-    provider._session = mock_session
+        mock_session = MagicMock()
+        mock_session.post.return_value = mock_post_cm
+        mock_session.close = AsyncMock()
+        mock_session.closed = False
 
-    with pytest.raises(ValueError, match="Unerwarteter Content-Type"):
-        await provider.generate("prompt", "sys")
+        provider._session = mock_session
+
+        with pytest.raises(ValueError, match="Unerwarteter Content-Type"):
+            await provider.generate("prompt", "sys")
+
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_local_api_provider_content_type_validation_positive():
+    provider = LocalApiProvider(
+        base_url="http://127.0.0.1:11434/v1",
+        model_name="phi4:latest",
+    )
+
+    mock_resp_json = {
+        "choices": [{"message": {"content": "{}"}}]
+    }
+
+    valid_content_types = [
+        "application/json",
+        "application/json; charset=utf-8",
+        "application/problem+json",
+        "application/geo+json; charset=utf-8",
+    ]
+
+    class MockContent:
+        async def iter_chunked(self, n: int):
+            yield json.dumps(mock_resp_json).encode("utf-8")
+
+    for ct in valid_content_types:
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.headers = {"Content-Type": ct}
+        mock_resp.content = MockContent()
+
+        mock_post_cm = MagicMock()
+        mock_post_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_post_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.post.return_value = mock_post_cm
+        mock_session.close = AsyncMock()
+        mock_session.closed = False
+
+        provider._session = mock_session
+
+        res = await provider.generate("prompt", "sys")
+        assert res == "{}"
 
     await provider.close()
 

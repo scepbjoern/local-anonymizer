@@ -2,7 +2,15 @@ import asyncio
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from app import EntityGroup, EntityOccurrence, AppState, reset_app_state, reset_app_state_async
+from app import (
+    EntityGroup,
+    EntityOccurrence,
+    AppState,
+    reset_app_state,
+    reset_app_state_async,
+    cleanup_session_async,
+    run_triage_batch_loop,
+)
 from local_anonymizer.llm.schema import TriageEnvelope, TriageKeepItem, TriageRecategorizeItem
 from local_anonymizer.llm.provider import LocalApiProvider
 from local_anonymizer.llm.batching import prepare_triage_batches
@@ -18,6 +26,7 @@ def test_app_state_llm_fields_and_reset():
     assert hasattr(st, "llm_partial_failure")
     assert hasattr(st, "llm_unprocessed_occ_ids")
     assert hasattr(st, "llm_active_task")
+    assert hasattr(st, "mutating_ui_zones")
 
     st.llm_triage_results["occ-1"] = "val"
     st.llm_staged_selections.add("occ-1")
@@ -34,8 +43,48 @@ def test_app_state_llm_fields_and_reset():
     assert st.llm_active_task is None
 
 
+def test_app_state_mutating_ui_zones():
+    st = AppState()
+    elem_sidebar = MagicMock()
+    elem_table = MagicMock()
+    elem_workspace = MagicMock()
+
+    st.register_mutating_element(elem_sidebar, "sidebar")
+    st.register_mutating_element(elem_table, "table")
+    st.register_mutating_element(elem_workspace, "workspace")
+
+    assert elem_sidebar in st.mutating_ui_zones["sidebar"]
+    assert elem_table in st.mutating_ui_zones["table"]
+    assert elem_workspace in st.mutating_ui_zones["workspace"]
+    assert set(st.mutating_ui_elements) == {elem_sidebar, elem_table, elem_workspace}
+
+    # Disabling all
+    st.set_all_mutating_elements_disabled(True)
+    elem_sidebar.disable.assert_called_once()
+    elem_table.disable.assert_called_once()
+    elem_workspace.disable.assert_called_once()
+
+    # Enabling all
+    st.set_all_mutating_elements_disabled(False)
+    elem_sidebar.enable.assert_called_once()
+    elem_table.enable.assert_called_once()
+    elem_workspace.enable.assert_called_once()
+
+    # Clear table zone only
+    st.clear_mutating_zone("table")
+    assert len(st.mutating_ui_zones["table"]) == 0
+    assert len(st.mutating_ui_zones["sidebar"]) == 1
+    assert len(st.mutating_ui_zones["workspace"]) == 1
+
+    # Registering element when running disables it immediately
+    st.is_llm_running = True
+    new_table_elem = MagicMock()
+    st.register_mutating_element(new_table_elem, "table")
+    new_table_elem.disable.assert_called_once()
+
+
 @pytest.mark.asyncio
-async def test_late_response_discarded_on_snapshot_drift_multi_batch():
+async def test_late_response_discarded_on_snapshot_drift_multi_batch_production_controller():
     # 3 batches: batch 1 succeeds, batch 2 experiences drift -> batch 2 and 3 marked unprocessed
     st = AppState()
     st.raw_text = "Dr. Müller und Dr. Schmidt und Dr. Weber."
@@ -93,27 +142,8 @@ async def test_late_response_discarded_on_snapshot_drift_multi_batch():
     st.is_llm_running = True
     st.llm_triage_snapshot = snap
 
-    # Execute batch loop matching production logic in launch_llm_triage
-    for batch_idx, b in enumerate(batches):
-        pre_snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
-        if pre_snap != snap or st.document_revision != b.document_revision:
-            st.llm_partial_failure = True
-            for rem in batches[batch_idx:]:
-                st.llm_unprocessed_occ_ids.update(rem.occ_id_set)
-            break
-
-        raw_json = await st.llm_provider.generate(b.user_prompt, b.system_prompt)
-
-        post_snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
-        if post_snap != snap or st.document_revision != b.document_revision:
-            st.llm_partial_failure = True
-            for rem in batches[batch_idx:]:
-                st.llm_unprocessed_occ_ids.update(rem.occ_id_set)
-            break
-
-        data = json.loads(raw_json)
-        for item in data.get("items", []):
-            st.llm_triage_results[item["occ_id"]] = item
+    # Execute real production batch loop controller
+    await run_triage_batch_loop(st, batches, snap)
 
     # Batch 1 was processed and saved
     assert "occ-1" in st.llm_triage_results
@@ -122,6 +152,32 @@ async def test_late_response_discarded_on_snapshot_drift_multi_batch():
     assert "occ-3" not in st.llm_triage_results
     assert st.llm_partial_failure is True
     assert st.llm_unprocessed_occ_ids == {"occ-2", "occ-3"}
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_async_lifecycle():
+    st = AppState()
+
+    async def long_running():
+        try:
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            pass
+
+    task = asyncio.create_task(long_running())
+    st.llm_active_task = task
+    st.is_llm_running = True
+
+    mock_provider = MagicMock(spec=LocalApiProvider)
+    mock_provider.close = AsyncMock()
+    st.llm_provider = mock_provider
+
+    await cleanup_session_async(st)
+    assert task.done()
+    assert mock_provider.close.called
+    assert st.llm_provider is None
+    assert st.llm_active_task is None
+    assert st.is_llm_running is False
 
 
 @pytest.mark.asyncio

@@ -26,9 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from fastapi import File, UploadFile
 from fastapi.responses import JSONResponse
-from nicegui import app, ui
+from nicegui import Client, app, ui
 
-from local_anonymizer.anonymizer import REVIEW_SCORE_THRESHOLD, clean_tag
+from local_anonymizer.anonymizer import AVAILABLE_ENTITIES, REVIEW_SCORE_THRESHOLD, clean_tag
 from local_anonymizer.recognizers import (
     EUPII_MODEL_NAME,
     EUPII_MODEL_SIZE_MB,
@@ -61,17 +61,22 @@ try:
     from local_anonymizer.llm import (
         TriageItem,
         TriageEnvelope,
+        TriageBatch,
         validate_batch_response,
         LocalApiProvider,
         prepare_triage_batches,
         ApplyCommand,
         ApplyService,
+        CANONICAL_APP_ENTITY_TYPES,
+        ENTITY_TYPE_ALIASES,
+        normalize_entity_type,
+        compute_triage_snapshot,
     )
-    from local_anonymizer.llm.apply_service import compute_triage_snapshot
     LLM_AVAILABLE = True
 except ImportError:
     LLM_AVAILABLE = False
     compute_triage_snapshot = None  # type: ignore
+    TriageBatch = None  # type: ignore
 
 # Silence presidio analyzer language mismatch warnings
 logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
@@ -449,6 +454,21 @@ def rebind_overrides_after_analysis(
     return final_entity_groups, new_overrides
 
 
+async def cleanup_session_async(st: "AppState") -> None:
+    """Asynchronously cancel any active LLM task, await teardown, and close provider session."""
+    active_task = getattr(st, "llm_active_task", None)
+    if active_task and not active_task.done():
+        active_task.cancel()
+        try:
+            await active_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        if getattr(st, "llm_active_task", None) is active_task:
+            st.llm_active_task = None
+    st.is_llm_running = False
+    await st.close_llm_provider()
+
+
 def reset_app_state(st: "AppState") -> None:
     """Reset all document-specific state in AppState cleanly."""
     if getattr(st, "llm_active_task", None) and not st.llm_active_task.done():
@@ -478,16 +498,69 @@ def reset_app_state(st: "AppState") -> None:
 
 
 async def reset_app_state_async(st: "AppState") -> None:
-    """Asynchronously cancel active LLM tasks, close provider session, and reset state."""
-    if getattr(st, "llm_active_task", None) and not st.llm_active_task.done():
-        st.llm_active_task.cancel()
-        try:
-            await st.llm_active_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        st.llm_active_task = None
-    await st.close_llm_provider()
+    """Asynchronously clean up active task and provider, then reset state."""
+    await cleanup_session_async(st)
     reset_app_state(st)
+
+
+async def run_triage_batch_loop(
+    state: "AppState",
+    batches: List[Any],
+    snapshot_hash: str,
+    on_batch_complete: Optional[Callable[[], None]] = None,
+) -> None:
+    """
+    Production batch execution loop.
+    Validates snapshot and document_revision before and after every batch await.
+    On drift or batch failure, marks all remaining batches (current and subsequent) as unprocessed.
+    """
+    for batch_idx, batch in enumerate(batches):
+        current_snap = compute_triage_snapshot(state.raw_text, state.analysis_revision, state.entity_groups) if compute_triage_snapshot else ""
+        if current_snap != snapshot_hash or state.document_revision != batch.document_revision:
+            logging.info("Dokument- oder Reviewzustand vor Inferenz geändert -> Verbleibende Batches verworfen.")
+            state.llm_partial_failure = True
+            for rem_b in batches[batch_idx:]:
+                state.llm_unprocessed_occ_ids.update(rem_b.occ_id_set)
+            break
+
+        try:
+            raw_json = await state.llm_provider.generate(
+                prompt=batch.user_prompt,
+                system_prompt=batch.system_prompt,
+            )
+            # Re-validate snapshot after await
+            post_snap = compute_triage_snapshot(state.raw_text, state.analysis_revision, state.entity_groups) if compute_triage_snapshot else ""
+            if post_snap != snapshot_hash or state.document_revision != batch.document_revision:
+                logging.info("Dokument- oder Reviewzustand nach Inferenz geändert -> Verbleibende Batches verworfen.")
+                state.llm_partial_failure = True
+                for rem_b in batches[batch_idx:]:
+                    state.llm_unprocessed_occ_ids.update(rem_b.occ_id_set)
+                break
+
+            envelope = TriageEnvelope.model_validate_json(raw_json)
+            validate_batch_response(
+                envelope,
+                batch.occ_id_set,
+                state.document_revision,
+                snapshot_hash,
+                expected_request_id=batch.request_id,
+            )
+
+            for item in envelope.items:
+                state.llm_triage_results[item.occ_id] = item
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            logging.warning(f"Batch {batch.batch_index}/{batch.total_batches} fehlgeschlagen: {type(ex).__name__}")
+            state.llm_partial_failure = True
+            for rem_b in batches[batch_idx:]:
+                state.llm_unprocessed_occ_ids.update(rem_b.occ_id_set)
+            break
+
+        if on_batch_complete:
+            on_batch_complete()
+        await asyncio.sleep(0.01)
 
 
 def load_document_into_state(
@@ -610,7 +683,49 @@ class AppState:
         self.llm_partial_failure: bool = False
         self.llm_unprocessed_occ_ids: Set[str] = set()
         self.llm_active_task: Optional[asyncio.Task] = None
-        self.mutating_ui_elements: List[Any] = []
+        self.mutating_ui_zones: Dict[str, List[Any]] = {
+            "sidebar": [],
+            "table": [],
+            "workspace": [],
+            "llm": [],
+            "llm_settings": [],
+            "ignore": [],
+            "glossary": [],
+        }
+
+    @property
+    def mutating_ui_elements(self) -> List[Any]:
+        """Flattened list of all registered mutating UI elements across all zones."""
+        res: List[Any] = []
+        for elems in self.mutating_ui_zones.values():
+            res.extend(elems)
+        return res
+
+    def register_mutating_element(self, elem: Any, zone: str = "table") -> None:
+        """Register a mutating UI control within a specific UI zone."""
+        self.mutating_ui_zones.setdefault(zone, []).append(elem)
+        if self.is_llm_running:
+            try:
+                elem.disable()
+            except Exception:
+                pass
+
+    def clear_mutating_zone(self, zone: str = "table") -> None:
+        """Clear registered elements for a specific UI zone (e.g. before re-rendering review table)."""
+        if zone in self.mutating_ui_zones:
+            self.mutating_ui_zones[zone].clear()
+
+    def set_all_mutating_elements_disabled(self, disabled: bool) -> None:
+        """Disable or enable all registered mutating UI controls across all zones."""
+        for zone, elements in self.mutating_ui_zones.items():
+            for elem in elements:
+                try:
+                    if disabled:
+                        elem.disable()
+                    else:
+                        elem.enable()
+                except Exception:
+                    pass
 
     async def close_llm_provider(self) -> None:
         """Close provider HTTP session safely."""
@@ -837,33 +952,6 @@ def _warmup_background_thread():
         with _model_lock:
             _model_ready = True
 
-
-# Supported entity labels
-AVAILABLE_ENTITIES = sorted([
-    "PERSON",
-    "ORGANIZATION",
-    "EMAIL_ADDRESS",
-    "PHONE_NUMBER",
-    "LOCATION",
-    "DATE_TIME",
-    "IBAN_CODE",
-    "CREDIT_CARD",
-    "BANK_ACCOUNT",
-    "ID_NUMBER",
-    "FINANCIAL_DATA",
-    "HEALTH_DATA",
-    "IP_ADDRESS",
-    "MAC_ADDRESS",
-    "URL",
-    "USERNAME",
-    "CRYPTO",
-    "MEDICAL_LICENSE",
-    "ADDRESS",
-    "AHV_NUMBER",
-    "UID_NUMBER",
-    "IT_SYSTEM",
-    "ROLE",
-])
 
 # Surface tag options as a clean dictionary
 SURFACE_TAG_OPTIONS: Dict[str, str] = {
@@ -1312,8 +1400,10 @@ def native_export_folder(stem: str, anon_text: str, mapping: dict, report: dict,
 
 # --- UI Construction ---
 @ui.page("/")
-def create_ui():
+def create_ui(client: Optional[Client] = None):
     state = AppState()
+    if client is not None:
+        client.on_disconnect(lambda: cleanup_session_async(state))
     ui.colors(primary="#1976D2", secondary="#26A69A", accent="#9C27B0", positive="#2E7D32", warning="#F57C00", negative="#C62828")
 
     # Header
@@ -1451,11 +1541,11 @@ def create_ui():
             logging.error(f"Native file open error: {err_msg}", exc_info=True)
             ui.notify(f"Fehler beim Laden: {err_msg}", type="negative", timeout=15000)
 
-    def reset_workspace():
+    async def reset_workspace():
         """Reset raw text, filename, and analysis table."""
         if not check_mutation_allowed():
             return
-        reset_app_state(state)
+        await reset_app_state_async(state)
         if raw_text_area is not None:
             raw_text_area.value = ""
         if preview_holder is not None:
@@ -1480,6 +1570,7 @@ def create_ui():
     def render_ignore_list_ui():
         if not ignore_container:
             return
+        state.clear_mutating_zone("ignore")
         ignore_container.clear()
         with ignore_container:
             raw_ignores = parse_ignore_terms(state.ignore_terms_text)
@@ -1487,7 +1578,10 @@ def create_ui():
 
             with ui.row().classes("w-full items-center gap-1 mb-2"):
                 new_ig_input = ui.input(placeholder="Neuer Begriff...").props("dense outlined bg-white").classes("flex-grow text-xs")
+                state.register_mutating_element(new_ig_input, "ignore")
                 def add_ig():
+                    if not check_mutation_allowed():
+                        return
                     val = new_ig_input.value.strip()
                     if val:
                         curr = parse_ignore_terms(state.ignore_terms_text)
@@ -1499,7 +1593,8 @@ def create_ui():
                             refresh_preview_and_exports()
                             ui.notify(f"'{val}' zur Ignore-Liste hinzugefügt.", type="info")
                         new_ig_input.value = ""
-                ui.button(icon="add", on_click=add_ig, color="primary").props("dense flat size=sm")
+                add_ig_btn = ui.button(icon="add", on_click=add_ig, color="primary").props("dense flat size=sm")
+                state.register_mutating_element(add_ig_btn, "ignore")
 
             with ui.column().classes("w-full max-h-48 overflow-y-auto gap-1 pr-1"):
                 if not unique_ignores:
@@ -1509,6 +1604,8 @@ def create_ui():
                         for term in unique_ignores:
                             def make_remove_ig(t):
                                 def on_remove():
+                                    if not check_mutation_allowed():
+                                        return
                                     curr = [x for x in parse_ignore_terms(state.ignore_terms_text) if x.lower() != t.lower()]
                                     state.ignore_terms_text = ", ".join(curr)
                                     save_current_config(state)
@@ -1519,11 +1616,13 @@ def create_ui():
 
                             with ui.row().classes("items-center gap-1 bg-slate-100 border border-slate-300 rounded px-2 py-0.5 shadow-none"):
                                 ui.label(term).classes("font-mono font-semibold text-xs text-slate-900")
-                                ui.button(icon="close", on_click=make_remove_ig(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-0.5 hover:bg-red-100")
+                                del_btn = ui.button(icon="close", on_click=make_remove_ig(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-0.5 hover:bg-red-100")
+                                state.register_mutating_element(del_btn, "ignore")
 
     def render_glossary_list_ui():
         if not glossary_container:
             return
+        state.clear_mutating_zone("glossary")
         glossary_container.clear()
         with glossary_container:
             glossary_dict = parse_glossary(state.glossary_text)
@@ -1532,7 +1631,11 @@ def create_ui():
             with ui.row().classes("w-full items-center gap-1 mb-2 flex-wrap"):
                 new_g_term = ui.input(placeholder="Begriff...").props("dense outlined bg-white").classes("flex-grow text-xs")
                 new_g_type = ui.select(options=AVAILABLE_ENTITIES, value="ORGANIZATION").props("dense outlined bg-white").classes("w-28 text-xs")
+                state.register_mutating_element(new_g_term, "glossary")
+                state.register_mutating_element(new_g_type, "glossary")
                 def add_g():
+                    if not check_mutation_allowed():
+                        return
                     t = new_g_term.value.strip()
                     if t:
                         lines = [l.strip() for l in state.glossary_text.splitlines() if l.strip()]
@@ -1544,7 +1647,8 @@ def create_ui():
                         refresh_preview_and_exports()
                         ui.notify(f"'{t}' ({new_g_type.value}) zur Begriffsliste hinzugefügt.", type="positive")
                         new_g_term.value = ""
-                ui.button(icon="add", on_click=add_g, color="positive").props("dense flat size=sm")
+                add_g_btn = ui.button(icon="add", on_click=add_g, color="positive").props("dense flat size=sm")
+                state.register_mutating_element(add_g_btn, "glossary")
 
             with ui.column().classes("w-full max-h-48 overflow-y-auto gap-1 pr-1"):
                 if not sorted_keys:
@@ -1555,6 +1659,8 @@ def create_ui():
                             ent_type = glossary_dict[term]
                             def make_remove_g(t):
                                 def on_remove():
+                                    if not check_mutation_allowed():
+                                        return
                                     lines = [l for l in state.glossary_text.splitlines() if not (l.strip().lower().startswith(f"{t.lower()}:") or l.strip().lower().startswith(f"{t.lower()}="))]
                                     state.glossary_text = "\n".join(lines)
                                     save_current_config(state)
@@ -1566,11 +1672,13 @@ def create_ui():
                             with ui.row().classes("items-center gap-1.5 bg-blue-50 border border-blue-300 rounded px-2 py-0.5 shadow-none"):
                                 ui.label(term).classes("font-mono font-bold text-xs text-slate-900")
                                 ui.label(f"({ent_type})").classes("text-[10px] font-semibold text-blue-800 bg-blue-100 px-1 rounded")
-                                ui.button(icon="close", on_click=make_remove_g(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-0.5 hover:bg-red-100")
+                                del_btn = ui.button(icon="close", on_click=make_remove_g(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-0.5 hover:bg-red-100")
+                                state.register_mutating_element(del_btn, "glossary")
 
     def render_llm_settings_ui():
         if llm_settings_container is None:
             return
+        state.clear_mutating_zone("llm_settings")
         llm_settings_container.clear()
         with llm_settings_container:
             if not LLM_AVAILABLE:
@@ -1587,7 +1695,8 @@ def create_ui():
                 build_llm_panel()
                 build_review_table()
 
-            ui.switch("LLM-Assistenz aktivieren", value=state.config.llm_enabled, on_change=on_llm_toggle).props("dense").classes("text-xs mb-2 font-semibold")
+            llm_switch = ui.switch("LLM-Assistenz aktivieren", value=state.config.llm_enabled, on_change=on_llm_toggle).props("dense").classes("text-xs mb-2 font-semibold")
+            state.register_mutating_element(llm_switch, "llm_settings")
 
             if state.config.llm_enabled:
                 ui.label("API-Endpunkt (OpenAI-kompatibel, z. B. Ollama/LM Studio):").classes("text-[11px] text-slate-600 font-medium")
@@ -1601,11 +1710,12 @@ def create_ui():
                         asyncio.create_task(state.close_llm_provider())
                     build_llm_panel()
 
-                ui.input(
+                base_url_input = ui.input(
                     value=state.config.llm_base_url,
                     placeholder="http://127.0.0.1:11434/v1",
                     on_change=on_base_url_change,
                 ).props("dense outlined bg-white").classes("w-full text-xs mb-2")
+                state.register_mutating_element(base_url_input, "llm_settings")
 
                 ui.label("Modellname (z. B. phi4:latest, qwen2.5:3b):").classes("text-[11px] text-slate-600 font-medium")
 
@@ -1618,11 +1728,12 @@ def create_ui():
                         asyncio.create_task(state.close_llm_provider())
                     build_llm_panel()
 
-                ui.input(
+                model_name_input = ui.input(
                     value=state.config.llm_model_name,
                     placeholder="phi4:latest",
                     on_change=on_model_name_change,
                 ).props("dense outlined bg-white").classes("w-full text-xs mb-2")
+                state.register_mutating_element(model_name_input, "llm_settings")
 
                 def on_auto_review_toggle(e):
                     if not check_mutation_allowed():
@@ -1630,13 +1741,14 @@ def create_ui():
                     state.config.llm_auto_review = bool(e.value)
                     save_current_config(state)
 
-                ui.checkbox(
+                auto_review_checkbox = ui.checkbox(
                     "LLM-Review direkt an die Textanalyse anschließen",
                     value=state.config.llm_auto_review,
                     on_change=on_auto_review_toggle,
                 ).props("dense").classes("text-xs text-slate-700 mb-2").tooltip(
                     "Wenn aktiviert, startet nach der lokalen Erkennung automatisch die LLM-Triage der Fundstellen."
                 )
+                state.register_mutating_element(auto_review_checkbox, "llm_settings")
 
     def refresh_preview_and_exports():
         if not preview_holder or not export_holder:
@@ -2071,7 +2183,7 @@ def create_ui():
             with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
                 with ui.row().classes("items-center gap-2 flex-1 min-w-[280px]"):
                     stage_chk = ui.checkbox(value=is_staged, on_change=on_stage_toggle).props("dense").tooltip("Für Sammelübernahme vormerken")
-                    state.mutating_ui_elements.append(stage_chk)
+                    state.register_mutating_element(stage_chk, "llm")
                     ui.label(grp.original_text).classes("font-mono font-bold text-xs text-slate-900")
                     ui.badge(grp.entity_type, color="slate").props("dense outline")
                     if grp.role:
@@ -2097,7 +2209,7 @@ def create_ui():
                         open_apply_dialog([item.occ_id])
 
                     single_btn = ui.button("Übernehmen", icon="check", color="positive", on_click=single_apply).props("outline dense size=xs")
-                    state.mutating_ui_elements.append(single_btn)
+                    state.register_mutating_element(single_btn, "llm")
 
             if getattr(item, "reasoning", None):
                 with ui.row().classes("w-full mt-1 text-[11px] text-slate-600 italic px-7"):
@@ -2146,6 +2258,7 @@ def create_ui():
     def build_llm_panel():
         if not llm_panel_holder:
             return
+        state.clear_mutating_zone("llm")
         llm_panel_holder.clear()
         with llm_panel_holder:
             if not LLM_AVAILABLE:
@@ -2211,6 +2324,7 @@ def create_ui():
                                     return
                                 launch_llm_triage(triggered_from_analysis=False)
                             triage_start_btn = ui.button(btn_label, icon="auto_awesome", color="primary", on_click=start_triage_click).props("unelevated dense size=sm")
+                            state.register_mutating_element(triage_start_btn, "llm")
                             is_start_enabled = has_entities and has_model and not state.is_llm_running
                             triage_start_btn.set_enabled(is_start_enabled)
                             if not has_entities:
@@ -2249,8 +2363,10 @@ def create_ui():
                                 state.llm_staged_selections.clear()
                                 build_llm_panel()
 
-                            ui.button("Alle vormerken", on_click=stage_all).props("flat dense size=xs color=slate")
-                            ui.button("Auswahl leeren", on_click=unstage_all).props("flat dense size=xs color=slate")
+                            stage_all_btn = ui.button("Alle vormerken", on_click=stage_all).props("flat dense size=xs color=slate")
+                            unstage_all_btn = ui.button("Auswahl leeren", on_click=unstage_all).props("flat dense size=xs color=slate")
+                            state.register_mutating_element(stage_all_btn, "llm")
+                            state.register_mutating_element(unstage_all_btn, "llm")
 
                             selected_count = len(state.llm_staged_selections)
                             apply_bulk_btn = ui.button(
@@ -2259,6 +2375,7 @@ def create_ui():
                                 color="positive",
                                 on_click=lambda: open_apply_dialog(list(state.llm_staged_selections)),
                             ).props("unelevated dense size=sm")
+                            state.register_mutating_element(apply_bulk_btn, "llm")
 
                             if selected_count == 0 or state.llm_partial_failure:
                                 apply_bulk_btn.disable()
@@ -2336,50 +2453,12 @@ def create_ui():
         ui.notify(f"Starte LLM-Triage ({len(candidates)} Fundstellen in {len(batches)} Batches)...", type="info")
 
         try:
-            for batch_idx, batch in enumerate(batches):
-                current_snap = compute_triage_snapshot(state.raw_text, state.analysis_revision, state.entity_groups)
-                if current_snap != snapshot_hash or state.document_revision != batch.document_revision:
-                    logging.info("Dokument- oder Reviewzustand während LLM-Lauf geändert -> Lauf abgebrochen.")
-                    state.llm_partial_failure = True
-                    for rem_b in batches[batch_idx:]:
-                        state.llm_unprocessed_occ_ids.update(rem_b.occ_id_set)
-                    break
-
-                try:
-                    raw_json = await state.llm_provider.generate(
-                        prompt=batch.user_prompt,
-                        system_prompt=batch.system_prompt,
-                    )
-                    # Re-validate snapshot after await
-                    post_snap = compute_triage_snapshot(state.raw_text, state.analysis_revision, state.entity_groups)
-                    if post_snap != snapshot_hash or state.document_revision != batch.document_revision:
-                        logging.info("Dokument- oder Reviewzustand nach Inferenz geändert -> Batch verworfen.")
-                        state.llm_partial_failure = True
-                        for rem_b in batches[batch_idx:]:
-                            state.llm_unprocessed_occ_ids.update(rem_b.occ_id_set)
-                        break
-
-                    envelope = TriageEnvelope.model_validate_json(raw_json)
-                    validate_batch_response(
-                        envelope,
-                        batch.occ_id_set,
-                        state.document_revision,
-                        snapshot_hash,
-                        expected_request_id=batch.request_id,
-                    )
-
-                    for item in envelope.items:
-                        state.llm_triage_results[item.occ_id] = item
-
-                except asyncio.CancelledError:
-                    raise
-                except Exception as ex:
-                    logging.warning(f"Batch {batch.batch_index}/{batch.total_batches} fehlgeschlagen: {type(ex).__name__}")
-                    state.llm_partial_failure = True
-                    state.llm_unprocessed_occ_ids.update(batch.occ_id_set)
-
-                build_llm_panel()
-                await asyncio.sleep(0.01)
+            await run_triage_batch_loop(
+                state,
+                batches,
+                snapshot_hash,
+                on_batch_complete=build_llm_panel,
+            )
 
             if state.llm_partial_failure:
                 ui.notify(
@@ -2421,7 +2500,7 @@ def create_ui():
     def build_review_table():
         if not table_holder:
             return
-        state.mutating_ui_elements.clear()
+        state.clear_mutating_zone("table")
         table_holder.clear()
         with table_holder:
             if not state.entity_groups:
@@ -2480,9 +2559,7 @@ def create_ui():
                         value=state.sort_by,
                         on_change=on_sort_change,
                     ).props("dense outlined bg-white").classes("w-64 text-xs")
-                    state.mutating_ui_elements.append(sort_sel)
-                    if state.is_llm_running:
-                        sort_sel.disable()
+                    state.register_mutating_element(sort_sel, "table")
 
                 with ui.row().classes("items-center gap-2"):
                     def select_all():
@@ -2505,10 +2582,8 @@ def create_ui():
 
                     sel_all_btn = ui.button("Alle aktivieren", icon="select_all", on_click=select_all, color="slate").props("outline dense size=sm")
                     desel_all_btn = ui.button("Alle abwählen", icon="deselect", on_click=deselect_all, color="slate").props("outline dense size=sm")
-                    state.mutating_ui_elements.extend([sel_all_btn, desel_all_btn])
-                    if state.is_llm_running:
-                        sel_all_btn.disable()
-                        desel_all_btn.disable()
+                    state.register_mutating_element(sel_all_btn, "table")
+                    state.register_mutating_element(desel_all_btn, "table")
 
                     toggle_expand_btn = ui.button(
                         "Alle aufklappen",
@@ -2565,8 +2640,8 @@ def create_ui():
                                                 return on_change
 
                                             master_check = ui.checkbox(value=master.enabled, on_change=make_group_check(master)).props("dense")
-                                            state.mutating_ui_elements.append(master_check)
-                                            if not is_category_enabled(state, master.entity_type) or state.is_llm_running:
+                                            state.register_mutating_element(master_check, "table")
+                                            if not is_category_enabled(state, master.entity_type):
                                                 master_check.disable()
                                             ui.label(master.original_text).classes("font-mono text-sm font-bold text-slate-800")
                                             ui.badge(f"{master.count}x", color="primary" if master.count > 1 else "grey-6").props("dense")
@@ -2599,9 +2674,7 @@ def create_ui():
                                                 value=master.entity_type,
                                                 on_change=make_group_select(master),
                                             ).props("dense outlined bg-white").classes("w-36 text-xs")
-                                            state.mutating_ui_elements.append(m_sel)
-                                            if state.is_llm_running:
-                                                m_sel.disable()
+                                            state.register_mutating_element(m_sel, "table")
 
                                         # 3. Role Input Field (In-place badge update WITHOUT losing focus!)
                                         with ui.row().classes("items-center gap-1"):
@@ -2624,9 +2697,7 @@ def create_ui():
                                                 placeholder="z.B. Student",
                                                 on_change=make_role_change(master, master_badge, child_badge_refs),
                                             ).props("dense outlined bg-white debounce=300").classes("w-32 text-xs")
-                                            state.mutating_ui_elements.append(m_role_inp)
-                                            if state.is_llm_running:
-                                                m_role_inp.disable()
+                                            state.register_mutating_element(m_role_inp, "table")
 
                                         # 4. Interactive Smart-Linking Proposal (Confirmation Model) or Link Dropdown
                                         if not has_children:
@@ -2664,9 +2735,7 @@ def create_ui():
                                                         color="teal-8",
                                                         on_click=make_apply_suggestion(master, p_target_id, master.suggested_tag or "VORNAME"),
                                                     ).props("outline dense size=sm").tooltip(f"Vorschlag übernehmen: Als {tag_label} verknüpfen")
-                                                    state.mutating_ui_elements.append(sugg_btn)
-                                                    if state.is_llm_running:
-                                                        sugg_btn.disable()
+                                                    state.register_mutating_element(sugg_btn, "table")
 
                                             elif master.suggested_candidates:
                                                 ui.badge(f"💡 {len(master.suggested_candidates)} Namenskandidaten", color="amber-8").props("outline dense").tooltip("Mehrere passende Personen gefunden. Bitte im Dropdown rechts auswählen.")
@@ -2715,9 +2784,7 @@ def create_ui():
                                                         label="Verknüpfen mit:",
                                                         on_change=make_link_to_master(master),
                                                     ).props('dense outlined bg-white options-dense menu-props="{ maxHeight: \'300px\' }"').classes("min-w-[200px] max-w-[320px] text-xs").tooltip("Zielperson / Bezug auswählen")
-                                                    state.mutating_ui_elements.append(link_sel)
-                                                    if state.is_llm_running:
-                                                        link_sel.disable()
+                                                    state.register_mutating_element(link_sel, "table")
 
                                         # 5. Score & Action
                                         with ui.row().classes("items-center gap-2"):
@@ -2803,12 +2870,11 @@ def create_ui():
                                                 icon="edit_note",
                                                 on_click=make_mark_manual(master.original_text, master),
                                             ).props("flat round dense size=sm color=orange-8").tooltip("Diesen Begriff nur für den aktuellen Durchlauf als manuell markiert behandeln")
-                                            state.mutating_ui_elements.extend([ign_btn, gloss_btn, manual_button])
-                                            if not is_category_enabled(state, master.entity_type) or state.is_llm_running:
+                                            state.register_mutating_element(ign_btn, "table")
+                                            state.register_mutating_element(gloss_btn, "table")
+                                            state.register_mutating_element(manual_button, "table")
+                                            if not is_category_enabled(state, master.entity_type):
                                                 manual_button.disable()
-                                            if state.is_llm_running:
-                                                ign_btn.disable()
-                                                gloss_btn.disable()
 
                                 # Expanded content: Context occurrences
                                 with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
@@ -2849,9 +2915,7 @@ def create_ui():
                                                         return on_click
 
                                                     rev_btn = ui.button("↩️ Zusammenführen", on_click=make_revert_occ(master, occ)).props("flat dense size=sm color=teal-8").tooltip("Ausgliederung rückgängig machen und mit Basisgruppe vereinen")
-                                                    state.mutating_ui_elements.append(rev_btn)
-                                                    if state.is_llm_running:
-                                                        rev_btn.disable()
+                                                    state.register_mutating_element(rev_btn, "table")
                                                 elif master.count > 1:
                                                     def make_split_occ(grp, o):
                                                         def on_click():
@@ -2865,9 +2929,7 @@ def create_ui():
                                                         return on_click
 
                                                     split_btn = ui.button("✂️ Ausgliedern", on_click=make_split_occ(master, occ)).props("flat dense size=sm color=primary").tooltip("Als eigene Gruppe ausgliedern (Homonym-Behandlung)")
-                                                    state.mutating_ui_elements.append(split_btn)
-                                                    if state.is_llm_running:
-                                                        split_btn.disable()
+                                                    state.register_mutating_element(split_btn, "table")
 
                             # Render Indented Linked Children
                             for child_node in root_node.children:
@@ -2880,8 +2942,8 @@ def create_ui():
                                             with ui.row().classes("items-center gap-2 min-w-[260px]"):
                                                 ui.label("↳").classes("text-teal-700 font-bold text-base")
                                                 child_check = ui.checkbox(value=child.enabled, on_change=make_group_check(child)).props("dense")
-                                                state.mutating_ui_elements.append(child_check)
-                                                if not is_category_enabled(state, child.entity_type) or state.is_llm_running:
+                                                state.register_mutating_element(child_check, "table")
+                                                if not is_category_enabled(state, child.entity_type):
                                                     child_check.disable()
                                                 ui.label(child.original_text).classes("font-mono text-sm font-bold text-teal-900")
                                                 ui.badge(f"{child.count}x", color="teal-6").props("dense")
@@ -2905,9 +2967,7 @@ def create_ui():
                                                     label="Schreibweise:",
                                                     on_change=make_surface_change(child),
                                                 ).props("dense outlined bg-white").classes("w-44 text-xs")
-                                                state.mutating_ui_elements.append(surf_sel)
-                                                if state.is_llm_running:
-                                                    surf_sel.disable()
+                                                state.register_mutating_element(surf_sel, "table")
 
                                             # Explicit UNLINK Action
                                             with ui.row().classes("items-center gap-2"):
@@ -2928,9 +2988,7 @@ def create_ui():
                                                     color="negative",
                                                     on_click=make_unlink_action(child),
                                                 ).props("flat dense size=sm").tooltip("Verknüpfung aufheben und als separate Entität führen")
-                                                state.mutating_ui_elements.append(unlink_btn)
-                                                if state.is_llm_running:
-                                                    unlink_btn.disable()
+                                                state.register_mutating_element(unlink_btn, "table")
 
                                     # Child Occurrences
                                     with ui.column().classes("p-3 bg-white border-t gap-2 w-full"):
@@ -2971,9 +3029,7 @@ def create_ui():
                                                             return on_click
 
                                                         rev_child_btn = ui.button("↩️ Zusammenführen", on_click=make_revert_child_occ(child, occ)).props("flat dense size=sm color=teal-8").tooltip("Ausgliederung rückgängig machen und mit Basisgruppe vereinen")
-                                                        state.mutating_ui_elements.append(rev_child_btn)
-                                                        if state.is_llm_running:
-                                                            rev_child_btn.disable()
+                                                        state.register_mutating_element(rev_child_btn, "table")
                                                     elif child.count > 1:
                                                         def make_split_child_occ(grp, o):
                                                             def on_click():
@@ -2987,9 +3043,7 @@ def create_ui():
                                                             return on_click
 
                                                         split_child_btn = ui.button("✂️ Ausgliedern", on_click=make_split_child_occ(child, occ)).props("flat dense size=sm color=primary").tooltip("Als eigene Gruppe ausgliedern (Homonym-Behandlung)")
-                                                        state.mutating_ui_elements.append(split_child_btn)
-                                                        if state.is_llm_running:
-                                                            split_child_btn.disable()
+                                                        state.register_mutating_element(split_child_btn, "table")
 
     # --- Main Layout ---
     with ui.row().classes("w-full no-wrap p-4 gap-6"):
@@ -3000,12 +3054,14 @@ def create_ui():
             # Format Mode Selector
             ui.label("Platzhalter-Format:").classes("text-xs font-semibold text-slate-700 mb-1")
             def on_mode_change(e):
+                if not check_mutation_allowed():
+                    return
                 state.format_mode = e.value
                 save_current_config(state)
                 refresh_preview_and_exports()
                 build_review_table()
 
-            ui.radio(
+            mode_radio = ui.radio(
                 {
                     "numbered": "Modus 1: [TYP_NR] (Klassisch)",
                     "numbered_role": "Modus 2: [TYP_NR_ROLLE] (Empfohlen)",
@@ -3014,16 +3070,19 @@ def create_ui():
                 value=state.format_mode,
                 on_change=on_mode_change,
             ).props("dense").classes("text-xs mb-3")
+            state.register_mutating_element(mode_radio, "sidebar")
 
             # Export Format Choice (.txt vs .md)
             ui.separator().classes("my-2")
             ui.label("Standard Export-Format:").classes("text-xs font-semibold text-slate-700 mb-1")
             def on_export_fmt_change(e):
+                if not check_mutation_allowed():
+                    return
                 state.export_format = e.value
                 save_current_config(state)
                 refresh_preview_and_exports()
 
-            ui.radio(
+            export_fmt_radio = ui.radio(
                 {
                     "txt": ".txt (Reiner Text)",
                     "md": ".md (Markdown-Formatierung)",
@@ -3031,6 +3090,7 @@ def create_ui():
                 value=state.export_format,
                 on_change=on_export_fmt_change,
             ).props("dense inline").classes("text-xs mb-3")
+            state.register_mutating_element(export_fmt_radio, "sidebar")
 
             ui.separator().classes("my-2")
 
@@ -3049,6 +3109,8 @@ def create_ui():
                         selector_ref: List[Any] = []
 
                         def change_mode(e):
+                            if not check_mutation_allowed():
+                                return
                             mode = e.value or ENTITY_MODE_OFF
                             state.entity_modes[e_name] = mode
                             state.active_entities = [
@@ -3077,16 +3139,20 @@ def create_ui():
                         entity_mode_classes(state.entity_modes.get(ent, ENTITY_MODE_OFF))
                     )
                     selector_ref.append(mode_select)
+                    state.register_mutating_element(mode_select, "sidebar")
 
             ui.separator().classes("my-2")
 
             ui.label("Erkennungs-Schwellenwert (GLiNER):").classes("text-xs font-semibold text-slate-700")
             def on_thresh_change(e):
+                if not check_mutation_allowed():
+                    return
                 state.gliner_threshold = e.value
                 save_current_config(state)
                 if state.entity_groups and reanalysis_warning_card is not None:
                     reanalysis_warning_card.set_visibility(True)
             thresh_slider = ui.slider(min=0.20, max=0.95, step=0.05, value=state.gliner_threshold, on_change=on_thresh_change)
+            state.register_mutating_element(thresh_slider, "sidebar")
             ui.label().bind_text_from(thresh_slider, "value", lambda v: f"GLiNER Schwellenwert: {v:.2f}").classes("text-xs text-slate-500 mb-2")
 
             ui.separator().classes("my-2")
@@ -3098,6 +3164,8 @@ def create_ui():
                 eupii_spinner.set_visibility(False)
 
                 async def on_eupii_toggle(e):
+                    if not check_mutation_allowed():
+                        return
                     target_val = bool(e.value)
                     if target_val:
                         # Check if model is already available in local cache
@@ -3164,8 +3232,11 @@ def create_ui():
 
                 eupii_switch = ui.switch("EU-PII Modell aktivieren", value=state.enable_eupii, on_change=on_eupii_toggle).props("dense").classes("text-xs")
                 eupii_switch.tooltip("Aktiviert das spezialisierte Token-Klassifikationsmodell bardsai/eu-pii für erweiterte Erkennung von Personen, Orten, IDs und Gesundheitsdaten.")
+                state.register_mutating_element(eupii_switch, "sidebar")
 
             def on_eupii_thresh_change(e):
+                if not check_mutation_allowed():
+                    return
                 state.eupii_threshold = e.value
                 save_current_config(state)
                 with _model_lock:
@@ -3175,6 +3246,7 @@ def create_ui():
                     reanalysis_warning_card.set_visibility(True)
 
             eupii_slider = ui.slider(min=0.20, max=0.95, step=0.05, value=state.eupii_threshold, on_change=on_eupii_thresh_change)
+            state.register_mutating_element(eupii_slider, "sidebar")
             ui.label().bind_text_from(eupii_slider, "value", lambda v: f"EU-PII Schwellenwert: {v:.2f}").classes("text-xs text-slate-500 mb-2")
 
             ui.separator().classes("my-2")
@@ -3246,6 +3318,8 @@ def create_ui():
 
                         # Drop handler via HTTP streaming / path / base64
                         async def on_file_dropped(e):
+                            if not check_mutation_allowed():
+                                return
                             data = e.args
                             logging.info(f"on_file_dropped received: {type(data)} -> {data}")
                             filename = data.get("name", "dokument")
@@ -3384,25 +3458,31 @@ def create_ui():
 
                         with ui.row().classes("items-center gap-4 flex-wrap"):
                             async def on_toggle_headers_footers(e):
+                                if not check_mutation_allowed():
+                                    return
                                 state.include_headers_footers = bool(e.value)
                                 await on_extraction_opt_change()
 
                             async def on_toggle_picture_text(e):
+                                if not check_mutation_allowed():
+                                    return
                                 state.extract_picture_text = bool(e.value)
                                 await on_extraction_opt_change()
 
-                            ui.checkbox(
+                            hf_checkbox = ui.checkbox(
                                 "Kopf- und Fußzeilen einbeziehen",
                                 value=state.include_headers_footers,
                                 on_change=on_toggle_headers_footers,
                             ).props("dense size=sm").tooltip("Laufende Kopf- und Fußzeilen (z. B. Seitenzahlen, Dokumenttitel) mit einlesen. Standard: Aus.")
+                            state.register_mutating_element(hf_checkbox, "workspace")
 
                             with ui.row().classes("items-center gap-1"):
-                                ui.checkbox(
+                                pt_checkbox = ui.checkbox(
                                     "Text aus PDF-Bildern & Grafiken extrahieren",
                                     value=state.extract_picture_text,
                                     on_change=on_toggle_picture_text,
                                 ).props("dense size=sm").tooltip("Liest Textboxen in Diagrammen & Vektorgrafiken aus.")
+                                state.register_mutating_element(pt_checkbox, "workspace")
                                 with ui.button(icon="help_outline").props("flat round dense size=xs color=grey").classes("p-0 min-h-0 min-w-0"):
                                     with ui.tooltip().classes("bg-slate-900 text-white text-xs max-w-md p-2.5 leading-relaxed shadow-lg rounded-lg"):
                                         ui.markdown(
@@ -3491,6 +3571,9 @@ def create_ui():
                                 manual_input = ui.input(placeholder="z. B. Remo").props("dense outlined bg-white").classes("w-44 text-xs")
                                 manual_type = ui.select(options=AVAILABLE_ENTITIES, value="PERSON").props("dense outlined bg-white").classes("w-36 text-xs")
                                 save_perm_check = ui.checkbox("Dauerhaft in Begriffsliste speichern", value=False).props("dense").classes("text-xs text-slate-600")
+                                state.register_mutating_element(manual_input, "workspace")
+                                state.register_mutating_element(manual_type, "workspace")
+                                state.register_mutating_element(save_perm_check, "workspace")
 
                                 async def add_manual_entity():
                                     if not check_mutation_allowed():
@@ -3584,6 +3667,7 @@ def create_ui():
                                     manual_input.value = ""
 
                                 add_manual_btn = ui.button("➕ Hinzufügen", icon="add", color="positive", on_click=add_manual_entity).props("unelevated dense size=sm")
+                                state.register_mutating_element(add_manual_btn, "workspace")
 
                     # LLM Proposal Panel (Review-Assistenz)
                     llm_panel_holder = ui.column().classes("w-full mb-3")
@@ -3608,12 +3692,16 @@ def create_ui():
                             ui.label("1. LLM-Antwort (Text oder Dokument):").classes("font-semibold text-xs text-slate-700 mb-1")
 
                             def load_restore_text(text: str, filename: str):
+                                if not check_mutation_allowed():
+                                    return
                                 state.restore_anon_text = text
                                 if restore_anon_input is not None:
                                     restore_anon_input.value = text
                                 ui.notify(f"'{filename}' geladen ({len(text)} Zeichen).", type="positive")
 
                             def open_restore_file_dialog():
+                                if not check_mutation_allowed():
+                                    return
                                 try:
                                     import tkinter as tk
                                     from tkinter import filedialog
@@ -3637,6 +3725,8 @@ def create_ui():
                                     ui.notify(f"Fehler beim Laden: {str(ex)}", type="negative")
 
                             async def on_restore_file_dropped(e):
+                                if not check_mutation_allowed():
+                                    return
                                 data = e.args
                                 filename = data.get("name", "dokument")
                                 filepath = data.get("path", "")
@@ -3731,6 +3821,8 @@ def create_ui():
                             """)
 
                             def on_anon_change(e):
+                                if not check_mutation_allowed():
+                                    return
                                 state.restore_anon_text = e.value
                             restore_anon_input = ui.textarea(
                                 placeholder="[PERSON_1_STUDENT_VOLLNAME] arbeitet an [ORGANIZATION_1_HOCHSCHULE]...",
@@ -3750,12 +3842,16 @@ def create_ui():
                                 initial_map_val = json.dumps(state.restore_mapping, indent=2, ensure_ascii=False)
 
                             def load_mapping_data(mapping_data: dict):
+                                if not check_mutation_allowed():
+                                    return
                                 state.restore_mapping = mapping_data
                                 if map_json_input is not None:
                                     map_json_input.value = json.dumps(mapping_data, indent=2, ensure_ascii=False)
                                 ui.notify(f"Mapping-Tabelle geladen ({len(mapping_data)} Einträge).", type="positive")
 
                             def open_mapping_file_dialog():
+                                if not check_mutation_allowed():
+                                    return
                                 try:
                                     import tkinter as tk
                                     from tkinter import filedialog
@@ -3778,6 +3874,8 @@ def create_ui():
                                     ui.notify(f"Ungültige JSON-Mapping-Datei: {str(ex)}", type="negative")
 
                             async def on_mapping_file_dropped(e):
+                                if not check_mutation_allowed():
+                                    return
                                 data = e.args
                                 filename = data.get("name", "mapping.json")
                                 filepath = data.get("path", "")
@@ -3874,6 +3972,8 @@ def create_ui():
                             """)
 
                             def on_map_text_change(e):
+                                if not check_mutation_allowed():
+                                    return
                                 try:
                                     if e.value.strip():
                                         state.restore_mapping = json.loads(e.value)
@@ -3887,6 +3987,8 @@ def create_ui():
                             ).props("outlined rows=6").classes("w-full font-mono text-xs")
 
                     def run_restore():
+                        if not check_mutation_allowed():
+                            return
                         if not state.restore_anon_text:
                             ui.notify("Bitte anonymisierten Text einfügen oder Datei hochladen.", type="warning")
                             return

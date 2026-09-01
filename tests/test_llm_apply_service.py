@@ -28,17 +28,31 @@ class MockState:
         self.is_llm_running = False
 
 
-def test_normalize_entity_type():
+from local_anonymizer.anonymizer import AVAILABLE_ENTITIES
+
+
+def test_canonical_entity_types_matches_available_entities():
+    assert CANONICAL_APP_ENTITY_TYPES == set(AVAILABLE_ENTITIES)
+    for ent in AVAILABLE_ENTITIES:
+        assert normalize_entity_type(ent) == ent
+
+
+def test_normalize_entity_type_aliases():
     assert normalize_entity_type("ORGANIZATION") == "ORGANIZATION"
     assert normalize_entity_type("org") == "ORGANIZATION"
+    assert normalize_entity_type("ORGANISATION") == "ORGANIZATION"
     assert normalize_entity_type("PER") == "PERSON"
     assert normalize_entity_type("person") == "PERSON"
     assert normalize_entity_type("LOC") == "LOCATION"
     assert normalize_entity_type("GPE") == "LOCATION"
     assert normalize_entity_type("DATE") == "DATE_TIME"
     assert normalize_entity_type("TIME") == "DATE_TIME"
+    assert normalize_entity_type("EMAIL") == "EMAIL_ADDRESS"
+    assert normalize_entity_type("PHONE") == "PHONE_NUMBER"
+    assert normalize_entity_type("IBAN") == "IBAN_CODE"
     assert normalize_entity_type("UNKNOWN_XYZ") is None
     assert normalize_entity_type("MISC") is None
+    assert normalize_entity_type("") is None
 
 
 def test_check_mutation_allowed():

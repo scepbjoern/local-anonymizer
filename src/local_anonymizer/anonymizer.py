@@ -58,6 +58,33 @@ DEFAULT_IGNORE_TERMS = [
     "Software", "System", "Systeme", "Plattform", "Plattformen", "Datenbank", "Datenbanken",
 ]
 
+# Canonical supported entity labels across the application
+AVAILABLE_ENTITIES: List[str] = sorted([
+    "PERSON",
+    "ORGANIZATION",
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "LOCATION",
+    "DATE_TIME",
+    "IBAN_CODE",
+    "CREDIT_CARD",
+    "BANK_ACCOUNT",
+    "ID_NUMBER",
+    "FINANCIAL_DATA",
+    "HEALTH_DATA",
+    "IP_ADDRESS",
+    "MAC_ADDRESS",
+    "URL",
+    "USERNAME",
+    "CRYPTO",
+    "MEDICAL_LICENSE",
+    "ADDRESS",
+    "AHV_NUMBER",
+    "UID_NUMBER",
+    "IT_SYSTEM",
+    "ROLE",
+])
+
 # Scores below this threshold are uncertain enough to require human review. The lower bound
 # previously used by the UI hid especially weak predictions instead of flagging them.
 REVIEW_SCORE_THRESHOLD = 0.85

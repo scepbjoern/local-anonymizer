@@ -4,39 +4,21 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 
 
-CANONICAL_APP_ENTITY_TYPES: Set[str] = {
-    "PERSON",
-    "ORGANIZATION",
-    "EMAIL_ADDRESS",
-    "PHONE_NUMBER",
-    "LOCATION",
-    "DATE_TIME",
-    "IBAN_CODE",
-    "CREDIT_CARD",
-    "BANK_ACCOUNT",
-    "ID_NUMBER",
-    "FINANCIAL_DATA",
-    "HEALTH_DATA",
-    "IP_ADDRESS",
-    "MAC_ADDRESS",
-    "URL",
-    "USERNAME",
-    "CRYPTO",
-    "MEDICAL_LICENSE",
-    "ADDRESS",
-    "AHV_NUMBER",
-    "UID_NUMBER",
-    "IT_SYSTEM",
-    "ROLE",
-}
+from local_anonymizer.anonymizer import AVAILABLE_ENTITIES
+
+CANONICAL_APP_ENTITY_TYPES: Set[str] = set(AVAILABLE_ENTITIES)
 
 ENTITY_TYPE_ALIASES: Dict[str, str] = {
     "ORG": "ORGANIZATION",
+    "ORGANISATION": "ORGANIZATION",
     "PER": "PERSON",
     "LOC": "LOCATION",
     "GPE": "LOCATION",
     "DATE": "DATE_TIME",
     "TIME": "DATE_TIME",
+    "EMAIL": "EMAIL_ADDRESS",
+    "PHONE": "PHONE_NUMBER",
+    "IBAN": "IBAN_CODE",
 }
 
 

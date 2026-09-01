@@ -109,7 +109,7 @@ def test_prepare_triage_batches_multiple_batches():
         candidates,
         document_revision=3,
         document_hash="snap_multi",
-        max_tokens_per_batch=400,
+        max_tokens_per_batch=1200,
         max_items_per_batch=10,
     )
     assert len(batches) > 1
@@ -129,3 +129,62 @@ def test_prepare_triage_batches_multiple_batches():
 def test_prepare_triage_batches_empty():
     batches = prepare_triage_batches([], document_revision=1, document_hash="snap_empty")
     assert len(batches) == 0
+
+
+def test_prepare_triage_batches_min_budget_value_error():
+    candidates = [
+        {
+            "occ_id": "occ-1",
+            "original_text": "Alice",
+            "entity_type": "PERSON",
+            "role": "CEO",
+            "context_snippet": "Alice is the CEO of Acme Corp.",
+        }
+    ]
+    with pytest.raises(ValueError) as excinfo:
+        prepare_triage_batches(
+            candidates,
+            document_revision=1,
+            document_hash="snap_val_err",
+            max_tokens_per_batch=100,  # Far below baseline
+        )
+    assert "kleiner als das minimale Basisbudget" in str(excinfo.value)
+
+
+def test_prepare_triage_batches_hard_token_budget_invariant_long_fields():
+    # Test candidate with long text, long role, long occ_id, and long context snippet
+    long_name = "Prof. Dr. med. Maximilian-Alexander von Hohenzollern-Sigmaringen der Dritte " * 10
+    long_role = "Leitender Oberarzt für Experimentelle Nuklearmedizin und Molekulare Bildgebung " * 10
+    long_ctx = "Der Patient wurde von " + long_name + " in der Klinik untersucht. " * 30
+
+    candidates = [
+        {
+            "occ_id": f"occ-super-long-identifier-with-extra-suffix-{i}",
+            "original_text": long_name,
+            "entity_type": "PERSON",
+            "role": long_role,
+            "context_snippet": long_ctx,
+        }
+        for i in range(10)
+    ]
+
+    limit = 1000
+    batches = prepare_triage_batches(
+        candidates,
+        document_revision=2,
+        document_hash="snap_hard_invariant",
+        max_tokens_per_batch=limit,
+    )
+
+    assert len(batches) > 0
+    all_occ_ids = set()
+    sys_tokens = estimate_tokens(SYSTEM_TRIAGE_PROMPT)
+
+    for b in batches:
+        total_tokens = sys_tokens + estimate_tokens(b.user_prompt)
+        assert total_tokens <= limit, f"Batch {b.batch_index} exceeded limit: {total_tokens} > {limit}"
+        all_occ_ids.update(b.occ_id_set)
+
+    # 100% of candidates must be preserved
+    assert all_occ_ids == {f"occ-super-long-identifier-with-extra-suffix-{i}" for i in range(10)}
+    assert sum(len(b.candidates) for b in batches) == 10
