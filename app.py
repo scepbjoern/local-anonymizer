@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 # Ensure src is in python path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
@@ -44,6 +44,15 @@ from local_anonymizer.config import (
     ENTITY_MODE_EXPLICIT_EUPII,
     ENTITY_MODE_OFF,
     LOG_FILE,
+)
+from local_anonymizer.profiles import (
+    CategoryTemplate,
+    DocumentProfileOverlay,
+    ProfileStore,
+    ScopedTerm,
+    ScopeResolutionEngine,
+    get_builtin_templates,
+    normalize_term_key,
 )
 from local_anonymizer.extractors import (
     UnsupportedFileFormatError,
@@ -300,6 +309,7 @@ class EntityGroup:
         self.group_id: str = group_id if group_id is not None else original_text.strip().lower()
         self.enabled: bool = True
         self.role: str = ""
+        self.role_provenance: str = "auto"
         self.parent_group_id: Optional[str] = None
         self.surface_tag: str = ""
         self.placeholder: str = ""
@@ -377,6 +387,7 @@ def split_occurrence_to_new_group(st: "AppState", grp: EntityGroup, occ: EntityO
         group_id=target_group_id,
     )
     new_grp.role = grp.role
+    new_grp.role_provenance = getattr(grp, "role_provenance", "auto")
     new_grp.enabled = grp.enabled
     new_grp.occurrences.append(occ)
     st.entity_groups.append(new_grp)
@@ -482,13 +493,28 @@ def rebind_overrides_after_analysis(
                     group_id=key,
                 )
                 base_grp.role = prev.role
+                base_grp.role_provenance = getattr(prev, "role_provenance", "auto")
                 base_grp.enabled = prev.enabled
                 base_grp.surface_tag = prev.surface_tag
                 base_grp.parent_group_id = prev.parent_group_id
             else:
                 base_grp = EntityGroup(original_text=norm, entity_type=res.entity_type, group_id=key)
             base_groups_dict[key] = base_grp
-        base_groups_dict[key].occurrences.append(occ)
+        base_group = base_groups_dict[key]
+        profile_role = (res.recognition_metadata or {}).get("custom_role")
+        profile_role = profile_role.strip() if isinstance(profile_role, str) and profile_role.strip() else None
+        if key not in existing_base_map:
+            if profile_role is not None:
+                base_group.role = profile_role
+                base_group.role_provenance = "profile"
+        else:
+            previous_provenance = getattr(base_group, "role_provenance", "auto")
+            if previous_provenance not in ("manual", "llm") and not (
+                previous_provenance == "auto" and base_group.role
+            ):
+                base_group.role = profile_role or ""
+                base_group.role_provenance = "profile" if profile_role else "auto"
+        base_group.occurrences.append(occ)
         all_new_occurrences.append((occ, orig, res.entity_type))
 
     old_overrides = list(current_overrides.values())
@@ -547,6 +573,7 @@ def rebind_overrides_after_analysis(
         )
         if first_ov.role is not None:
             restored_grp.role = first_ov.role
+            restored_grp.role_provenance = "manual"
         if first_ov.enabled is not None:
             restored_grp.enabled = first_ov.enabled
 
@@ -1035,6 +1062,18 @@ def group_tree_nodes_by_homonym(tree: List[Any]) -> List[HomonymCluster]:
 class AppState:
     def __init__(self):
         self.config: AppConfig = AppConfig.load()
+        self.profile_store = ProfileStore(CONFIG_DIR)
+        try:
+            self.profile_store.initialize_or_migrate()
+            manifest = self.profile_store.load_manifest()
+            self.system_profile = self.profile_store.load_system_profile()
+            self.project_profile = self.profile_store.load_project_profile(manifest["active_project_id"])
+        except Exception as ex:
+            logging.warning("Could not load profile scopes; using AppConfig compatibility state: %s", ex)
+            self.system_profile = None
+            self.project_profile = None
+        self.document_overlay = DocumentProfileOverlay()
+        self.effective_config = None
         self.filename: str = ""
         self.raw_text: str = ""
         self.entity_groups: List[EntityGroup] = []
@@ -1056,6 +1095,10 @@ class AppState:
         self.ignore_terms_text: str = self.config.ignore_terms
         self.glossary_text: str = self.config.glossary
         self.colliding_roles: Set[Tuple[str, str]] = set()
+        self.analyzed_config_hash: Optional[str] = None
+        self.preview_stale: bool = False
+
+        self.refresh_effective_config()
 
         # Shared mapping for Tab 1 -> Tab 2 handoff
         self.current_mapping: Dict[str, str] = {}
@@ -1122,6 +1165,31 @@ class AppState:
     def is_busy(self) -> bool:
         """Central check whether any mutating async operation is in-flight."""
         return self.is_analyzing or self.is_llm_running or self.llm_setup_state != "idle"
+
+    def refresh_effective_config(self, reload_profiles: bool = False) -> Any:
+        """Rebuild the immutable profile snapshot and update stale-result state."""
+        if reload_profiles and self.project_profile is not None:
+            try:
+                manifest = self.profile_store.load_manifest()
+                self.system_profile = self.profile_store.load_system_profile()
+                self.project_profile = self.profile_store.load_project_profile(manifest["active_project_id"])
+            except Exception as ex:
+                logging.warning("Could not reload profile scopes: %s", ex)
+        if self.system_profile is not None and self.project_profile is not None:
+            self.effective_config = ScopeResolutionEngine.resolve(
+                self.system_profile,
+                self.project_profile,
+                self.document_overlay,
+                set(AVAILABLE_ENTITIES),
+            )
+            self.entity_modes = dict(self.effective_config.entity_modes)
+            self.active_entities = [
+                entity for entity, mode in self.entity_modes.items()
+                if mode in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
+            ]
+        if self.effective_config is not None and self.analyzed_config_hash is not None:
+            self.preview_stale = self.effective_config.snapshot_hash != self.analyzed_config_hash
+        return self.effective_config
 
     @property
     def mutating_ui_elements(self) -> List[Any]:
@@ -1223,7 +1291,12 @@ def parse_glossary(text: str) -> Dict[str, str]:
         return glossary
     if text.startswith("{"):
         try:
-            return json.loads(text)
+            raw = json.loads(text)
+            if isinstance(raw, dict):
+                for term, value in raw.items():
+                    if isinstance(value, str):
+                        glossary[term] = value.split("|", 1)[0].strip().upper()
+                return glossary
         except Exception:
             pass
     for line in text.splitlines():
@@ -1232,11 +1305,29 @@ def parse_glossary(text: str) -> Dict[str, str]:
             continue
         if ":" in line:
             parts = line.split(":", 1)
-            glossary[parts[0].strip()] = parts[1].strip().upper()
+            glossary[parts[0].strip()] = parts[1].split("|", 1)[0].strip().upper()
         elif "=" in line:
             parts = line.split("=", 1)
-            glossary[parts[0].strip()] = parts[1].strip().upper()
+            glossary[parts[0].strip()] = parts[1].split("|", 1)[0].strip().upper()
     return glossary
+
+
+def parse_glossary_roles(text: str) -> Dict[str, str]:
+    """Parse optional ``| role`` suffixes while keeping the legacy glossary API intact."""
+    roles: Dict[str, str] = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        separator = ":" if ":" in line else "=" if "=" in line else None
+        if separator is None:
+            continue
+        term, value = (part.strip() for part in line.split(separator, 1))
+        if "|" in value:
+            _, role = (part.strip() for part in value.split("|", 1))
+            if term and role:
+                roles[term] = role
+    return roles
 
 
 def parse_ignore_terms(text: str) -> List[str]:
@@ -1255,11 +1346,13 @@ def build_anonymizer(app_state: Optional[AppState] = None):
 
     if app_state is not None:
         glossary = parse_glossary(app_state.glossary_text)
+        glossary_roles = parse_glossary_roles(app_state.glossary_text)
         ignore_terms = parse_ignore_terms(app_state.ignore_terms_text)
         general_entities, glossary_entities = get_recognizer_entities(app_state.entity_modes)
         return LocalAnonymizer(
             language="de",
             glossary=glossary,
+            glossary_roles=glossary_roles,
             ignore_terms=ignore_terms,
             enabled_entities=general_entities,
             enabled_glossary_entities=glossary_entities,
@@ -1277,6 +1370,7 @@ def build_anonymizer(app_state: Optional[AppState] = None):
         return LocalAnonymizer(
             language="de",
             glossary=parse_glossary(cfg.glossary),
+            glossary_roles=parse_glossary_roles(cfg.glossary),
             ignore_terms=parse_ignore_terms(cfg.ignore_terms),
             enabled_entities=general_entities,
             enabled_glossary_entities=glossary_entities,
@@ -1307,7 +1401,7 @@ def sync_cached_anonymizer_settings(anon, app_state: "AppState") -> None:
     anon.set_entity_modes(app_state.entity_modes)
     anon.set_ignore_terms(parse_ignore_terms(app_state.ignore_terms_text))
     new_glossary = parse_glossary(app_state.glossary_text)
-    anon.set_glossary(new_glossary)
+    anon.set_glossary(new_glossary, glossary_roles=parse_glossary_roles(app_state.glossary_text))
 
 
 def get_synced_cached_anonymizer(app_state: "AppState"):
@@ -1575,6 +1669,7 @@ def save_current_config(st: AppState):
     st.config.glossary = st.glossary_text
     st.config.export_format = st.export_format
     st.config.save()
+    st.refresh_effective_config(reload_profiles=True)
 
 
 async def ensure_models_downloaded_with_dialog(state: AppState) -> bool:
@@ -2635,6 +2730,15 @@ def create_ui(client: Optional[Client] = None):
     def refresh_preview_and_exports():
         if not preview_holder or not export_holder:
             return
+        state.refresh_effective_config()
+        if state.preview_stale:
+            preview_holder.clear()
+            export_holder.clear()
+            with preview_holder:
+                with ui.row().classes("w-full items-center gap-2 p-3 bg-amber-50 border border-amber-300 rounded text-amber-900 text-sm"):
+                    ui.icon("warning", size="sm").classes("text-amber-600")
+                    ui.label("⚠️ Konfiguration geändert. Bisherige Ergebnisse sind veraltet. Bitte analysieren Sie den Text mit dem neuen Profil erneut.").classes("font-medium")
+            return
         anon_text, mapping, audit_report = compute_reactive_preview(state)
         stem = Path(state.filename).stem or "dokument"
         ext = state.export_format
@@ -2760,6 +2864,9 @@ def create_ui(client: Optional[Client] = None):
             return
 
         state.is_analyzing = True
+        analysis_snapshot_hash = (
+            state.effective_config.snapshot_hash if state.effective_config is not None else None
+        )
         set_mutating_controls_disabled(True)
         try:
             # Ensure required AI models are confirmed and downloaded before starting analysis
@@ -2889,6 +2996,8 @@ def create_ui(client: Optional[Client] = None):
             state.llm_staged_selections.clear()
 
             compute_reactive_preview(state)
+            state.analyzed_config_hash = analysis_snapshot_hash
+            state.refresh_effective_config()
             total_occurrences = sum(g.count for g in state.entity_groups)
             build_llm_panel()
             build_review_table()
@@ -3558,6 +3667,7 @@ def create_ui(client: Optional[Client] = None):
                                                     if not check_mutation_allowed():
                                                         return
                                                     grp.role = (e.value or "").strip()
+                                                    grp.role_provenance = "manual"
                                                     sync_group_overrides(state, grp)
                                                     compute_reactive_preview(state)
                                                     m_badge.set_text(grp.placeholder)
@@ -4137,7 +4247,171 @@ def create_ui(client: Optional[Client] = None):
                 glossary_container = ui.column().classes("w-full")
                 render_glossary_list_ui()
 
-        # Main Workspace
+    # Phase 5b.1 profile controls live at the top of the workspace.  The
+    # document overlay remains transient and is deliberately reset on a
+    # project switch.
+    def profile_terms_text(terms: Mapping[str, ScopedTerm], include_role: bool = False) -> str:
+        rows = []
+        for term in terms.values():
+            suffix = f" | {term.role}" if include_role and term.role else ""
+            rows.append(f"{term.term}: {term.entity_type}{suffix}" if term.entity_type else term.term)
+        return "\n".join(rows)
+
+    def refresh_profile_select_options(select: Any) -> None:
+        options = {p.project_id: p.project_name for p in state.profile_store.list_projects()}
+        select.options = options
+        select.update()
+
+    def switch_project(project_id: str) -> None:
+        if not check_mutation_allowed():
+            return
+        if state.document_overlay.dirty:
+            ui.notify("Projektwechsel abgebrochen: ungespeicherte Dokumentbegriffe würden verworfen.", type="warning")
+            return
+        try:
+            manifest = state.profile_store.load_manifest()
+            project = state.profile_store.load_project_profile(project_id)
+            manifest["active_project_id"] = project.project_id
+            state.profile_store.save_manifest(manifest, expected_revision=manifest.get("revision"))
+            state.project_profile = project
+            state.document_overlay = DocumentProfileOverlay()
+            state.glossary_text = profile_terms_text(project.glossary_terms, include_role=True)
+            state.ignore_terms_text = ", ".join(term.term for term in project.ignore_terms.values())
+            state.analyzed_config_hash = None if not state.entity_groups else state.analyzed_config_hash
+            state.refresh_effective_config()
+            state.preview_stale = bool(state.entity_groups)
+            refresh_profile_select_options(project_select)
+            project_select.value = project.project_id
+            if state.entity_groups:
+                refresh_preview_and_exports()
+                build_review_table()
+            ui.notify(f"Projekt „{project.project_name}“ aktiviert.", type="positive")
+        except Exception as ex:
+            ui.notify(f"Projektwechsel nicht möglich: {ex}", type="negative")
+
+    def open_new_project_dialog() -> None:
+        if not check_mutation_allowed():
+            return
+        with ui.dialog() as dialog, ui.card().classes("p-4"):
+            ui.label("Neues Projekt").classes("text-lg font-bold")
+            name_input = ui.input("Projektname").props("autofocus outlined dense").classes("w-80")
+            with ui.row().classes("justify-end w-full mt-2"):
+                ui.button("Abbrechen", on_click=dialog.close).props("flat")
+                def create_project() -> None:
+                    try:
+                        project = state.profile_store.create_project(name_input.value or "")
+                        dialog.close()
+                        switch_project(project.project_id)
+                    except Exception as ex:
+                        ui.notify(f"Projekt konnte nicht angelegt werden: {ex}", type="negative")
+                ui.button("Anlegen", on_click=create_project, color="primary").props("unelevated")
+        dialog.open()
+
+    def open_rename_project_dialog() -> None:
+        if not check_mutation_allowed() or state.project_profile is None:
+            return
+        with ui.dialog() as dialog, ui.card().classes("p-4"):
+            ui.label("Projekt umbenennen").classes("text-lg font-bold")
+            name_input = ui.input("Projektname", value=state.project_profile.project_name).props("autofocus outlined dense").classes("w-80")
+            with ui.row().classes("justify-end w-full mt-2"):
+                ui.button("Abbrechen", on_click=dialog.close).props("flat")
+                def rename_project() -> None:
+                    try:
+                        state.project_profile.project_name = (name_input.value or "").strip()
+                        state.profile_store.save_project_profile(
+                            state.project_profile,
+                            expected_revision=state.project_profile.revision,
+                        )
+                        dialog.close()
+                        refresh_profile_select_options(project_select)
+                        ui.notify("Projekt umbenannt.", type="positive")
+                    except Exception as ex:
+                        ui.notify(f"Projekt konnte nicht umbenannt werden: {ex}", type="negative")
+                ui.button("Speichern", on_click=rename_project, color="primary").props("unelevated")
+        dialog.open()
+
+    def delete_active_project() -> None:
+        if not check_mutation_allowed() or state.project_profile is None:
+            return
+        try:
+            state.profile_store.delete_project(state.project_profile.project_id)
+            manifest = state.profile_store.load_manifest()
+            state.project_profile = state.profile_store.load_project_profile(manifest["active_project_id"])
+            state.document_overlay = DocumentProfileOverlay()
+            state.refresh_effective_config()
+            state.preview_stale = bool(state.entity_groups)
+            refresh_profile_select_options(project_select)
+            project_select.value = state.project_profile.project_id
+            ui.notify("Projekt gelöscht; das Standardprojekt ist aktiv.", type="positive")
+        except Exception as ex:
+            ui.notify(f"Projekt konnte nicht gelöscht werden: {ex}", type="negative")
+
+    def open_profile_manager() -> None:
+        with ui.dialog() as dialog, ui.card().classes("w-[900px] max-w-full p-4"):
+            ui.label("Profile & Begriffe verwalten").classes("text-lg font-bold text-slate-800")
+            ui.label("Dokumentänderungen bleiben flüchtig; Projektprofile werden lokal im Klartext gespeichert.").classes("text-xs text-slate-600 mb-2")
+            with ui.tabs().classes("w-full") as profile_tabs:
+                categories_tab = ui.tab("Kategorien & Vorlagen")
+                glossary_tab = ui.tab("Eigene Begriffe (Glossar)")
+                ignore_tab = ui.tab("Ignorierliste")
+            with ui.tab_panels(profile_tabs, value=categories_tab).classes("w-full"):
+                with ui.tab_panel(categories_tab):
+                    ui.label("Wirksame Kategorien im aktiven Projekt").classes("font-semibold text-sm")
+                    for entity in AVAILABLE_ENTITIES:
+                        with ui.row().classes("items-center gap-2"):
+                            ui.label(entity).classes("font-mono text-xs w-44")
+                            ui.badge(state.entity_modes.get(entity, ENTITY_MODE_OFF), color="blue-7").props("dense")
+                    ui.label("Vorlagen sind Startpunkte; ihre Modi werden als Projektsnapshot kopiert.").classes("text-xs text-slate-600 mt-2")
+                with ui.tab_panel(glossary_tab):
+                    for term in state.project_profile.glossary_terms.values() if state.project_profile else []:
+                        ui.label(f"{term.term} → {term.entity_type or '–'}{f' · Rolle: {term.role}' if term.role else ''}").classes("text-xs font-mono")
+                with ui.tab_panel(ignore_tab):
+                    for term in state.project_profile.ignore_terms.values() if state.project_profile else []:
+                        ui.label(term.term).classes("text-xs font-mono")
+            with ui.row().classes("justify-end w-full mt-3"):
+                ui.button("Schliessen", on_click=dialog.close).props("flat")
+        dialog.open()
+
+    with ui.card().classes("w-full mb-3 p-3 bg-white border border-slate-200 rounded-lg shadow-sm"):
+        with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+            ui.label("Projekt").classes("text-sm font-semibold text-slate-700")
+            project_options = {p.project_id: p.project_name for p in state.profile_store.list_projects()}
+            project_select = ui.select(
+                options=project_options,
+                value=(state.project_profile.project_id if state.project_profile else None),
+                on_change=lambda event: switch_project(event.value),
+            ).props("dense outlined").classes("min-w-48")
+            new_project_btn = ui.button("➕ Neues Projekt", on_click=lambda: open_new_project_dialog()).props("outline dense")
+            rename_project_btn = ui.button("✏️ Umbenennen", on_click=lambda: open_rename_project_dialog()).props("outline dense")
+            delete_project_btn = ui.button("🗑️ Löschen", on_click=lambda: delete_active_project()).props("outline dense color=negative")
+            ui.separator().props("vertical")
+            ui.label("Vorlage").classes("text-sm font-semibold text-slate-700")
+            template_options = {tid: tpl.name for tid, tpl in get_builtin_templates(set(AVAILABLE_ENTITIES)).items()}
+
+            def apply_template(template_id: str) -> None:
+                if not template_id or not check_mutation_allowed() or state.project_profile is None:
+                    return
+                try:
+                    state.project_profile = state.profile_store.apply_template_to_project(
+                        state.project_profile.project_id,
+                        template_id,
+                        expected_revision=state.project_profile.revision,
+                    )
+                    state.refresh_effective_config()
+                    state.preview_stale = bool(state.entity_groups)
+                    ui.notify("Vorlage als Snapshot auf das Projekt angewendet.", type="positive")
+                    if state.entity_groups:
+                        refresh_preview_and_exports()
+                except Exception as ex:
+                    ui.notify(f"Vorlage konnte nicht angewendet werden: {ex}", type="negative")
+
+            template_select = ui.select(options=template_options, on_change=lambda event: apply_template(event.value)).props("dense outlined").classes("min-w-64")
+            ui.button("⚙️ Profile & Begriffe verwalten", on_click=open_profile_manager).props("outline dense")
+        with ui.row().classes("items-center gap-2 mt-2"):
+            ui.badge("Projekt-Scope", color="teal").props("dense outline")
+            ui.label("Projektänderungen dauerhaft · Dokumentoverlay nur für diese Sitzung").classes("text-xs text-slate-600")
+
+    # Main Workspace
         with ui.column().classes("flex-grow"):
             with ui.tabs().classes("w-full border-b") as tabs:
                 tab_anonymize = ui.tab("🔒 Anonymisieren & Review")

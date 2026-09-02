@@ -521,6 +521,7 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
     def __init__(
         self,
         glossary: Optional[Dict[str, str]] = None,
+        glossary_roles: Optional[Dict[str, str]] = None,
         high_confidence_threshold: float = 90.0,
         review_threshold: float = 75.0,
         supported_language: str = "de",
@@ -531,12 +532,14 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
 
         Args:
             glossary: Dictionary mapping canonical terms to entity types (e.g. {"ZHAW": "ORGANIZATION", "abcd": "PERSON"}).
+            glossary_roles: Dictionary mapping canonical terms to role tags (e.g. {"Max Muster": "PATIENT"}).
             high_confidence_threshold: Similarity score for automatic replacement (>= 90% -> score 0.95).
             review_threshold: Similarity score for manual review flagging (>= 75% -> score 0.80).
             supported_language: Language code.
             name: Recognizer name.
         """
         self.glossary = glossary or {}
+        self.glossary_roles = glossary_roles or {}
         self.high_confidence_threshold = high_confidence_threshold
         self.review_threshold = review_threshold
 
@@ -547,15 +550,24 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
             name=name,
         )
 
-    def add_term(self, term: str, entity_type: str = "ORGANIZATION") -> None:
+    def add_term(self, term: str, entity_type: str = "ORGANIZATION", role: Optional[str] = None) -> None:
         """Add or update a glossary term."""
         self.glossary[term] = entity_type
+        if role:
+            self.glossary_roles[term] = role
+        elif term in self.glossary_roles:
+            del self.glossary_roles[term]
         if entity_type not in self.supported_entities:
             self.supported_entities.append(entity_type)
 
-    def set_glossary(self, glossary: Optional[Dict[str, str]] = None) -> None:
+    def set_glossary(
+        self,
+        glossary: Optional[Dict[str, str]] = None,
+        glossary_roles: Optional[Dict[str, str]] = None,
+    ) -> None:
         """Replace the glossary and derive supported entity types from its configured values."""
         self.glossary = glossary or {}
+        self.glossary_roles = glossary_roles or {}
         self.supported_entities = sorted(set(self.glossary.values()))
 
     def load(self) -> None:
@@ -653,16 +665,20 @@ class FuzzyGlossaryRecognizer(EntityRecognizer):
             )
             if not overlaps:
                 accepted_spans.append((start, end))
+                meta: Dict[str, Any] = {
+                    "recognizer_name": self.name,
+                    "glossary_match": match_kind,
+                }
+                if self.glossary_roles and canonical_term in self.glossary_roles:
+                    meta["custom_role"] = self.glossary_roles[canonical_term]
+                    meta["role_provenance"] = "profile"
                 results.append(
                     RecognizerResult(
                         entity_type=entity_type,
                         start=start,
                         end=end,
                         score=score,
-                        recognition_metadata={
-                            "recognizer_name": self.name,
-                            "glossary_match": match_kind,
-                        },
+                        recognition_metadata=meta,
                     )
                 )
 

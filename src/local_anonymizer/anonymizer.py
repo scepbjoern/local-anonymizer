@@ -320,6 +320,7 @@ class LocalAnonymizer:
         self,
         language: str = "de",
         glossary: Optional[Dict[str, str]] = None,
+        glossary_roles: Optional[Dict[str, str]] = None,
         ignore_terms: Optional[Sequence[str]] = None,
         custom_labels: Optional[Dict[str, str]] = None,
         gliner_model: str = "urchade/gliner_multi_pii-v1",
@@ -335,11 +336,13 @@ class LocalAnonymizer:
     ):
         self.language = language
         self.glossary = glossary or {}
+        self.glossary_roles = glossary_roles or {}
         self.gliner_threshold = gliner_threshold
         self.enable_eupii = enable_eupii
         self.eupii_threshold = eupii_threshold
         self.eupii_model = eupii_model
         self.entity_modes = entity_modes or {}
+
 
         # Keep built-in safeguards separate from user terms: deliberate user ignores must take
         # precedence over glossary entries, while an explicit glossary entry may still override
@@ -421,6 +424,7 @@ class LocalAnonymizer:
         )
         self.fuzzy_recognizer = FuzzyGlossaryRecognizer(
             glossary=self.glossary,
+            glossary_roles=self.glossary_roles,
             high_confidence_threshold=fuzzy_high_threshold,
             review_threshold=fuzzy_review_threshold,
             supported_language=language,
@@ -469,15 +473,22 @@ class LocalAnonymizer:
                     stacklevel=2,
                 )
 
-    def add_glossary_term(self, term: str, entity_type: str = "PERSON") -> None:
-        """Add a term to the fuzzy glossary dynamically."""
-        self.fuzzy_recognizer.add_term(term, entity_type)
+    def add_glossary_term(self, term: str, entity_type: str = "PERSON", role: Optional[str] = None) -> None:
+        """Add a term to the fuzzy glossary dynamically, with optional role."""
         self.glossary[term] = entity_type
+        if role:
+            self.glossary_roles[term] = role
+        self.fuzzy_recognizer.add_term(term, entity_type, role=role)
 
-    def set_glossary(self, glossary: Optional[Dict[str, str]] = None) -> None:
-        """Replace the glossary and keep the recognizer's supported types in sync."""
+    def set_glossary(
+        self,
+        glossary: Optional[Dict[str, str]] = None,
+        glossary_roles: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Replace the glossary (and optional roles) and keep the recognizer's supported types in sync."""
         self.glossary = glossary or {}
-        self.fuzzy_recognizer.set_glossary(self.glossary)
+        self.glossary_roles = glossary_roles or {}
+        self.fuzzy_recognizer.set_glossary(self.glossary, glossary_roles=self.glossary_roles)
 
     def set_ignore_terms(self, ignore_terms: Optional[Sequence[str]] = None) -> None:
         """Replace user ignore terms while retaining the built-in generic-term safeguards."""
@@ -960,6 +971,13 @@ class LocalAnonymizer:
             return AnonymizationResult(anonymized_text="", mapping={})
 
         roles = {k.strip().lower(): v.strip() for k, v in (roles or {}).items() if v and v.strip()}
+        # Inject glossary_roles from profile as low-priority fallback (role_provenance="profile")
+        # Explicit caller-provided roles take precedence.
+        if self.glossary_roles:
+            for g_term, g_role in self.glossary_roles.items():
+                g_key = g_term.strip().lower()
+                if g_key not in roles and g_role and g_role.strip():
+                    roles[g_key] = g_role.strip()
         entity_links = {
             k.strip().lower(): (v[0].strip().lower(), v[1].strip())
             for k, v in (entity_links or {}).items()

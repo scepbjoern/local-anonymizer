@@ -236,10 +236,12 @@ class ApplyService:
                     target_group.entity_type = norm_type
                     if cmd.descriptor_suggestion is not None:
                         target_group.role = cmd.descriptor_suggestion
+                        target_group.role_provenance = "llm"
                     target_group.enabled = True
                 elif cmd.action == "keep":
                     if cmd.descriptor_suggestion is not None:
                         target_group.role = cmd.descriptor_suggestion
+                        target_group.role_provenance = "llm"
                     target_group.enabled = True
 
                 if sync_fn is not None:
