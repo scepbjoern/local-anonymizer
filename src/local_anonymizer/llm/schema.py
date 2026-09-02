@@ -1,7 +1,93 @@
 import json
 import re
 from typing import Annotated, Any, Dict, List, Literal, Optional, Set, Union
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def validate_model_name(name: str) -> str:
+    """
+    Validate that a model name is non-empty, within length bounds (1-128 chars),
+    contains no control or invalid characters, and does NOT contain the forbidden ':cloud' tag.
+    Returns normalized stripped model name or raises ValueError.
+    """
+    if not isinstance(name, str):
+        raise ValueError("Modellname muss ein String sein.")
+    stripped = name.strip()
+    if not stripped:
+        raise ValueError("Modellname darf nicht leer sein.")
+    if len(stripped) > 128:
+        raise ValueError("Modellname darf maximal 128 Zeichen lang sein.")
+    if not re.fullmatch(r"^[a-zA-Z0-9_\.\-:\/]+$", stripped):
+        raise ValueError(
+            "Modellname enthält unzulässige Zeichen (nur Buchstaben, Ziffern, '_', '.', '-', ':', '/' erlaubt)."
+        )
+    # Defense-in-depth: Block any Cloud tags case-insensitively
+    lower = stripped.lower()
+    if ":cloud" in lower or lower.endswith("cloud") and ":" in lower:
+        raise ValueError(
+            "Cloud-Modelle (':cloud') sind aus Datenschutzgründen unzulässig. Bitte ausschliesslich lokale Modelle verwenden."
+        )
+    return stripped
+
+
+CatalogSuitability = Literal["recommended", "suitable", "limited", "not_recommended", "untested"]
+DiscoveryStatus = Literal["success", "empty", "unreachable", "timeout", "invalid_response", "unsupported"]
+SetupState = Literal["idle", "discovering", "preloading", "testing"]
+
+
+class CatalogPhaseEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    status: CatalogSuitability = Field(..., description="Eignung für diese Phase")
+    reason: str = Field(..., min_length=1, max_length=500, description="Evidenzbasierte Begründung")
+
+
+class CatalogModelEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    canonical_name: str = Field(..., min_length=1, max_length=128, description="Stabiler kanonischer Modellname")
+    aliases: List[str] = Field(default_factory=list, description="Verifizierte Tags / Aliasse")
+    tested_tag: str = Field(..., min_length=1, max_length=128, description="Tatsächlich getesteter Tag")
+    provider: str = Field(..., min_length=1, max_length=64, description="Getesteter Provider (z. B. Ollama)")
+    hardware_class: str = Field(..., min_length=1, max_length=128, description="Dokumentierte Referenzhardware")
+    test_date: str = Field(..., min_length=10, max_length=10, description="Testdatum YYYY-MM-DD")
+    phase_6a_triage: CatalogPhaseEvaluation = Field(..., description="Bewertung Phase 6A")
+    phase_6b_smart_linking: CatalogPhaseEvaluation = Field(..., description="Bewertung Phase 6B")
+
+    @field_validator("canonical_name", "tested_tag")
+    @classmethod
+    def check_valid_model_name(cls, v: str) -> str:
+        return validate_model_name(v)
+
+    @field_validator("aliases")
+    @classmethod
+    def check_aliases(cls, v: List[str]) -> List[str]:
+        return [validate_model_name(a) for a in v]
+
+
+class CatalogSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    schema_version: Literal["1.0.0"] = Field("1.0.0", description="Strikte Katalog-Schemaversion")
+    models: List[CatalogModelEntry] = Field(..., description="Liste geprüfter Modelle")
+
+
+class DiscoveryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    status: DiscoveryStatus = Field(..., description="Ergebnis der Discovery")
+    models: List[str] = Field(default_factory=list, description="Gefundene lokale Modellnamen")
+    message: str = Field("", max_length=500, description="Statusmeldung / Fehlerhinweis")
+
+
+class PsModelInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str = Field(..., min_length=1, max_length=128)
+    model: str = Field(..., min_length=1, max_length=128)
+    size: Optional[int] = Field(None, ge=0)
+    size_vram: Optional[int] = Field(None, ge=0)
+    expires_at: Optional[str] = Field(None, max_length=64)
 
 
 TriageAction = Literal["keep", "recategorize", "discard"]

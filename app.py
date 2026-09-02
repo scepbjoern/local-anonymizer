@@ -56,7 +56,7 @@ from local_anonymizer.extractors import (
     strip_html_markup,
 )
 
-# Optional LLM Triage Layer (Phase 6A)
+# Optional LLM Triage Layer (Phase 6A & 6A.1)
 try:
     from local_anonymizer.llm import (
         TriageItem,
@@ -64,6 +64,7 @@ try:
         TriageBatch,
         validate_batch_response,
         extract_json_from_llm_response,
+        validate_model_name,
         LocalApiProvider,
         prepare_triage_batches,
         ApplyCommand,
@@ -72,6 +73,18 @@ try:
         ENTITY_TYPE_ALIASES,
         normalize_entity_type,
         compute_triage_snapshot,
+        fetch_ollama_models,
+        fetch_generic_models,
+        preload_ollama_model,
+        test_generic_connection,
+        load_catalog,
+        find_catalog_entry,
+        get_model_suitability_badge,
+        CatalogError,
+        DiscoveryResult,
+        PsModelInfo,
+        PROVIDER_TYPE_OLLAMA,
+        PROVIDER_TYPE_GENERIC,
     )
     LLM_AVAILABLE = True
 except ImportError:
@@ -79,6 +92,17 @@ except ImportError:
     compute_triage_snapshot = None  # type: ignore
     TriageBatch = None  # type: ignore
     extract_json_from_llm_response = None  # type: ignore
+    validate_model_name = None  # type: ignore
+    fetch_ollama_models = None  # type: ignore
+    fetch_generic_models = None  # type: ignore
+    preload_ollama_model = None  # type: ignore
+    test_generic_connection = None  # type: ignore
+    load_catalog = None  # type: ignore
+    find_catalog_entry = None  # type: ignore
+    get_model_suitability_badge = None  # type: ignore
+    CatalogError = Exception  # type: ignore
+    PROVIDER_TYPE_OLLAMA = "ollama"
+    PROVIDER_TYPE_GENERIC = "generic"
 
 # Silence presidio analyzer language mismatch warnings
 logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
@@ -553,6 +577,8 @@ def rebind_overrides_after_analysis(
 
 async def cleanup_session_async(st: "AppState") -> None:
     """Asynchronously cancel any active LLM task, await teardown, and close provider session."""
+    if hasattr(st, "cancel_setup_task"):
+        await st.cancel_setup_task()
     active_task = getattr(st, "llm_active_task", None)
     if active_task and not active_task.done():
         active_task.cancel()
@@ -568,6 +594,10 @@ async def cleanup_session_async(st: "AppState") -> None:
 
 def reset_app_state(st: "AppState") -> None:
     """Reset all document-specific state in AppState cleanly."""
+    if getattr(st, "llm_setup_task", None) and not st.llm_setup_task.done():
+        st.llm_setup_task.cancel()
+    st.llm_setup_task = None
+    st.llm_setup_state = "idle"
     if getattr(st, "llm_active_task", None) and not st.llm_active_task.done():
         st.llm_active_task.cancel()
     st.llm_active_task = None
@@ -802,6 +832,24 @@ class AppState:
         self.llm_partial_failure: bool = False
         self.llm_unprocessed_occ_ids: Set[str] = set()
         self.llm_active_task: Optional[asyncio.Task] = None
+
+        # LLM Setup & Preloading State (Phase 6A.1)
+        self.llm_provider_type: str = getattr(self.config, "llm_provider_type", "ollama")
+        self.llm_setup_state: str = "idle"  # idle, discovering, preloading, testing
+        self.llm_setup_task: Optional[asyncio.Task] = None
+        self.llm_setup_request_id: str = ""
+        self.llm_setup_endpoint_snapshot: str = ""
+        self.llm_setup_model_snapshot: str = ""
+        self.llm_discovered_models: List[str] = []
+        self.llm_discovery_status: Optional[str] = None
+        self.llm_custom_model_mode: bool = False
+        self.llm_custom_model_name: str = ""
+        self.llm_ready_info: Optional[Any] = None
+        self.llm_ready_timestamp: float = 0.0
+        self.llm_ready_bound_url: str = ""
+        self.llm_ready_bound_model: str = ""
+        self.llm_setup_status_msg: str = ""
+
         self.mutating_ui_zones: Dict[str, List[Any]] = {
             "sidebar": [],
             "table": [],
@@ -823,7 +871,7 @@ class AppState:
     def register_mutating_element(self, elem: Any, zone: str = "table") -> None:
         """Register a mutating UI control within a specific UI zone."""
         self.mutating_ui_zones.setdefault(zone, []).append(elem)
-        if self.is_llm_running:
+        if self.is_llm_running or self.llm_setup_state != "idle":
             try:
                 elem.disable()
             except Exception:
@@ -845,6 +893,36 @@ class AppState:
                         elem.enable()
                 except Exception:
                     pass
+
+    def invalidate_llm_ready(self) -> None:
+        """Reset transient model readiness status."""
+        self.llm_ready_info = None
+        self.llm_ready_timestamp = 0.0
+        self.llm_ready_bound_url = ""
+        self.llm_ready_bound_model = ""
+
+    def is_model_ready(self) -> bool:
+        """Check if active model was verified via /api/ps and config hasn't changed."""
+        if (
+            self.llm_ready_info is not None
+            and self.llm_provider_type == "ollama"
+            and self.llm_ready_bound_url == self.config.llm_base_url.strip()
+            and self.llm_ready_bound_model == self.config.llm_model_name.strip()
+        ):
+            return True
+        return False
+
+    async def cancel_setup_task(self) -> None:
+        """Cancel and await currently active discovery or preload setup task."""
+        task = self.llm_setup_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.llm_setup_task = None
+        self.llm_setup_state = "idle"
 
     async def close_llm_provider(self) -> None:
         """Close provider HTTP session safely."""
@@ -1575,7 +1653,7 @@ def create_ui(client: Optional[Client] = None):
     extraction_progress_bar = None
     ignore_container = None
     glossary_container = None
-    llm_settings_container = None
+    llm_setup_holder = None
     llm_panel_holder = None
     manual_input = None
     manual_type = None
@@ -1807,96 +1885,398 @@ def create_ui(client: Optional[Client] = None):
                                 del_btn = ui.button(icon="close", on_click=make_remove_g(term)).props("flat round dense size=xs color=negative").classes("p-0 min-h-0 min-w-0 ml-0.5 hover:bg-red-100")
                                 state.register_mutating_element(del_btn, "glossary")
 
-    def render_llm_settings_ui():
-        if llm_settings_container is None:
+    def build_llm_setup_panel():
+        if llm_setup_holder is None:
             return
-        state.clear_mutating_zone("llm_settings")
-        llm_settings_container.clear()
-        with llm_settings_container:
+        state.clear_mutating_zone("llm_setup")
+        llm_setup_holder.clear()
+        with llm_setup_holder:
             if not LLM_AVAILABLE:
-                ui.label("Das Extra `[llm]` ist nicht installiert. Installieren Sie es mit:").classes("text-[11px] text-amber-800 font-semibold mb-1")
-                ui.code("pip install local-anonymizer[llm]").classes("text-[10px] w-full mb-2")
+                with ui.card().classes("w-full p-3 bg-slate-50 border border-slate-200 rounded-lg"):
+                    with ui.row().classes("items-center justify-between gap-2"):
+                        with ui.row().classes("items-center gap-2 text-slate-600 text-xs"):
+                            ui.icon("info", size="sm").classes("text-slate-400")
+                            ui.label("Lokale LLM-Review-Assistenz: Optionales Zusatzpaket [llm] nicht installiert. Installieren mit: pip install local-anonymizer[llm]").classes("font-medium")
                 return
 
-            def on_llm_toggle(e):
-                if not check_mutation_allowed():
-                    return
-                state.config.llm_enabled = bool(e.value)
-                save_current_config(state)
-                render_llm_settings_ui()
-                build_llm_panel()
-                build_review_table()
+            with ui.card().classes("w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl mb-1 shadow-none"):
+                with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.icon("psychology", size="sm").classes("text-indigo-700")
+                        ui.label("Lokale LLM-Review-Assistenz (Optional)").classes("font-bold text-xs text-slate-800")
+                        if state.config.llm_enabled:
+                            if state.llm_setup_state == "discovering":
+                                ui.spinner(size="xs", color="primary")
+                                ui.badge("Suche Modelle...", color="primary").props("dense")
+                            elif state.llm_setup_state in ("preloading", "testing"):
+                                ui.spinner(size="xs", color="primary")
+                                ui.badge("Lade / Teste...", color="primary").props("dense")
+                            elif state.is_model_ready():
+                                ps_inf = state.llm_ready_info
+                                tooltip_text = f"Modell '{state.config.llm_model_name}' ist in Ollama geladen."
+                                if ps_inf and getattr(ps_inf, "size_vram", None):
+                                    vram_mb = ps_inf.size_vram // (1024 * 1024)
+                                    tooltip_text += f" (VRAM: ca. {vram_mb} MB)"
+                                if ps_inf and getattr(ps_inf, "expires_at", None):
+                                    tooltip_text += f" (Ablauf: {ps_inf.expires_at})"
+                                ui.badge("✓ Bereit", color="positive").props("dense outline").tooltip(tooltip_text)
+                            elif state.llm_provider_type == "generic" and state.llm_ready_bound_url == state.config.llm_base_url.strip():
+                                ui.badge("✓ Verbindung OK", color="positive").props("dense outline").tooltip("Generischer Server erreichbar")
+                            elif state.llm_setup_status_msg:
+                                ui.badge(state.llm_setup_status_msg, color="grey-7").props("dense outline")
 
-            llm_switch = ui.switch("LLM-Assistenz aktivieren", value=state.config.llm_enabled, on_change=on_llm_toggle).props("dense").classes("text-xs mb-2 font-semibold")
-            state.register_mutating_element(llm_switch, "llm_settings")
+                    async def on_llm_toggle(e):
+                        if not check_mutation_allowed():
+                            return
+                        state.config.llm_enabled = bool(e.value)
+                        save_current_config(state)
+                        if not state.config.llm_enabled:
+                            await state.cancel_setup_task()
+                            await state.close_llm_provider()
+                            state.invalidate_llm_ready()
+                        else:
+                            if state.llm_provider_type == "ollama" and not state.llm_discovered_models:
+                                asyncio.create_task(trigger_model_discovery())
+                        build_llm_setup_panel()
+                        build_llm_panel()
+                        build_review_table()
 
-            if state.config.llm_enabled:
-                ui.label("API-Endpunkt (OpenAI-kompatibel, z. B. Ollama/LM Studio):").classes("text-[11px] text-slate-600 font-medium")
+                    llm_switch = ui.switch("Aktivieren", value=state.config.llm_enabled, on_change=on_llm_toggle).props("dense size=sm").classes("text-xs font-semibold")
+                    state.register_mutating_element(llm_switch, "llm_setup")
 
-                def on_base_url_change(e):
-                    if not check_mutation_allowed():
-                        return
-                    state.config.llm_base_url = (e.value or "").strip()
-                    save_current_config(state)
-                    if state.llm_provider:
-                        asyncio.create_task(state.close_llm_provider())
-                    build_llm_panel()
+                if state.config.llm_enabled:
+                    ui.separator().classes("my-2")
 
-                base_url_input = ui.input(
-                    value=state.config.llm_base_url,
-                    placeholder="http://127.0.0.1:11434/v1",
-                    on_change=on_base_url_change,
-                ).props("dense outlined bg-white").classes("w-full text-xs mb-2")
-                state.register_mutating_element(base_url_input, "llm_settings")
+                    with ui.row().classes("w-full items-center gap-1.5 p-2 bg-blue-50/80 border border-blue-200 rounded-lg text-xs text-blue-950 mb-2"):
+                        ui.icon("lock", size="xs").classes("text-blue-700 shrink-0")
+                        ui.label("Datenschutz-Hinweis: Betrieb erfolgt zu 100% lokal. Für vollständige Isolation bitte Ollama im Local-Only-Modus betreiben (OLLAMA_NO_CLOUD=1). Cloud-Modelle (':cloud') sind gesperrt.").classes("text-[11px]")
 
-                ui.label("Modellname (z. B. qwen3:8b, ministral-3:8b, qwen3.5:9b):").classes("text-[11px] text-slate-600 font-medium")
+                    with ui.row().classes("w-full items-center gap-3 flex-wrap mb-2"):
+                        async def on_provider_type_change(e):
+                            if not check_mutation_allowed():
+                                return
+                            new_type = e.value
+                            state.llm_provider_type = new_type
+                            state.config.llm_provider_type = new_type
+                            state.invalidate_llm_ready()
+                            await state.close_llm_provider()
+                            save_current_config(state)
+                            if new_type == "ollama" and not state.llm_discovered_models:
+                                asyncio.create_task(trigger_model_discovery())
+                            build_llm_setup_panel()
+                            build_llm_panel()
 
-                def on_model_name_change(e):
-                    if not check_mutation_allowed():
-                        return
-                    new_val = (e.value or "").strip()
-                    state.config.llm_model_name = new_val
-                    save_current_config(state)
-                    if state.llm_provider:
-                        asyncio.create_task(state.close_llm_provider())
-                    build_llm_panel()
+                        prov_select = ui.select(
+                            options={"ollama": "Ollama (Lokal)", "generic": "Anderer OpenAI-kompatibler Server (z. B. LM Studio)"},
+                            value=state.llm_provider_type,
+                            on_change=on_provider_type_change,
+                            label="Provider",
+                        ).props("dense outlined bg-white").classes("w-64 text-xs")
+                        state.register_mutating_element(prov_select, "llm_setup")
 
-                model_name_input = ui.input(
-                    value=state.config.llm_model_name or DEFAULT_LLM_MODEL_NAME,
-                    placeholder="qwen3:8b",
-                    on_change=on_model_name_change,
-                ).props("dense outlined bg-white").classes("w-full text-xs mb-1")
-                state.register_mutating_element(model_name_input, "llm_settings")
-
-                with ui.row().classes("w-full items-center gap-1 mb-2 flex-wrap"):
-                    ui.label("Schnellwahl:").classes("text-[10px] text-slate-500")
-                    for m_tag, m_lbl in [("qwen3:8b", "Qwen3 8B (Standard)"), ("ministral-3:8b", "Ministral 3 8B"), ("qwen3.5:9b", "Qwen3.5 9B")]:
-                        def make_set_m(m):
-                            def _set():
-                                model_name_input.value = m
-                                state.config.llm_model_name = m
+                        async def on_base_url_change(e):
+                            if not check_mutation_allowed():
+                                return
+                            new_url = (e.value or "").strip()
+                            if new_url != state.config.llm_base_url:
+                                state.config.llm_base_url = new_url
+                                state.invalidate_llm_ready()
+                                await state.close_llm_provider()
                                 save_current_config(state)
-                                if state.llm_provider:
-                                    asyncio.create_task(state.close_llm_provider())
+                                build_llm_setup_panel()
                                 build_llm_panel()
-                            return _set
-                        ui.button(m_lbl, on_click=make_set_m(m_tag)).props("flat dense size=xs color=primary").classes("text-[10px] px-1.5 py-0.5 bg-indigo-50 border border-indigo-200 rounded")
 
+                        base_url_input = ui.input(
+                            label="API-Endpunkt (Loopback)",
+                            value=state.config.llm_base_url,
+                            placeholder="http://127.0.0.1:11434/v1",
+                            on_change=on_base_url_change,
+                        ).props("dense outlined bg-white").classes("flex-1 min-w-[200px] text-xs")
+                        state.register_mutating_element(base_url_input, "llm_setup")
 
-                def on_auto_review_toggle(e):
-                    if not check_mutation_allowed():
-                        return
-                    state.config.llm_auto_review = bool(e.value)
-                    save_current_config(state)
+                    with ui.row().classes("w-full items-center gap-2 flex-wrap mb-2"):
+                        if state.llm_provider_type == "ollama":
+                            model_options: Dict[str, str] = {}
+                            if state.llm_discovered_models:
+                                for m in state.llm_discovered_models:
+                                    lbl, col, tt = get_model_suitability_badge(m)
+                                    model_options[m] = f"{m} ({lbl})" if lbl != "Nicht evaluiert" else m
 
-                auto_review_checkbox = ui.checkbox(
-                    "LLM-Review direkt an die Textanalyse anschließen",
-                    value=state.config.llm_auto_review,
-                    on_change=on_auto_review_toggle,
-                ).props("dense").classes("text-xs text-slate-700 mb-2").tooltip(
-                    "Wenn aktiviert, startet nach der lokalen Erkennung automatisch die LLM-Triage der Fundstellen."
-                )
-                state.register_mutating_element(auto_review_checkbox, "llm_settings")
+                            curr_m = state.config.llm_model_name
+                            if curr_m and curr_m not in model_options and not state.llm_custom_model_mode:
+                                lbl, col, tt = get_model_suitability_badge(curr_m)
+                                model_options[curr_m] = f"{curr_m} ({lbl})" if lbl != "Nicht evaluiert" else curr_m
+
+                            model_options["__custom__"] = "Anderes Modell …"
+
+                            async def on_model_select_change(e):
+                                if not check_mutation_allowed():
+                                    return
+                                val = e.value
+                                if val == "__custom__":
+                                    state.llm_custom_model_mode = True
+                                    build_llm_setup_panel()
+                                    return
+                                state.llm_custom_model_mode = False
+                                try:
+                                    valid_name = validate_model_name(val)
+                                    state.config.llm_model_name = valid_name
+                                    state.invalidate_llm_ready()
+                                    await state.close_llm_provider()
+                                    save_current_config(state)
+                                    build_llm_setup_panel()
+                                    build_llm_panel()
+                                except ValueError as ve:
+                                    ui.notify(str(ve), type="negative")
+
+                            selected_val = "__custom__" if state.llm_custom_model_mode else (state.config.llm_model_name or "qwen3:8b")
+
+                            model_dropdown = ui.select(
+                                options=model_options,
+                                value=selected_val if selected_val in model_options else "__custom__",
+                                on_change=on_model_select_change,
+                                label="Modellauswahl",
+                            ).props("dense outlined bg-white").classes("w-72 text-xs")
+                            state.register_mutating_element(model_dropdown, "llm_setup")
+
+                            if state.llm_custom_model_mode or not state.llm_discovered_models:
+                                async def on_custom_name_change(e):
+                                    if not check_mutation_allowed():
+                                        return
+                                    raw_val = (e.value or "").strip()
+                                    try:
+                                        if raw_val:
+                                            valid_name = validate_model_name(raw_val)
+                                            state.config.llm_model_name = valid_name
+                                            state.invalidate_llm_ready()
+                                            await state.close_llm_provider()
+                                            save_current_config(state)
+                                            build_llm_panel()
+                                    except ValueError as ve:
+                                        ui.notify(str(ve), type="negative")
+
+                                custom_input = ui.input(
+                                    label="Freier Modellname",
+                                    value=state.config.llm_model_name,
+                                    placeholder="z. B. qwen3:8b",
+                                    on_change=on_custom_name_change,
+                                ).props("dense outlined bg-white").classes("w-48 text-xs")
+                                state.register_mutating_element(custom_input, "llm_setup")
+
+                            async def on_refresh_click():
+                                if not check_mutation_allowed():
+                                    return
+                                await trigger_model_discovery()
+
+                            refresh_btn = ui.button("Liste aktualisieren", icon="refresh", on_click=on_refresh_click, color="slate").props("outline dense size=sm")
+                            state.register_mutating_element(refresh_btn, "llm_setup")
+
+                            async def on_preload_click():
+                                if not check_mutation_allowed():
+                                    return
+                                await trigger_ollama_preload()
+
+                            preload_btn = ui.button("Laden", icon="memory", on_click=on_preload_click, color="primary").props("unelevated dense size=sm").tooltip("Lädt das Modell vorab in den Arbeitsspeicher / VRAM")
+                            state.register_mutating_element(preload_btn, "llm_setup")
+
+                        else:
+                            async def on_generic_model_change(e):
+                                if not check_mutation_allowed():
+                                    return
+                                raw_val = (e.value or "").strip()
+                                try:
+                                    if raw_val:
+                                        valid_name = validate_model_name(raw_val)
+                                        state.config.llm_model_name = valid_name
+                                        state.invalidate_llm_ready()
+                                        await state.close_llm_provider()
+                                        save_current_config(state)
+                                        build_llm_panel()
+                                except ValueError as ve:
+                                    ui.notify(str(ve), type="negative")
+
+                            gen_model_input = ui.input(
+                                label="Modellname",
+                                value=state.config.llm_model_name,
+                                placeholder="z. B. local-model",
+                                on_change=on_generic_model_change,
+                            ).props("dense outlined bg-white").classes("w-72 text-xs")
+                            state.register_mutating_element(gen_model_input, "llm_setup")
+
+                            async def on_test_conn_click():
+                                if not check_mutation_allowed():
+                                    return
+                                await trigger_generic_test()
+
+                            test_btn = ui.button("Verbindung testen", icon="wifi", on_click=on_test_conn_click, color="primary").props("unelevated dense size=sm")
+                            state.register_mutating_element(test_btn, "llm_setup")
+
+                        if state.llm_setup_state in ("discovering", "preloading", "testing"):
+                            async def on_cancel_setup():
+                                await state.cancel_setup_task()
+                                state.llm_setup_status_msg = "Abgebrochen"
+                                ui.notify("Vorgang abgebrochen.", type="info")
+                                build_llm_setup_panel()
+                            cancel_setup_btn = ui.button("Abbrechen", icon="cancel", on_click=on_cancel_setup, color="negative").props("flat dense size=sm")
+
+                    curr_entry = find_catalog_entry(state.config.llm_model_name)
+                    if curr_entry is not None:
+                        lbl, col, tt = get_model_suitability_badge(state.config.llm_model_name)
+                        with ui.row().classes("w-full items-center gap-2 px-2.5 py-1.5 bg-slate-100/70 border border-slate-200 rounded text-xs text-slate-700"):
+                            ui.badge(f"Katalog: {lbl}", color=col).props("dense")
+                            ui.label(f"{curr_entry.phase_6a_triage.reason}").classes("text-[11px] text-slate-600 flex-1")
+                            if curr_entry.hardware_class:
+                                ui.label(f"Hardware: {curr_entry.hardware_class}").classes("text-[10px] text-slate-400 font-mono")
+
+                    def on_auto_review_toggle(e):
+                        if not check_mutation_allowed():
+                            return
+                        state.config.llm_auto_review = bool(e.value)
+                        save_current_config(state)
+
+                    auto_review_checkbox = ui.checkbox(
+                        "LLM-Review direkt an die Textanalyse anschließen",
+                        value=state.config.llm_auto_review,
+                        on_change=on_auto_review_toggle,
+                    ).props("dense size=sm").classes("text-xs text-slate-700 mt-1").tooltip(
+                        "Wenn aktiviert, startet nach der lokalen Erkennung automatisch die LLM-Triage der Fundstellen."
+                    )
+                    state.register_mutating_element(auto_review_checkbox, "llm_setup")
+
+    async def trigger_model_discovery():
+        if state.is_llm_running or state.llm_setup_state != "idle":
+            return
+        await state.cancel_setup_task()
+
+        req_id = uuid.uuid4().hex
+        url_snap = state.config.llm_base_url.strip()
+        state.llm_setup_request_id = req_id
+        state.llm_setup_endpoint_snapshot = url_snap
+        state.llm_setup_state = "discovering"
+        build_llm_setup_panel()
+
+        async def _run_discovery():
+            try:
+                if state.llm_provider_type == "ollama":
+                    res = await fetch_ollama_models(url_snap)
+                else:
+                    res = await fetch_generic_models(url_snap)
+
+                if state.llm_setup_request_id != req_id or state.config.llm_base_url.strip() != url_snap:
+                    return
+
+                if res.status == "success":
+                    state.llm_discovered_models = res.models
+                    state.llm_discovery_status = "success"
+                    state.llm_setup_status_msg = f"{len(res.models)} Modelle gefunden"
+                    ui.notify(f"{len(res.models)} lokale Modelle gefunden.", type="positive")
+                elif res.status == "empty":
+                    state.llm_discovered_models = []
+                    state.llm_discovery_status = "empty"
+                    state.llm_custom_model_mode = True
+                    state.llm_setup_status_msg = "Keine Modelle gefunden"
+                    ui.notify("Keine installierten Modelle gefunden.", type="warning")
+                else:
+                    state.llm_discovery_status = res.status
+                    state.llm_custom_model_mode = True
+                    state.llm_setup_status_msg = res.message or "Discovery fehlgeschlagen"
+                    ui.notify(f"Discovery-Hinweis: {res.message}", type="warning")
+            except asyncio.CancelledError:
+                pass
+            except Exception as ex:
+                state.llm_setup_status_msg = "Fehler bei Discovery"
+                ui.notify(f"Discovery-Fehler: {ex}", type="negative")
+            finally:
+                if state.llm_setup_request_id == req_id:
+                    state.llm_setup_state = "idle"
+                    state.llm_setup_task = None
+                    build_llm_setup_panel()
+
+        state.llm_setup_task = asyncio.create_task(_run_discovery())
+
+    async def trigger_ollama_preload():
+        if state.is_llm_running or state.llm_setup_state != "idle":
+            return
+        await state.cancel_setup_task()
+
+        req_id = uuid.uuid4().hex
+        url_snap = state.config.llm_base_url.strip()
+        model_snap = state.config.llm_model_name.strip()
+        state.llm_setup_request_id = req_id
+        state.llm_setup_endpoint_snapshot = url_snap
+        state.llm_setup_model_snapshot = model_snap
+        state.llm_setup_state = "preloading"
+        build_llm_setup_panel()
+
+        async def _run_preload():
+            try:
+                ps_info = await preload_ollama_model(url_snap, model_snap)
+                if (
+                    state.llm_setup_request_id != req_id
+                    or state.config.llm_base_url.strip() != url_snap
+                    or state.config.llm_model_name.strip() != model_snap
+                ):
+                    return
+
+                state.llm_ready_info = ps_info
+                state.llm_ready_timestamp = time.time()
+                state.llm_ready_bound_url = url_snap
+                state.llm_ready_bound_model = model_snap
+                state.llm_setup_status_msg = "Modell bereit"
+                ui.notify(f"Modell '{model_snap}' erfolgreich in Ollama geladen.", type="positive")
+            except asyncio.CancelledError:
+                pass
+            except Exception as ex:
+                state.invalidate_llm_ready()
+                state.llm_setup_status_msg = "Laden fehlgeschlagen"
+                ui.notify(f"Fehler beim Vorladen: {ex}", type="negative")
+            finally:
+                if state.llm_setup_request_id == req_id:
+                    state.llm_setup_state = "idle"
+                    state.llm_setup_task = None
+                    build_llm_setup_panel()
+                    build_llm_panel()
+
+        state.llm_setup_task = asyncio.create_task(_run_preload())
+
+    async def trigger_generic_test():
+        if state.is_llm_running or state.llm_setup_state != "idle":
+            return
+        await state.cancel_setup_task()
+
+        req_id = uuid.uuid4().hex
+        url_snap = state.config.llm_base_url.strip()
+        state.llm_setup_request_id = req_id
+        state.llm_setup_endpoint_snapshot = url_snap
+        state.llm_setup_state = "testing"
+        build_llm_setup_panel()
+
+        async def _run_test():
+            try:
+                ok = await test_generic_connection(url_snap)
+                if state.llm_setup_request_id != req_id or state.config.llm_base_url.strip() != url_snap:
+                    return
+                if ok:
+                    state.llm_ready_bound_url = url_snap
+                    state.llm_setup_status_msg = "Verbindung OK"
+                    ui.notify("Verbindung zum Server erfolgreich.", type="positive")
+                else:
+                    state.invalidate_llm_ready()
+                    state.llm_setup_status_msg = "Verbindung fehlgeschlagen"
+            except asyncio.CancelledError:
+                pass
+            except Exception as ex:
+                state.invalidate_llm_ready()
+                state.llm_setup_status_msg = "Verbindung fehlgeschlagen"
+                ui.notify(f"Fehler bei Verbindungstest: {ex}", type="negative")
+            finally:
+                if state.llm_setup_request_id == req_id:
+                    state.llm_setup_state = "idle"
+                    state.llm_setup_task = None
+                    build_llm_setup_panel()
+                    build_llm_panel()
+
+        state.llm_setup_task = asyncio.create_task(_run_test())
 
     def refresh_preview_and_exports():
         if not preview_holder or not export_holder:
@@ -2201,32 +2581,36 @@ def create_ui(client: Optional[Client] = None):
         return state.llm_active_task
 
     def check_mutation_allowed() -> bool:
-        """Central guard against mutating state while LLM triage is running."""
+        """Central guard against mutating state while LLM triage or setup is running."""
         if state.is_llm_running:
             ui.notify("Aktion während laufender LLM-Prüfung gesperrt.", type="warning")
+            return False
+        if state.llm_setup_state != "idle":
+            ui.notify("Aktion während laufendem Modell-Setup gesperrt.", type="warning")
             return False
         return True
 
     def set_mutating_controls_disabled(disabled: bool):
-        """Disable/enable all mutating UI controls during active LLM inference."""
+        """Disable/enable all mutating UI controls during active LLM inference or setup."""
+        is_blocked = disabled or state.llm_setup_state != "idle" or state.is_llm_running
         if analyze_btn:
-            analyze_btn.set_enabled(not disabled and bool(state.raw_text and state.raw_text.strip()))
+            analyze_btn.set_enabled(not is_blocked and bool(state.raw_text and state.raw_text.strip()))
         if reset_btn:
-            reset_btn.set_enabled(not disabled)
+            reset_btn.set_enabled(not is_blocked)
         if raw_text_area:
-            if disabled:
+            if is_blocked:
                 raw_text_area.props("readonly")
             else:
                 raw_text_area.props(remove="readonly")
         if add_manual_btn:
-            add_manual_btn.set_enabled(not disabled)
+            add_manual_btn.set_enabled(not is_blocked)
         if manual_input:
-            manual_input.set_enabled(not disabled)
+            manual_input.set_enabled(not is_blocked)
         if manual_type:
-            manual_type.set_enabled(not disabled)
+            manual_type.set_enabled(not is_blocked)
         for elem in state.mutating_ui_elements:
             try:
-                elem.set_enabled(not disabled)
+                elem.set_enabled(not is_blocked)
             except Exception:
                 pass
 
@@ -3493,11 +3877,6 @@ def create_ui(client: Optional[Client] = None):
                 glossary_container = ui.column().classes("w-full")
                 render_glossary_list_ui()
 
-            # Interactive LLM Configuration
-            with ui.expansion("🤖 Lokale LLM-Review-Assistenz", icon="psychology").classes("w-full text-xs mt-1"):
-                llm_settings_container = ui.column().classes("w-full")
-                render_llm_settings_ui()
-
         # Main Workspace
         with ui.column().classes("flex-grow"):
             with ui.tabs().classes("w-full border-b") as tabs:
@@ -3735,6 +4114,10 @@ def create_ui(client: Optional[Client] = None):
                             placeholder="Text hier eingeben oder Dokument oben hineinziehen...",
                             on_change=on_raw_text_change,
                         ).props("outlined rows=6").classes("w-full font-mono text-sm")
+
+                    # Interactive LLM Setup & Preloading Panel (Top-Down Workflow step before Analysis)
+                    llm_setup_holder = ui.column().classes("w-full mb-2")
+                    build_llm_setup_panel()
 
                     # Re-analysis Warning Banner (appears when entities or settings changed after initial analysis)
                     with ui.card().classes("w-full p-2.5 bg-amber-50 border border-amber-300 rounded-lg mb-2") as reanalysis_warning_card:

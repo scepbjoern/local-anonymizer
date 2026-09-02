@@ -38,3 +38,7 @@ markers = [
     "integration: marks tests as integration tests requiring local model cache or downloads (deselect with '-m \"not integration\"')",
 ]
 addopts = "-m 'not integration'"
+
+[tool.setuptools.package-data]
+"local_anonymizer.llm" = ["catalog.json"]
+

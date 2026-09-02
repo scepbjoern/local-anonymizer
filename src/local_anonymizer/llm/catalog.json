@@ -1,0 +1,69 @@
+{
+  "schema_version": "1.0.0",
+  "models": [
+    {
+      "canonical_name": "qwen3:8b",
+      "aliases": [],
+      "tested_tag": "qwen3:8b",
+      "provider": "Ollama",
+      "hardware_class": "CPU / GPU (Ollama Lokalbetrieb)",
+      "test_date": "2026-09-01",
+      "phase_6a_triage": {
+        "status": "recommended",
+        "reason": "UAT Phase 6A im Ollama-Lokalbetrieb erfolgreich durchgeführt (Non-Thinking Modus, Pydantic-Schema-Validierung)."
+      },
+      "phase_6b_smart_linking": {
+        "status": "untested",
+        "reason": "Evaluation für Phase 6B steht noch aus."
+      }
+    },
+    {
+      "canonical_name": "ministral-3:8b",
+      "aliases": [],
+      "tested_tag": "ministral-3:8b",
+      "provider": "Ollama",
+      "hardware_class": "GPU (Ollama Lokalbetrieb)",
+      "test_date": "2026-09-01",
+      "phase_6a_triage": {
+        "status": "suitable",
+        "reason": "In Vorprüfungen und Benchmarks für strukturierte JSON-Triage geeignet."
+      },
+      "phase_6b_smart_linking": {
+        "status": "untested",
+        "reason": "Evaluation für Phase 6B steht noch aus."
+      }
+    },
+    {
+      "canonical_name": "qwen3.5:9b",
+      "aliases": [],
+      "tested_tag": "qwen3.5:9b",
+      "provider": "Ollama",
+      "hardware_class": "GPU (Ollama Lokalbetrieb)",
+      "test_date": "2026-09-01",
+      "phase_6a_triage": {
+        "status": "suitable",
+        "reason": "In Vorprüfungen für strukturierte JSON-Triage geeignet."
+      },
+      "phase_6b_smart_linking": {
+        "status": "untested",
+        "reason": "Evaluation für Phase 6B steht noch aus."
+      }
+    },
+    {
+      "canonical_name": "phi4:latest",
+      "aliases": [],
+      "tested_tag": "phi4:latest",
+      "provider": "Ollama",
+      "hardware_class": "GPU (Ollama Lokalbetrieb)",
+      "test_date": "2026-09-01",
+      "phase_6a_triage": {
+        "status": "limited",
+        "reason": "Im UAT verworfen aufgrund häufiger Schema- und Formatabweichungen."
+      },
+      "phase_6b_smart_linking": {
+        "status": "untested",
+        "reason": "Evaluation für Phase 6B steht noch aus."
+      }
+    }
+  ]
+}
