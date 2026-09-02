@@ -47,6 +47,7 @@ from local_anonymizer.profiles import (
     TEMPLATE_MEDICAL,
     CategoryTemplate,
     DirtyOverlayError,
+    SystemMutationConfirmationRequired,
     DocumentProfileOverlay,
     EffectiveConfig,
     ProjectProfile,
@@ -1036,6 +1037,29 @@ class TestProfileControllerR1ToR5:
         assert project.template_id == saved.template_id
         assert project.entity_modes == applied_modes
 
+    def test_template_and_project_deletion_are_revision_bound(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        first = ProfileController(store)
+        template = first.save_custom_template(
+            CategoryTemplate(template_id=_valid_uuid4(), name="Lösch-CAS", entity_modes={"PERSON": ENTITY_MODE_OFF})
+        )
+        second = ProfileController(store)
+        changed = store.load_template(template.template_id)
+        assert changed is not None
+        changed.description = "extern geändert"
+        store.save_custom_template(changed, expected_revision=changed.revision)
+        with pytest.raises(RevisionConflictError):
+            first.delete_custom_template(template.template_id, expected_revision=template.revision)
+
+        project = store.create_project("Löschprojekt")
+        stale = ProfileController(store, active_project_id=project.project_id)
+        external = ProfileController(store, active_project_id=project.project_id)
+        external.project_profile.description = "extern geändert"
+        external.save_project(expected_revision=external.project_profile.revision)
+        with pytest.raises(RevisionConflictError):
+            stale.delete_project(expected_revision=stale.project_profile.revision)
+
     def test_warning_acknowledgement_is_one_time_and_cas_checked(self, tmp_path):
         store = _make_store(tmp_path)
         store.initialize_or_migrate()
@@ -1047,6 +1071,66 @@ class TestProfileControllerR1ToR5:
         with pytest.raises(RevisionConflictError):
             second.acknowledge_warning(expected_revision=second.manifest["revision"])
         assert store.load_manifest()["warning_acknowledged_version"] == 1
+
+    def test_system_mutation_requires_confirmation_before_memory_change(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        before = dict(controller.system_profile.glossary_terms)
+        with pytest.raises(SystemMutationConfirmationRequired):
+            controller.run_system_mutation(
+                lambda: controller.upsert_glossary(ScopeLevel.SYSTEM, "Global", "PERSON"),
+                confirmed=False,
+            )
+        assert controller.system_profile.glossary_terms == before
+        controller.run_system_mutation(
+            lambda: controller.upsert_glossary(ScopeLevel.SYSTEM, "Global", "PERSON"),
+            confirmed=True,
+        )
+        assert "global" in controller.system_profile.glossary_terms
+
+    def test_session_bound_sidebar_cas_rejects_external_project_change(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        first = ProfileController(store)
+        first.acknowledge_warning(expected_revision=first.manifest["revision"])
+        import app
+
+        state = SimpleNamespace(
+            profile_store=store,
+            profile_controller=first,
+            system_profile=first.system_profile,
+            project_profile=first.project_profile,
+            document_overlay=first.document_overlay,
+            entity_modes=dict(first.project_profile.entity_modes),
+            active_entities=[],
+            format_mode="numbered_role",
+            gliner_model_name=app.GLINER_MODEL_NAME,
+            gliner_threshold=0.55,
+            enable_eupii=False,
+            eupii_threshold=0.5,
+            eupii_model_name=app.EUPII_MODEL_NAME,
+            ignore_terms_text="",
+            glossary_text="",
+            export_format="txt",
+            config=SimpleNamespace(save=lambda: True),
+            refresh_effective_config=lambda *args, **kwargs: None,
+        )
+        second = ProfileController(store)
+        second.project_profile.entity_modes["PERSON"] = ENTITY_MODE_OFF
+        second.save_project(expected_revision=second.project_profile.revision)
+
+        assert app.save_current_config(state) is False
+        assert state.project_profile.entity_modes["PERSON"] == ENTITY_MODE_OFF
+
+    def test_provenance_lookup_uses_normalized_surface_key(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        controller.upsert_glossary(ScopeLevel.SYSTEM, "ZHAW", "ORGANIZATION")
+        cfg = controller.effective_config()
+        assert cfg.glossary["ZHAW"] == "ORGANIZATION"
+        assert cfg.glossary_provenance[normalize_term_key("zhaw")][0] == ScopeLevel.SYSTEM
 
     def test_actual_analyze_uses_frozen_effective_scope_precedence(self, tmp_path):
         store = _make_store(tmp_path)

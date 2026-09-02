@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 import portalocker
 
@@ -1526,11 +1526,24 @@ class ProfileStore:
             profile.template_id = validate_id_string(template.template_id, allow_builtins=True)
             return self._save_project_profile_unlocked(profile, expected_revision)
 
-    def delete_project(self, project_id: str) -> None:
+    def delete_project(
+        self,
+        project_id: str,
+        expected_revision: Optional[int] = None,
+        expected_manifest_revision: Optional[int] = None,
+    ) -> None:
         canon_id = validate_id_string(project_id)
         with self._thread_lock, self._file_lock():
             proj = self._load_project_profile_unlocked(canon_id)
             manifest = self._load_manifest_unlocked()
+            if expected_revision is not None and proj.revision != expected_revision:
+                raise RevisionConflictError(
+                    f"Project deletion conflict: on_disk={proj.revision}, expected={expected_revision}"
+                )
+            if expected_manifest_revision is not None and manifest["revision"] != expected_manifest_revision:
+                raise RevisionConflictError(
+                    f"Manifest deletion conflict: on_disk={manifest['revision']}, expected={expected_manifest_revision}"
+                )
             stable_default_id = manifest.get("default_project_id")
             if canon_id == stable_default_id or proj.is_default:
                 raise ValueError("The default project cannot be deleted.")
@@ -1586,12 +1599,22 @@ class ProfileStore:
         customs = self.list_custom_templates()
         return builtins + customs
 
-    def delete_custom_template(self, template_id: str) -> None:
+    def delete_custom_template(self, template_id: str, expected_revision: Optional[int] = None) -> None:
         if template_id in BUILTIN_TEMPLATE_IDS:
             raise ValueError("Built-in templates cannot be deleted.")
         canon_id = validate_id_string(template_id)
         with self._thread_lock, self._file_lock():
             tpl_file = self.templates_dir / f"{canon_id}.json"
+            if not tpl_file.exists():
+                if expected_revision is not None:
+                    raise FileNotFoundError(f"Template not found: {template_id}")
+                return
+            current = json.loads(tpl_file.read_text(encoding="utf-8"))
+            current_revision = current.get("revision", 1)
+            if expected_revision is not None and current_revision != expected_revision:
+                raise RevisionConflictError(
+                    f"Template deletion conflict: on_disk={current_revision}, expected={expected_revision}"
+                )
             tpl_file.unlink(missing_ok=True)
 
     def delete_migration_backups(self) -> int:
@@ -1610,6 +1633,10 @@ class ProfileStore:
 
 class DirtyOverlayError(RuntimeError):
     """Raised when a document overlay would be lost without explicit discard."""
+
+
+class SystemMutationConfirmationRequired(RuntimeError):
+    """Raised before a system-wide term mutation without explicit confirmation."""
 
 
 class ProfileController:
@@ -1712,6 +1739,13 @@ class ProfileController:
             self._touch_overlay()
         return item
 
+    @staticmethod
+    def run_system_mutation(action: Callable[[], Any], confirmed: bool = False) -> Any:
+        """Guard a system-wide mutation so cancellation cannot change memory state."""
+        if not confirmed:
+            raise SystemMutationConfirmationRequired("System-wide mutation requires explicit confirmation")
+        return action()
+
     def upsert_ignore(self, scope: Any, term: str) -> ScopedTerm:
         scope_level = self._scope(scope)
         term_value = validate_clean_string(term, "term", 200, allow_empty=False).strip()
@@ -1761,6 +1795,14 @@ class ProfileController:
         self.manifest = self.store.save_manifest(manifest, expected_revision=expected)
         return self.manifest
 
+    def save_manifest(self, updates: Mapping[str, Any], expected_revision: Optional[int] = None) -> Dict[str, Any]:
+        """CAS-save manifest settings using the revision held by this session."""
+        expected = int(self.manifest["revision"] if expected_revision is None else expected_revision)
+        manifest = dict(self.manifest)
+        manifest.update(dict(updates))
+        self.manifest = self.store.save_manifest(manifest, expected_revision=expected)
+        return self.manifest
+
     def warning_required(self) -> bool:
         return int(self.manifest.get("warning_acknowledged_version", 0)) < 1
 
@@ -1777,5 +1819,13 @@ class ProfileController:
         )
         return self.project_profile
 
-    def delete_custom_template(self, template_id: str) -> None:
-        self.store.delete_custom_template(template_id)
+    def delete_custom_template(self, template_id: str, expected_revision: Optional[int] = None) -> None:
+        self.store.delete_custom_template(template_id, expected_revision=expected_revision)
+
+    def delete_project(self, expected_revision: Optional[int] = None) -> None:
+        expected_project = self.project_profile.revision if expected_revision is None else expected_revision
+        self.store.delete_project(
+            self.project_profile.project_id,
+            expected_revision=expected_project,
+            expected_manifest_revision=int(self.manifest["revision"]),
+        )
