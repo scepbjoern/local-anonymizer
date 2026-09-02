@@ -15,6 +15,7 @@ Covers:
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -70,6 +71,143 @@ AVAILABLE = set(AVAILABLE_ENTITIES)
 
 def _make_store(tmp_path: Path) -> ProfileStore:
     return ProfileStore(root_dir=tmp_path)
+
+
+def _extract_app_functions(*names):
+    """Compile the actual GUI helper bodies with test-controlled globals."""
+    import app
+
+    tree = ast.parse((Path(__file__).parent.parent / "app.py").read_text(encoding="utf-8"))
+    create_ui = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "create_ui")
+    nodes = {
+        node.name: node
+        for node in ast.walk(create_ui)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names
+    }
+    namespace = dict(vars(app))
+    for name in names:
+        node = ast.fix_missing_locations(nodes[name])
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "app.py", "exec"), namespace)
+    return namespace
+
+
+class _FakeUiElement:
+    def __init__(self, value=None):
+        self.value = value
+        self.opened = False
+
+    def classes(self, *_args, **_kwargs):
+        return self
+
+    def props(self, *_args, **_kwargs):
+        return self
+
+    def open(self):
+        self.opened = True
+
+    def close(self):
+        self.opened = False
+
+    def clear(self):
+        return None
+
+
+class _FakeUiContext(_FakeUiElement):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class _FakeUi:
+    def __init__(self):
+        self.buttons = []
+        self.notifications = []
+
+    def dialog(self):
+        dialog = _FakeUiContext()
+        self.dialogs = getattr(self, "dialogs", [])
+        self.dialogs.append(dialog)
+        return dialog
+
+    def card(self):
+        return _FakeUiContext()
+
+    def row(self):
+        return _FakeUiContext()
+
+    def label(self, *_args, **_kwargs):
+        return _FakeUiElement()
+
+    def markdown(self, *_args, **_kwargs):
+        return _FakeUiElement()
+
+    def checkbox(self, *_args, **_kwargs):
+        return _FakeUiElement(value=True)
+
+    def button(self, label, on_click=None, **_kwargs):
+        button = _FakeUiElement()
+        button.label = label
+        button.on_click = on_click
+        self.buttons.append(button)
+        return button
+
+    def notify(self, message, **kwargs):
+        self.notifications.append((message, kwargs))
+
+    def click_last(self, label):
+        button = next(button for button in reversed(self.buttons) if button.label == label)
+        return button.on_click()
+
+
+def _make_gui_adapter_context(store, controller, fake_ui, busy):
+    overlay = DocumentProfileOverlay(
+        glossary_terms={"privatwort": _scoped_term("Privatwort", "PERSON")},
+        dirty=True,
+        overlay_revision=7,
+    )
+    controller.document_overlay = overlay
+    state = SimpleNamespace(
+        profile_store=store,
+        profile_controller=controller,
+        system_profile=controller.system_profile,
+        project_profile=controller.project_profile,
+        document_overlay=overlay,
+        entity_modes=dict(controller.project_profile.entity_modes),
+        entity_groups=[],
+        glossary_text="",
+        ignore_terms_text="",
+        preview_stale=False,
+        refresh_effective_config=lambda *args, **kwargs: None,
+    )
+    namespace = _extract_app_functions(
+        "_profile_controller",
+        "_sync_profile_controller",
+        "_run_durable_profile_action",
+        "mutate",
+        "add_glossary",
+        "add_ignore",
+    )
+    namespace.update(
+        {
+            "ui": fake_ui,
+            "state": state,
+            "controller": controller,
+            "check_mutation_allowed": lambda: not busy["value"],
+            "render_all": lambda: None,
+            "profile_terms_text": lambda terms, include_role=False: "\n".join(
+                term.term for term in terms.values()
+            ),
+            "scope_select": SimpleNamespace(value="project"),
+        }
+    )
+    namespace["mutate"].__globals__.update(namespace)
+    namespace["_run_durable_profile_action"].__globals__.update(namespace)
+    namespace["_sync_profile_controller"].__globals__.update(namespace)
+    namespace["add_glossary"].__globals__.update(namespace)
+    namespace["add_ignore"].__globals__.update(namespace)
+    return state, namespace
 
 
 def _valid_uuid4() -> str:
@@ -1196,6 +1334,170 @@ class TestProfileControllerR1ToR5:
         assert "category_holder\n" not in panel_block
         assert "term_value = str(g_term.value or \"\").strip()" in source
         assert "role = cfg.glossary_roles.get(key)" in source
+
+    def test_actual_profile_mutation_rejects_busy_system_confirmation_without_reload(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        controller.acknowledge_warning(expected_revision=controller.manifest["revision"])
+        fake_ui = _FakeUi()
+        busy = {"value": False}
+        state, ns = _make_gui_adapter_context(store, controller, fake_ui, busy)
+        before_overlay = state.document_overlay
+        before_overlay_dict = before_overlay.to_dict()
+        action_calls = []
+        after_success_calls = []
+
+        ns["mutate"](
+            "system",
+            lambda: action_calls.append("action"),
+            after_success=lambda: after_success_calls.append("after"),
+            expected_project_id=state.project_profile.project_id,
+        )
+        busy["value"] = True
+        fake_ui.click_last("Systemweit anwenden")
+
+        assert action_calls == []
+        assert after_success_calls == []
+        assert state.document_overlay is before_overlay
+        assert state.document_overlay.to_dict() == before_overlay_dict
+        assert controller.document_overlay is before_overlay
+        assert "privatwort" not in controller.system_profile.glossary_terms
+        assert store.load_system_profile().glossary_terms == {}
+        assert any("beschäftigt" in message for message, _ in fake_ui.notifications)
+
+    def test_actual_profile_mutation_rejects_project_switch_without_touching_new_overlay(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        new_project = store.create_project("Neues Ziel")
+        fake_ui = _FakeUi()
+        busy = {"value": False}
+        state, ns = _make_gui_adapter_context(store, controller, fake_ui, busy)
+        old_project_id = state.project_profile.project_id
+        old_project_overlay = state.document_overlay
+        old_project_overlay_dict = old_project_overlay.to_dict()
+        new_project_profile = store.load_project_profile(new_project.project_id)
+        new_overlay = DocumentProfileOverlay(
+            glossary_terms={"neueswort": _scoped_term("Neueswort", "ORGANIZATION")},
+            dirty=True,
+            overlay_revision=11,
+        )
+        action_calls = []
+        after_success_calls = []
+
+        ns["mutate"](
+            "project",
+            lambda: action_calls.append("action"),
+            after_success=lambda: after_success_calls.append("after"),
+            expected_project_id=old_project_id,
+        )
+        state.project_profile = new_project_profile
+        state.document_overlay = new_overlay
+        controller.project_profile = new_project_profile
+        controller.document_overlay = new_overlay
+        fake_ui.click_last("Bestätigen & Fortfahren")
+
+        assert action_calls == []
+        assert after_success_calls == []
+        assert state.project_profile.project_id == new_project.project_id
+        assert state.document_overlay is new_overlay
+        assert state.document_overlay.to_dict() == new_overlay.to_dict()
+        assert store.load_project_profile(old_project_id).glossary_terms == {}
+        assert old_project_overlay.to_dict() == old_project_overlay_dict
+        assert any("Projekt" in message for message, _ in fake_ui.notifications)
+
+    def test_actual_profile_mutation_reloads_cas_conflict_without_losing_overlay(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        controller.acknowledge_warning(expected_revision=controller.manifest["revision"])
+        fake_ui = _FakeUi()
+        busy = {"value": False}
+        state, ns = _make_gui_adapter_context(store, controller, fake_ui, busy)
+        overlay = state.document_overlay
+        overlay_dict = overlay.to_dict()
+        external = ProfileController(store)
+        external.upsert_glossary(ScopeLevel.PROJECT, "Extern", "ORGANIZATION")
+        external.save_project(expected_revision=external.project_profile.revision)
+        action_calls = []
+        after_success_calls = []
+
+        def action():
+            action_calls.append("action")
+            controller.upsert_glossary(ScopeLevel.PROJECT, "Lokal", "PERSON")
+
+        ns["mutate"](
+            "project",
+            action,
+            after_success=lambda: after_success_calls.append("after"),
+            expected_project_id=state.project_profile.project_id,
+        )
+
+        assert action_calls == ["action"]
+        assert after_success_calls == []
+        assert state.document_overlay is overlay
+        assert state.document_overlay.to_dict() == overlay_dict
+        assert controller.document_overlay is overlay
+        loaded = store.load_project_profile(state.project_profile.project_id)
+        assert "extern" in loaded.glossary_terms
+        assert "lokal" not in loaded.glossary_terms
+        assert any("extern geändert" in message for message, _ in fake_ui.notifications)
+
+    def test_actual_delayed_glossary_and_ignore_confirmation_and_cancel_keep_inputs_safe(self, tmp_path):
+        def run_glossary_flow():
+            store = _make_store(tmp_path / "glossary")
+            store.initialize_or_migrate()
+            controller = ProfileController(store)
+            fake_ui = _FakeUi()
+            state, ns = _make_gui_adapter_context(store, controller, fake_ui, {"value": False})
+            ns.update(
+                {
+                    "g_term": _FakeUiElement("Begriff"),
+                    "g_type": _FakeUiElement("PERSON"),
+                    "g_role": _FakeUiElement("Rolle"),
+                    "i_term": _FakeUiElement("Ignorieren"),
+                }
+            )
+            ns["add_glossary"].__globals__.update(ns)
+            ns["add_glossary"]()
+            fake_ui.click_last("Abbrechen")
+            assert ns["g_term"].value == "Begriff"
+            assert "begriff" not in controller.project_profile.glossary_terms
+            ns["add_glossary"]()
+            fake_ui.click_last("Bestätigen & Fortfahren")
+            assert ns["g_term"].value == ""
+            assert ns["g_role"].value == ""
+            assert "begriff" in controller.project_profile.glossary_terms
+            assert state.document_overlay.dirty is True
+
+        def run_ignore_flow():
+            store = _make_store(tmp_path / "ignore")
+            store.initialize_or_migrate()
+            controller = ProfileController(store)
+            fake_ui = _FakeUi()
+            state, ns = _make_gui_adapter_context(store, controller, fake_ui, {"value": False})
+            ns.update(
+                {
+                    "g_term": _FakeUiElement("Glossar"),
+                    "g_type": _FakeUiElement("PERSON"),
+                    "g_role": _FakeUiElement("Rolle"),
+                    "i_term": _FakeUiElement("Ignorieren"),
+                }
+            )
+            ns["add_ignore"].__globals__.update(ns)
+            ns["add_ignore"]()
+            fake_ui.click_last("Abbrechen")
+            assert ns["i_term"].value == "Ignorieren"
+            assert "ignorieren" not in controller.project_profile.ignore_terms
+            ns["add_ignore"]()
+            fake_ui.click_last("Bestätigen & Fortfahren")
+            assert ns["i_term"].value == ""
+            assert "ignorieren" in controller.project_profile.ignore_terms
+            assert state.document_overlay.dirty is True
+
+        run_glossary_flow()
+        run_ignore_flow()
 
     def test_actual_analyze_uses_frozen_effective_scope_precedence(self, tmp_path):
         store = _make_store(tmp_path)

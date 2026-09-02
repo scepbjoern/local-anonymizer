@@ -131,6 +131,20 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB limit
 
 
+class ProfileMutationAborted(RuntimeError):
+    """Raised when a delayed profile action is no longer safe to execute."""
+
+
+def _reload_profile_controller_preserving_overlay(
+    controller: ProfileController,
+    overlay: DocumentProfileOverlay,
+    active_project_id: Optional[str] = None,
+) -> None:
+    """Reload durable profiles while retaining the current document overlay."""
+    controller.reload(active_project_id=active_project_id)
+    controller.document_overlay = overlay
+
+
 def cleanup_temp_uploads(max_age_seconds: int = 1800):
     """Clean up any stale uploaded temporary files older than max_age_seconds (default 30 min).
     Never deletes recently active or newly created files from other running app instances or tabs."""
@@ -1808,7 +1822,12 @@ def save_current_config(st: AppState):
         st.refresh_effective_config()
         return True
     except RevisionConflictError:
-        controller.reload(active_project_id=st.project_profile.project_id)
+        overlay = st.document_overlay
+        _reload_profile_controller_preserving_overlay(
+            controller,
+            overlay,
+            active_project_id=project.project_id,
+        )
         st.system_profile = controller.system_profile
         st.project_profile = controller.project_profile
         st.document_overlay = controller.document_overlay
@@ -4743,8 +4762,15 @@ def create_ui(client: Optional[Client] = None):
         if not controller.warning_required():
             try:
                 action()
+            except ProfileMutationAborted as ex:
+                ui.notify(str(ex), type="warning", close_button=True)
             except RevisionConflictError:
-                controller.reload(active_project_id=state.project_profile.project_id)
+                overlay = state.document_overlay
+                _reload_profile_controller_preserving_overlay(
+                    controller,
+                    overlay,
+                    active_project_id=state.project_profile.project_id if state.project_profile else None,
+                )
                 _sync_profile_controller()
                 ui.notify("Speichern fehlgeschlagen: Das Profil wurde extern geändert und neu geladen.", type="warning", close_button=True)
             except Exception as ex:
@@ -4775,7 +4801,12 @@ def create_ui(client: Optional[Client] = None):
                         )
                         warning_dialog.close()
                     except RevisionConflictError:
-                        controller.reload(active_project_id=state.project_profile.project_id)
+                        overlay = state.document_overlay
+                        _reload_profile_controller_preserving_overlay(
+                            controller,
+                            overlay,
+                            active_project_id=state.project_profile.project_id if state.project_profile else None,
+                        )
                         _sync_profile_controller()
                         warning_dialog.close()
                         ui.notify("Speichern abgebrochen: Der Profilstand wurde extern geändert und neu geladen.", type="warning")
@@ -4829,12 +4860,12 @@ def create_ui(client: Optional[Client] = None):
                     return
                 def durable_action() -> None:
                     if not check_mutation_allowed():
-                        raise RevisionConflictError("Profile mutation became unavailable while the dialog was open")
+                        raise ProfileMutationAborted("Änderung abgebrochen: Die Anwendung ist inzwischen beschäftigt.")
                     if expected_project_id and (
                         state.project_profile is None
                         or state.project_profile.project_id != expected_project_id
                     ):
-                        raise RevisionConflictError("Active project changed while the dialog was open")
+                        raise ProfileMutationAborted("Änderung abgebrochen: Das aktive Projekt wurde inzwischen gewechselt.")
                     if scope == "system":
                         controller.run_system_mutation(action, confirmed=True)
                         controller.save_system(expected_revision=controller.system_profile.revision)
