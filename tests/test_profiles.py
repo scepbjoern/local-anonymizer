@@ -108,6 +108,12 @@ class _FakeUiElement:
     def close(self):
         self.opened = False
 
+    def update(self):
+        return None
+
+    def set_value(self, value):
+        self.value = value
+
     def clear(self):
         return None
 
@@ -184,10 +190,11 @@ def _make_gui_adapter_context(store, controller, fake_ui, busy):
     namespace = _extract_app_functions(
         "_profile_controller",
         "_sync_profile_controller",
-        "_run_durable_profile_action",
-        "mutate",
-        "add_glossary",
-        "add_ignore",
+            "_run_durable_profile_action",
+            "mutate",
+            "add_glossary",
+            "add_ignore",
+            "apply_template",
     )
     namespace.update(
         {
@@ -200,6 +207,7 @@ def _make_gui_adapter_context(store, controller, fake_ui, busy):
                 term.term for term in terms.values()
             ),
             "scope_select": SimpleNamespace(value="project"),
+            "sidebar_entity_mode_selects": {},
         }
     )
     namespace["mutate"].__globals__.update(namespace)
@@ -1334,6 +1342,70 @@ class TestProfileControllerR1ToR5:
         assert "category_holder\n" not in panel_block
         assert "term_value = str(g_term.value or \"\").strip()" in source
         assert "role = cfg.glossary_roles.get(key)" in source
+        profile_block = source[source.index("def open_profile_manager"):source.index("with ui.card().classes(\"w-full mb-3", panel_start)]
+        assert profile_block.count("max-h-64 overflow-y-auto") == 2
+
+    def test_actual_profile_sync_updates_sidebar_category_selectors(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        fake_ui = _FakeUi()
+        state, ns = _make_gui_adapter_context(store, controller, fake_ui, {"value": False})
+        selector = _FakeUiElement(ENTITY_MODE_ALL)
+        ns["sidebar_entity_mode_selects"] = {"PERSON": selector}
+        ns["_sync_profile_controller"].__globals__.update(ns)
+
+        controller.project_profile.entity_modes["PERSON"] = ENTITY_MODE_OFF
+        state.entity_modes["PERSON"] = ENTITY_MODE_OFF
+        ns["_sync_profile_controller"]()
+
+        assert selector.value == ENTITY_MODE_OFF
+
+    def test_actual_template_cancel_restores_selector_and_success_marks_reanalysis(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        controller.acknowledge_warning(expected_revision=controller.manifest["revision"])
+        template_id = _valid_uuid4()
+        modes = dict(controller.project_profile.entity_modes)
+        modes["PERSON"] = ENTITY_MODE_OFF if modes.get("PERSON") != ENTITY_MODE_OFF else ENTITY_MODE_ALL
+        store.save_custom_template(
+            CategoryTemplate(
+                template_id=template_id,
+                name="GUI-Testvorlage",
+                entity_modes=modes,
+                schema_version=2,
+                revision=1,
+            )
+        )
+        fake_ui = _FakeUi()
+        state, ns = _make_gui_adapter_context(store, controller, fake_ui, {"value": False})
+        state.entity_groups = [object()]
+        template_select = _FakeUiElement(None)
+        warning_card = _FakeUiElement()
+        warning_card.visibility = []
+        warning_card.set_visibility = lambda visible: warning_card.visibility.append(visible)
+        ns.update(
+            {
+                "template_select": template_select,
+                "reanalysis_warning_card": warning_card,
+                "refresh_preview_and_exports": lambda: None,
+                "sidebar_entity_mode_selects": {},
+            }
+        )
+        ns["apply_template"].__globals__.update(ns)
+
+        original_modes = dict(controller.project_profile.entity_modes)
+        ns["apply_template"](template_id)
+        fake_ui.click_last("Abbrechen")
+        assert template_select.value is None
+        assert controller.project_profile.entity_modes == original_modes
+
+        ns["apply_template"](template_id)
+        fake_ui.click_last("Anwenden")
+        assert template_select.value == template_id
+        assert controller.project_profile.entity_modes == modes
+        assert warning_card.visibility == [True]
 
     def test_actual_profile_mutation_rejects_busy_system_confirmation_without_reload(self, tmp_path):
         store = _make_store(tmp_path)

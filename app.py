@@ -2208,6 +2208,7 @@ def create_ui(client: Optional[Client] = None):
     restore_anon_input = None
     map_json_input = None
     restored_preview = None
+    sidebar_entity_mode_selects: Dict[str, Any] = {}
 
     def ask_discard_document_overlay(action: Callable[[], Any]) -> None:
         """Require an explicit discard before replacing the current document scope."""
@@ -4339,6 +4340,7 @@ def create_ui(client: Optional[Client] = None):
                         entity_mode_classes(state.entity_modes.get(ent, ENTITY_MODE_OFF))
                     )
                     selector_ref.append(mode_select)
+                    sidebar_entity_mode_selects[ent] = mode_select
                     state.register_mutating_element(mode_select, "sidebar")
 
             ui.separator().classes("my-2")
@@ -4738,23 +4740,47 @@ def create_ui(client: Optional[Client] = None):
         state.ignore_terms_text = ", ".join(term.term for term in state.project_profile.ignore_terms.values())
         state.refresh_effective_config()
         state.preview_stale = bool(state.entity_groups)
+        for entity, selector in sidebar_entity_mode_selects.items():
+            try:
+                mode = state.entity_modes.get(entity, ENTITY_MODE_OFF)
+                selector.set_value(mode)
+                selector.classes(replace=entity_mode_classes(mode))
+            except Exception:
+                pass
 
     def _run_durable_profile_action(
         action: Callable[[], None],
         system_mutation: bool = False,
         system_confirmed: bool = False,
+        on_abort: Optional[Callable[[], None]] = None,
     ) -> None:
         """Run a profile/template write only after the one-time local-storage warning."""
         controller = _profile_controller()
+
+        def abort_action() -> None:
+            if on_abort is not None:
+                try:
+                    on_abort()
+                except Exception:
+                    logging.exception("Profilaktion konnte nach Abbruch nicht zurückgesetzt werden")
+
         if system_mutation and not system_confirmed:
             with ui.dialog() as system_dialog, ui.card().classes("p-4 max-w-lg"):
                 ui.label("Systemweite Änderung bestätigen").classes("text-lg font-bold")
                 ui.label("Diese Glossar-/Ignore-Änderung gilt für alle Projekte und kann dort die wirksame Konfiguration beeinflussen.").classes("text-sm text-slate-700")
                 with ui.row().classes("w-full justify-end gap-2 mt-3"):
-                    ui.button("Abbrechen", on_click=system_dialog.close).props("flat")
+                    ui.button("Abbrechen", on_click=lambda: (system_dialog.close(), abort_action())).props("flat")
                     ui.button(
                         "Systemweit anwenden",
-                        on_click=lambda: (system_dialog.close(), _run_durable_profile_action(action, True, True)),
+                        on_click=lambda: (
+                            system_dialog.close(),
+                            _run_durable_profile_action(
+                                action,
+                                True,
+                                True,
+                                on_abort=on_abort,
+                            ),
+                        ),
                         color="primary",
                     ).props("unelevated")
             system_dialog.open()
@@ -4763,6 +4789,7 @@ def create_ui(client: Optional[Client] = None):
             try:
                 action()
             except ProfileMutationAborted as ex:
+                abort_action()
                 ui.notify(str(ex), type="warning", close_button=True)
             except RevisionConflictError:
                 overlay = state.document_overlay
@@ -4772,8 +4799,10 @@ def create_ui(client: Optional[Client] = None):
                     active_project_id=state.project_profile.project_id if state.project_profile else None,
                 )
                 _sync_profile_controller()
+                abort_action()
                 ui.notify("Speichern fehlgeschlagen: Das Profil wurde extern geändert und neu geladen.", type="warning", close_button=True)
             except Exception as ex:
+                abort_action()
                 ui.notify(f"Profiländerung konnte nicht gespeichert werden: {ex}", type="negative")
             return
 
@@ -4787,7 +4816,7 @@ def create_ui(client: Optional[Client] = None):
             ).classes("text-sm text-slate-700 leading-relaxed mt-2")
             understood = ui.checkbox("Ich habe diesen Hinweis verstanden und möchte fortfahren.")
             with ui.row().classes("w-full justify-end gap-2 mt-3"):
-                ui.button("Abbrechen", on_click=warning_dialog.close).props("flat")
+                ui.button("Abbrechen", on_click=lambda: (warning_dialog.close(), abort_action())).props("flat")
                 def confirm_profile_warning() -> None:
                     if not understood.value:
                         ui.notify("Bitte bestätige zuerst den Datenschutzhinweis.", type="warning")
@@ -4798,6 +4827,7 @@ def create_ui(client: Optional[Client] = None):
                             action,
                             system_mutation=system_mutation,
                             system_confirmed=True,
+                            on_abort=on_abort,
                         )
                         warning_dialog.close()
                     except RevisionConflictError:
@@ -4808,9 +4838,11 @@ def create_ui(client: Optional[Client] = None):
                             active_project_id=state.project_profile.project_id if state.project_profile else None,
                         )
                         _sync_profile_controller()
+                        abort_action()
                         warning_dialog.close()
                         ui.notify("Speichern abgebrochen: Der Profilstand wurde extern geändert und neu geladen.", type="warning")
                     except Exception as ex:
+                        abort_action()
                         warning_dialog.close()
                         ui.notify(f"Profiländerung konnte nicht gespeichert werden: {ex}", type="negative")
                 ui.button("Bestätigen & Fortfahren", on_click=confirm_profile_warning, color="primary").props("unelevated")
@@ -4929,20 +4961,21 @@ def create_ui(client: Optional[Client] = None):
                                 expected_project_id=selected_project_id,
                             )
                         ui.button("Hinzufügen", icon="add", on_click=add_glossary, color="primary").props("dense")
-                    for key, value in sorted(cfg.glossary.items(), key=lambda item: item[0].casefold()):
-                        provenance = cfg.glossary_provenance.get(normalize_term_key(key))
-                        label = provenance[1] if provenance else "wirksam"
-                        role = cfg.glossary_roles.get(key)
-                        role_suffix = f" · Rolle: {role}" if role else ""
-                        with ui.row().classes("w-full items-center gap-2 mb-1"):
-                            ui.label(f"Begriff: {key} · Typ: {value}{role_suffix}").classes("font-mono text-xs flex-grow")
-                            ui.badge(label, color="teal" if provenance and provenance[0] == ScopeLevel.PROJECT else "grey-7").props("dense")
-                            source_scope = provenance[0] if provenance else ScopeLevel.PROJECT
-                            selected_scope = ScopeLevel(scope)
-                            if source_scope == selected_scope:
-                                ui.button("Löschen", on_click=lambda k=key: mutate(scope, lambda: controller.remove_term(scope, k, True))).props("dense flat color=negative")
-                            elif selected_scope in (ScopeLevel.PROJECT, ScopeLevel.DOCUMENT):
-                                ui.button("Ausblenden", on_click=lambda k=key: mutate(scope, lambda: controller.disable_inherited(scope, k, True))).props("dense flat")
+                    with ui.column().classes("w-full max-h-64 overflow-y-auto gap-1 pr-1"):
+                        for key, value in sorted(cfg.glossary.items(), key=lambda item: item[0].casefold()):
+                            provenance = cfg.glossary_provenance.get(normalize_term_key(key))
+                            label = provenance[1] if provenance else "wirksam"
+                            role = cfg.glossary_roles.get(key)
+                            role_suffix = f" · Rolle: {role}" if role else ""
+                            with ui.row().classes("w-full items-center gap-2 mb-1"):
+                                ui.label(f"Begriff: {key} · Typ: {value}{role_suffix}").classes("font-mono text-xs flex-grow")
+                                ui.badge(label, color="teal" if provenance and provenance[0] == ScopeLevel.PROJECT else "grey-7").props("dense")
+                                source_scope = provenance[0] if provenance else ScopeLevel.PROJECT
+                                selected_scope = ScopeLevel(scope)
+                                if source_scope == selected_scope:
+                                    ui.button("Löschen", on_click=lambda k=key: mutate(scope, lambda: controller.remove_term(scope, k, True))).props("dense flat color=negative")
+                                elif selected_scope in (ScopeLevel.PROJECT, ScopeLevel.DOCUMENT):
+                                    ui.button("Ausblenden", on_click=lambda k=key: mutate(scope, lambda: controller.disable_inherited(scope, k, True))).props("dense flat")
                     ui.label("Begriffe mit Badge «System» oder «Projekt» sind geerbt bzw. wirksam aus dieser Ebene.").classes("text-[11px] text-slate-500 mt-2")
                 with ignore_holder:
                     with ui.row().classes("w-full items-end gap-2 mb-2"):
@@ -4960,17 +4993,18 @@ def create_ui(client: Optional[Client] = None):
                                 expected_project_id=selected_project_id,
                             )
                         ui.button("Hinzufügen", icon="add", on_click=add_ignore, color="primary").props("dense")
-                    for key in sorted(cfg.ignore_provenance, key=str.casefold):
-                        provenance = cfg.ignore_provenance.get(key)
-                        with ui.row().classes("w-full items-center gap-2 mb-1"):
-                            ui.label(key).classes("font-mono text-xs flex-grow")
-                            ui.badge(provenance[1] if provenance else "wirksam", color="grey-7").props("dense")
-                            source_scope = provenance[0] if provenance else ScopeLevel.PROJECT
-                            selected_scope = ScopeLevel(scope)
-                            if source_scope == selected_scope:
-                                ui.button("Löschen", on_click=lambda k=key: mutate(scope, lambda: controller.remove_term(scope, k, False))).props("dense flat color=negative")
-                            elif selected_scope in (ScopeLevel.PROJECT, ScopeLevel.DOCUMENT):
-                                ui.button("Ausblenden", on_click=lambda k=key: mutate(scope, lambda: controller.disable_inherited(scope, k, False))).props("dense flat")
+                    with ui.column().classes("w-full max-h-64 overflow-y-auto gap-1 pr-1"):
+                        for key in sorted(cfg.ignore_provenance, key=str.casefold):
+                            provenance = cfg.ignore_provenance.get(key)
+                            with ui.row().classes("w-full items-center gap-2 mb-1"):
+                                ui.label(key).classes("font-mono text-xs flex-grow")
+                                ui.badge(provenance[1] if provenance else "wirksam", color="grey-7").props("dense")
+                                source_scope = provenance[0] if provenance else ScopeLevel.PROJECT
+                                selected_scope = ScopeLevel(scope)
+                                if source_scope == selected_scope:
+                                    ui.button("Löschen", on_click=lambda k=key: mutate(scope, lambda: controller.remove_term(scope, k, False))).props("dense flat color=negative")
+                                elif selected_scope in (ScopeLevel.PROJECT, ScopeLevel.DOCUMENT):
+                                    ui.button("Ausblenden", on_click=lambda k=key: mutate(scope, lambda: controller.disable_inherited(scope, k, False))).props("dense flat")
 
             def render_all() -> None:
                 render_categories()
@@ -5014,8 +5048,15 @@ def create_ui(client: Optional[Client] = None):
             def apply_template(template_id: str, confirmed: bool = False) -> None:
                 if not template_id or not check_mutation_allowed() or state.project_profile is None:
                     return
+                previous_template_id = state.project_profile.template_id
+
+                def restore_template_selection() -> None:
+                    template_select.value = previous_template_id
+                    template_select.update()
+
                 template = state.profile_store.load_template(template_id)
                 if template is None:
+                    restore_template_selection()
                     ui.notify("Diese Vorlage ist nicht mehr verfügbar; die Projektmodi bleiben unverändert.", type="warning")
                     return
                 changed = dict(state.project_profile.entity_modes) != dict(template.entity_modes)
@@ -5024,7 +5065,7 @@ def create_ui(client: Optional[Client] = None):
                         ui.label("Projektmodi überschreiben?").classes("text-lg font-bold")
                         ui.label("Die aktuelle Projektkonfiguration wird durch eine Kopie der Vorlage ersetzt. Eigene Begriffe bleiben erhalten.").classes("text-sm text-slate-700")
                         with ui.row().classes("justify-end w-full mt-3 gap-2"):
-                            ui.button("Abbrechen", on_click=confirm_dialog.close).props("flat")
+                            ui.button("Abbrechen", on_click=lambda: (confirm_dialog.close(), restore_template_selection())).props("flat")
                             ui.button("Anwenden", on_click=lambda: (confirm_dialog.close(), apply_template(template_id, True)), color="primary").props("unelevated")
                     confirm_dialog.open()
                     return
@@ -5033,11 +5074,17 @@ def create_ui(client: Optional[Client] = None):
                     def action() -> None:
                         controller.apply_template(template_id, expected_revision=controller.project_profile.revision)
                         _sync_profile_controller()
+                        template_select.value = template_id
+                        template_select.update()
                         ui.notify("Vorlage als Snapshot auf das Projekt angewendet.", type="positive")
                         if state.entity_groups:
+                            state.preview_stale = True
+                            if reanalysis_warning_card is not None:
+                                reanalysis_warning_card.set_visibility(True)
                             refresh_preview_and_exports()
-                    _run_durable_profile_action(action)
+                    _run_durable_profile_action(action, on_abort=restore_template_selection)
                 except Exception as ex:
+                    restore_template_selection()
                     ui.notify(f"Vorlage konnte nicht angewendet werden: {ex}", type="negative")
 
             template_select = ui.select(options=template_options, on_change=lambda event: apply_template(event.value)).props("dense outlined").classes("min-w-64")
