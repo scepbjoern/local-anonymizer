@@ -5,13 +5,23 @@ import json
 import pytest
 from unittest.mock import patch
 
-from app import AppState, cleanup_session_async, reset_app_state
+from app import (
+    AppState,
+    cleanup_session_async,
+    reset_app_state,
+    launch_llm_triage_for_state,
+    run_llm_triage_for_state,
+    EntityGroup,
+    EntityOccurrence,
+)
 from local_anonymizer.llm.provider import (
     preload_ollama_model,
     test_generic_connection as verify_generic_connection,
+    verify_ollama_model_running,
     parse_iso_expiry,
+    LocalApiProvider,
 )
-from local_anonymizer.llm.schema import PsModelInfo
+from local_anonymizer.llm.schema import PsModelInfo, TriageEnvelope, TriageKeepItem
 
 
 class MockResponse:
@@ -70,7 +80,7 @@ async def test_preload_ollama_model_success():
         ]
     }
     responses = {
-        gen_url: MockResponse(200, body=b'{"response": ""}'),
+        gen_url: MockResponse(200, body=b'{"model": "qwen3:8b", "response": "", "done": true, "done_reason": "load"}'),
         ps_url: MockResponse(200, body=json.dumps(ps_payload).encode("utf-8")),
     }
     session = MockSession(responses_by_url=responses)
@@ -89,7 +99,7 @@ async def test_preload_ollama_model_not_running_error():
     ps_url = "http://127.0.0.1:11434/api/ps"
 
     responses = {
-        gen_url: MockResponse(200, body=b'{"response": ""}'),
+        gen_url: MockResponse(200, body=b'{"model": "qwen3:8b", "response": "", "done": true, "done_reason": "load"}'),
         ps_url: MockResponse(200, body=b'{"models": []}'),  # Empty running models list
     }
     session = MockSession(responses_by_url=responses)
@@ -182,7 +192,7 @@ async def test_preload_ollama_prefix_mismatch_rejected():
     generate_url = "http://127.0.0.1:11434/api/generate"
     ps_url = "http://127.0.0.1:11434/api/ps"
     responses = {
-        generate_url: MockResponse(200, body=b'{"response": ""}'),
+        generate_url: MockResponse(200, body=b'{"model": "qwen3:8b", "response": "", "done": true, "done_reason": "load"}'),
         ps_url: MockResponse(200, body=json.dumps(ps_resp).encode("utf-8")),
     }
     session = MockSession(responses_by_url=responses)
@@ -316,13 +326,389 @@ async def test_preload_ollama_generate_invalid_json_rejected():
 
 
 def test_parse_iso_expiry():
-    """Verify strict ISO expiry parsing without fallback on invalid input."""
-    from datetime import datetime, timezone
+    """Verify strict ISO expiry parsing requiring explicit timezone without fallback on invalid input."""
     now_iso = "2026-09-02T12:00:00Z"
     ts = parse_iso_expiry(now_iso)
     assert ts > 0.0
+
+    offset_iso = "2026-09-02T14:00:00+02:00"
+    ts_offset = parse_iso_expiry(offset_iso)
+    assert ts_offset > 0.0
+
+    # Naive timestamp without timezone MUST be rejected
+    assert parse_iso_expiry("2026-09-02T12:00:00") == 0.0
 
     # Invalid / empty
     assert parse_iso_expiry(None) == 0.0
     assert parse_iso_expiry("") == 0.0
     assert parse_iso_expiry("invalid-date-format") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_preload_ollama_empty_response_rejected():
+    """Verify that empty JSON object from /api/generate is rejected."""
+    gen_url = "http://127.0.0.1:11434/api/generate"
+    responses = {
+        gen_url: MockResponse(200, body=b'{}'),
+    }
+    session = MockSession(responses_by_url=responses)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        with pytest.raises(RuntimeError, match="nicht abgeschlossen"):
+            await preload_ollama_model("http://127.0.0.1:11434/v1", "qwen3:8b")
+
+
+@pytest.mark.asyncio
+async def test_preload_ollama_not_done_rejected():
+    """Verify that preload response with done=false is rejected."""
+    gen_url = "http://127.0.0.1:11434/api/generate"
+    responses = {
+        gen_url: MockResponse(200, body=b'{"model": "qwen3:8b", "done": false}'),
+    }
+    session = MockSession(responses_by_url=responses)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        with pytest.raises(RuntimeError, match="nicht abgeschlossen"):
+            await preload_ollama_model("http://127.0.0.1:11434/v1", "qwen3:8b")
+
+
+@pytest.mark.asyncio
+async def test_preload_ollama_wrong_model_rejected():
+    """Verify that preload response with conflicting model name is rejected."""
+    gen_url = "http://127.0.0.1:11434/api/generate"
+    responses = {
+        gen_url: MockResponse(200, body=b'{"model": "wrong-model:1b", "done": true}'),
+    }
+    session = MockSession(responses_by_url=responses)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        with pytest.raises(RuntimeError, match="Modell-Identit.+tskonflikt"):
+            await preload_ollama_model("http://127.0.0.1:11434/v1", "qwen3:8b")
+
+
+@pytest.mark.asyncio
+async def test_verify_ollama_model_running_active():
+    """Verify that verify_ollama_model_running detects active unexpired running model."""
+    import time
+    ps_resp = {
+        "models": [
+            {
+                "name": "qwen3:8b",
+                "model": "qwen3:8b",
+                "size_vram": 4900000000,
+                "expires_at": "2026-09-02T12:00:00Z",
+            }
+        ]
+    }
+    responses = {
+        "http://127.0.0.1:11434/api/ps": MockResponse(200, body=json.dumps(ps_resp).encode("utf-8")),
+    }
+    session = MockSession(responses_by_url=responses)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        with patch("local_anonymizer.llm.provider.parse_iso_expiry", return_value=time.time() + 300.0):
+            info = await verify_ollama_model_running("http://127.0.0.1:11434/v1", "qwen3:8b")
+            assert info is not None
+            assert info.name == "qwen3:8b"
+
+
+@pytest.mark.asyncio
+async def test_verify_ollama_model_running_externally_unloaded():
+    """Verify that verify_ollama_model_running returns None when model is unloaded in Ollama."""
+    responses = {
+        "http://127.0.0.1:11434/api/ps": MockResponse(200, body=b'{"models": []}'),
+    }
+    session = MockSession(responses_by_url=responses)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        info = await verify_ollama_model_running("http://127.0.0.1:11434/v1", "qwen3:8b")
+        assert info is None
+
+
+@pytest.mark.asyncio
+async def test_verify_ollama_model_running_expired():
+    """Verify that verify_ollama_model_running returns None when model expiry timestamp has passed."""
+    ps_resp = {
+        "models": [
+            {
+                "name": "qwen3:8b",
+                "model": "qwen3:8b",
+                "expires_at": "2020-01-01T00:00:00Z",
+            }
+        ]
+    }
+    responses = {
+        "http://127.0.0.1:11434/api/ps": MockResponse(200, body=json.dumps(ps_resp).encode("utf-8")),
+    }
+    session = MockSession(responses_by_url=responses)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        info = await verify_ollama_model_running("http://127.0.0.1:11434/v1", "qwen3:8b")
+        assert info is None
+
+
+@pytest.mark.asyncio
+async def test_launch_llm_triage_manual_end_to_end():
+    """Verify that manual triage launch executes worker, hits provider, and populates results."""
+    st = AppState()
+    st.raw_text = "Dr. Anna Keller arbeitet am Spital Zürich."
+    occ = EntityOccurrence(
+        start=0,
+        end=15,
+        score=1.0,
+        context_html="<b>Dr. Anna Keller</b> arbeitet am Spital Zürich.",
+        needs_review=False,
+    )
+    grp = EntityGroup(
+        original_text="Dr. Anna Keller",
+        entity_type="PERSON",
+        group_id="grp-1",
+    )
+    grp.occurrences.append(occ)
+    st.entity_groups = [grp]
+    st.config.llm_enabled = True
+    st.config.llm_model_name = "qwen3:8b"
+    st.config.llm_base_url = "http://127.0.0.1:11434/v1"
+
+    # Mock provider generate
+    mock_resp_json = {
+        "schema_version": "1.0.0",
+        "request_id": "",
+        "document_revision": st.document_revision,
+        "snapshot_hash": "",
+        "items": [
+            {
+                "occ_id": occ.occ_id,
+                "action": "keep",
+                "confidence": "high",
+                "reasoning": "Echte Person",
+                "descriptor_suggestion": "ÄRZTIN",
+            }
+        ],
+    }
+
+    class MockProvider:
+        model_name = "qwen3:8b"
+        base_url = "http://127.0.0.1:11434/v1"
+        call_count = 0
+
+        async def generate(self, prompt, system_prompt=""):
+            self.call_count += 1
+            import re
+            from local_anonymizer.llm.apply_service import compute_triage_snapshot
+            snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+            req_match = re.search(r'"request_id":\s*"([^"]+)"', prompt)
+            req_id = req_match.group(1) if req_match else "req-1"
+            return json.dumps({
+                "schema_version": "1.0",
+                "request_id": req_id,
+                "document_revision": st.document_revision,
+                "document_hash": snap,
+                "items": [
+                    {
+                        "occ_id": occ.occ_id,
+                        "action": "keep",
+                        "confidence": "high",
+                        "reasoning": "Echte Person",
+                        "descriptor_suggestion": "ÄRZTIN",
+                    }
+                ],
+            })
+
+        async def close(self):
+            pass
+
+    provider = MockProvider()
+    st.llm_provider = provider
+
+    notifications = []
+    task = launch_llm_triage_for_state(
+        st,
+        triggered_from_analysis=False,
+        notify_cb=lambda msg, t: notifications.append((msg, t)),
+    )
+    assert task is not None
+    assert st.is_llm_running is True
+
+    await task
+
+    assert st.is_llm_running is False
+    assert st.llm_active_task is None
+    assert provider.call_count == 1
+    assert len(st.llm_triage_results) == 1
+    res = st.llm_triage_results[occ.occ_id]
+    assert res.action == "keep"
+    assert res.descriptor_suggestion == "ÄRZTIN"
+    assert any("abgeschlossen" in m[0] for m in notifications)
+
+
+@pytest.mark.asyncio
+async def test_launch_llm_triage_auto_review_end_to_end():
+    """Verify that auto-review launch seamlessly takes over ownership from analysis and finishes cleanly."""
+    st = AppState()
+    st.raw_text = "Prof. Müller hält einen Vortrag."
+    occ = EntityOccurrence(
+        start=0,
+        end=12,
+        score=1.0,
+        context_html="<b>Prof. Müller</b> hält einen Vortrag.",
+        needs_review=False,
+    )
+    grp = EntityGroup(
+        original_text="Prof. Müller",
+        entity_type="PERSON",
+        group_id="grp-2",
+    )
+    grp.occurrences.append(occ)
+    st.entity_groups = [grp]
+    st.config.llm_enabled = True
+    st.config.llm_model_name = "qwen3:8b"
+    st.config.llm_base_url = "http://127.0.0.1:11434/v1"
+    st.is_analyzing = True
+
+    class MockProvider:
+        model_name = "qwen3:8b"
+        base_url = "http://127.0.0.1:11434/v1"
+
+        async def generate(self, prompt, system_prompt=""):
+            import re
+            from local_anonymizer.llm.apply_service import compute_triage_snapshot
+            snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+            req_match = re.search(r'"request_id":\s*"([^"]+)"', prompt)
+            req_id = req_match.group(1) if req_match else "req-2"
+            return json.dumps({
+                "schema_version": "1.0",
+                "request_id": req_id,
+                "document_revision": st.document_revision,
+                "document_hash": snap,
+                "items": [
+                    {
+                        "occ_id": occ.occ_id,
+                        "action": "keep",
+                        "confidence": "high",
+                        "reasoning": "Dozent",
+                        "descriptor_suggestion": "DOZENT",
+                    }
+                ],
+            })
+
+        async def close(self):
+            pass
+
+    st.llm_provider = MockProvider()
+
+    # Launch with triggered_from_analysis=True
+    task = launch_llm_triage_for_state(st, triggered_from_analysis=True)
+    assert task is not None
+    assert st.is_analyzing is False
+    assert st.is_llm_running is True
+
+    await task
+
+    assert st.is_llm_running is False
+    assert len(st.llm_triage_results) == 1
+
+
+@pytest.mark.asyncio
+async def test_launch_llm_triage_double_click_protection():
+    """Verify that rapid double-clicks return existing active task without starting duplicate runner."""
+    st = AppState()
+    st.raw_text = "Test Text"
+    occ = EntityOccurrence(start=0, end=4, score=1.0, context_html="Test", needs_review=False)
+    grp = EntityGroup(original_text="Test", entity_type="MISC", group_id="grp-3")
+    grp.occurrences.append(occ)
+    st.entity_groups = [grp]
+    st.config.llm_enabled = True
+    st.config.llm_model_name = "qwen3:8b"
+
+    class SlowProvider:
+        model_name = "qwen3:8b"
+        base_url = "http://127.0.0.1:11434/v1"
+        call_count = 0
+
+        async def generate(self, prompt, system_prompt=""):
+            self.call_count += 1
+            await asyncio.sleep(0.05)
+            import re
+            from local_anonymizer.llm.apply_service import compute_triage_snapshot
+            snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+            req_match = re.search(r'"request_id":\s*"([^"]+)"', prompt)
+            req_id = req_match.group(1) if req_match else "req-3"
+            return json.dumps({
+                "schema_version": "1.0",
+                "request_id": req_id,
+                "document_revision": st.document_revision,
+                "document_hash": snap,
+                "items": [{"occ_id": occ.occ_id, "action": "discard", "confidence": "high", "reasoning": "Generic"}],
+            })
+
+        async def close(self):
+            pass
+
+    provider = SlowProvider()
+    st.llm_provider = provider
+
+    task1 = launch_llm_triage_for_state(st, triggered_from_analysis=False)
+    task2 = launch_llm_triage_for_state(st, triggered_from_analysis=False)
+
+    assert task1 is not None
+    assert task2 is task1  # Exact same task returned
+
+    await task1
+    assert provider.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_launch_llm_triage_rejected_when_setup_active():
+    """Verify that launch is rejected when setup is discovering/preloading/testing."""
+    st = AppState()
+    st.raw_text = "Test"
+    occ = EntityOccurrence(start=0, end=4, score=1.0, context_html="Test", needs_review=False)
+    grp = EntityGroup(original_text="Test", entity_type="MISC", group_id="grp-4")
+    grp.occurrences.append(occ)
+    st.entity_groups = [grp]
+    st.config.llm_enabled = True
+    st.config.llm_model_name = "qwen3:8b"
+
+    st.llm_setup_state = "preloading"
+    notifications = []
+    task = launch_llm_triage_for_state(st, notify_cb=lambda msg, t: notifications.append((msg, t)))
+
+    assert task is None
+    assert st.is_llm_running is False
+    assert any("Setup" in n[0] for n in notifications)
+
+
+@pytest.mark.asyncio
+async def test_launch_llm_triage_exception_resets_busy_state():
+    """Verify that provider exception resets busy state and active task gracefully."""
+    st = AppState()
+    st.raw_text = "Test Text"
+    occ = EntityOccurrence(start=0, end=4, score=1.0, context_html="Test", needs_review=False)
+    grp = EntityGroup(original_text="Test", entity_type="MISC", group_id="grp-5")
+    grp.occurrences.append(occ)
+    st.entity_groups = [grp]
+    st.config.llm_enabled = True
+    st.config.llm_model_name = "qwen3:8b"
+
+    class FailingProvider:
+        model_name = "qwen3:8b"
+        base_url = "http://127.0.0.1:11434/v1"
+
+        async def generate(self, prompt, system_prompt=""):
+            raise RuntimeError("Connection dropped")
+
+        async def close(self):
+            pass
+
+    st.llm_provider = FailingProvider()
+    notifications = []
+    task = launch_llm_triage_for_state(st, notify_cb=lambda msg, t: notifications.append((msg, t)))
+    assert task is not None
+
+    await task
+
+    assert st.is_llm_running is False
+    assert st.llm_active_task is None
+    assert st.llm_partial_failure is True
+    assert occ.occ_id in st.llm_unprocessed_occ_ids

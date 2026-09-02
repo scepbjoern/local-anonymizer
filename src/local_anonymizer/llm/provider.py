@@ -8,6 +8,7 @@ import ipaddress
 import json
 import logging
 import re
+import time
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
@@ -171,8 +172,9 @@ def _parse_strict_json(body_bytes: bytes) -> Any:
 
 def parse_iso_expiry(expires_str: Optional[str]) -> float:
     """
-    Parse ISO expiry timestamp with timezone to UNIX epoch float.
-    Returns 0.0 if expires_str is missing or unparseable, preventing unverified infinite readiness.
+    Parse ISO expiry timestamp with explicit timezone to UNIX epoch float.
+    Returns 0.0 if expires_str is missing, unparseable, or naive (missing timezone),
+    preventing unverified or infinite readiness.
     """
     if not expires_str or not isinstance(expires_str, str):
         return 0.0
@@ -182,6 +184,9 @@ def parse_iso_expiry(expires_str: Optional[str]) -> float:
         if cleaned.endswith("Z"):
             cleaned = cleaned[:-1] + "+00:00"
         dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            # Naive timestamp without explicit timezone is rejected
+            return 0.0
         return dt.timestamp()
     except Exception:
         return 0.0
@@ -395,6 +400,15 @@ async def preload_ollama_model(
                     raise RuntimeError("Antwort von /api/generate ist kein gültiges JSON-Objekt.")
                 if "error" in gen_data and gen_data["error"]:
                     raise RuntimeError(f"Ollama meldete Fehler beim Vorladen: {gen_data['error']}")
+                if not gen_data.get("done", False):
+                    raise RuntimeError("Ollama Vorlade-Anfrage nicht abgeschlossen ('done' ist nicht True).")
+                resp_model = gen_data.get("model")
+                if resp_model:
+                    resp_model_str = resp_model.strip().lower()
+                    if resp_model_str not in (clean_name.lower(), target_tag.lower()):
+                        raise RuntimeError(
+                            f"Modell-Identitätskonflikt bei Vorladung: Angefordert '{target_tag}', aber Ollama antwortete mit '{resp_model}'."
+                        )
 
             # 2. Check /api/ps for active running model
             async with session.get(ps_endpoint, allow_redirects=False) as ps_resp:
@@ -443,6 +457,78 @@ async def preload_ollama_model(
             raise
         logger.warning(f"Preload failed: {type(e).__name__}")
         raise RuntimeError("Verbindung zu Ollama beim Vorladen unterbrochen.")
+
+
+async def verify_ollama_model_running(
+    base_url: str,
+    model_name: str,
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+    read_timeout: float = DEFAULT_READ_TIMEOUT,
+) -> Optional[PsModelInfo]:
+    """
+    Query GET /api/ps on local Ollama server to check if model is actively loaded in memory.
+    Returns PsModelInfo if active and unexpired, or None if unloaded/unreachable/expired.
+    """
+    try:
+        clean_url = validate_loopback_url(base_url)
+        clean_name = validate_model_name(model_name)
+    except Exception:
+        return None
+
+    target_tag = clean_name
+    try:
+        from local_anonymizer.llm.catalog import find_catalog_entry, CatalogError
+        cat_entry = find_catalog_entry(clean_name)
+        if cat_entry is not None:
+            target_tag = cat_entry.tested_tag
+    except CatalogError:
+        pass
+
+    root_url = derive_ollama_base_url(clean_url)
+    ps_endpoint = f"{root_url}/api/ps"
+
+    timeout = aiohttp.ClientTimeout(
+        total=connect_timeout + read_timeout,
+        connect=connect_timeout,
+        sock_read=read_timeout,
+    )
+
+    try:
+        async with aiohttp.ClientSession(trust_env=False, timeout=timeout) as session:
+            async with session.get(ps_endpoint, allow_redirects=False) as ps_resp:
+                if ps_resp.status != 200:
+                    return None
+                raw_ct = ps_resp.headers.get("Content-Type", "")
+                if not is_valid_json_mime(raw_ct):
+                    return None
+                body_bytes = await _read_limited_body(ps_resp, MAX_RESPONSE_BYTES)
+                ps_data = _parse_strict_json(body_bytes)
+                if not isinstance(ps_data, dict) or "models" not in ps_data or not isinstance(ps_data["models"], list):
+                    return None
+
+                clean_lower = clean_name.lower()
+                target_lower = target_tag.lower()
+
+                for rm in ps_data["models"]:
+                    if isinstance(rm, dict):
+                        rm_name = str(rm.get("name", "")).strip().lower()
+                        rm_model = str(rm.get("model", "")).strip().lower()
+                        if rm_name in (clean_lower, target_lower) or rm_model in (clean_lower, target_lower):
+                            expires_str = str(rm.get("expires_at", "")) if rm.get("expires_at") else None
+                            exp_ts = parse_iso_expiry(expires_str)
+                            if exp_ts <= 0.0 or time.time() >= exp_ts:
+                                return None
+                            return PsModelInfo(
+                                name=str(rm.get("name", clean_name)),
+                                model=str(rm.get("model", clean_name)),
+                                size=rm.get("size") if isinstance(rm.get("size"), int) else None,
+                                size_vram=rm.get("size_vram") if isinstance(rm.get("size_vram"), int) else None,
+                                expires_at=expires_str,
+                            )
+                return None
+    except Exception as exc:
+        logger.debug(f"verify_ollama_model_running exception: {exc}", exc_info=True)
+        return None
 
 
 async def test_generic_connection(

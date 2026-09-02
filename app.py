@@ -84,6 +84,7 @@ try:
         DiscoveryResult,
         PsModelInfo,
         parse_iso_expiry,
+        verify_ollama_model_running,
         PROVIDER_TYPE_OLLAMA,
         PROVIDER_TYPE_GENERIC,
     )
@@ -103,6 +104,7 @@ except ImportError:
     get_model_suitability_badge = None  # type: ignore
     CatalogError = Exception  # type: ignore
     parse_iso_expiry = lambda s: 0.0  # type: ignore
+    verify_ollama_model_running = None  # type: ignore
     PROVIDER_TYPE_OLLAMA = "ollama"
     PROVIDER_TYPE_GENERIC = "generic"
 
@@ -708,6 +710,208 @@ async def run_triage_batch_loop(
         if on_batch_complete:
             on_batch_complete()
         await asyncio.sleep(0.01)
+
+
+async def run_llm_triage_for_state(
+    state: "AppState",
+    triggered_from_analysis: bool = False,
+    notify_cb: Optional[Callable[[str, str], None]] = None,
+    on_batch_complete: Optional[Callable[[], None]] = None,
+) -> None:
+    """
+    Direct asynchronous execution worker for LLM triage.
+    Prepares batches, re-verifies live Ollama model presence, and executes the batch loop.
+    """
+    def notify(msg: str, type_: str = "info"):
+        if notify_cb:
+            notify_cb(msg, type_)
+        else:
+            try:
+                ui.notify(msg, type=type_)
+            except Exception:
+                pass
+
+    if not LLM_AVAILABLE:
+        notify("LLM-Paket nicht verfügbar. Bitte `pip install local-anonymizer[llm]` installieren.", "warning")
+        return
+
+    if not state.config.llm_enabled:
+        if not triggered_from_analysis:
+            notify("Lokale LLM-Review-Assistenz ist deaktiviert. Bitte in den Einstellungen aktivieren.", "info")
+        return
+
+    if not state.config.llm_model_name or not state.config.llm_model_name.strip():
+        notify("Bitte geben Sie einen Modellnamen in den LLM-Einstellungen an (z. B. qwen3:8b).", "warning")
+        return
+
+    if not state.raw_text or not state.entity_groups:
+        if not triggered_from_analysis:
+            notify("Keine analysierten Fundstellen vorhanden.", "info")
+        return
+
+    candidates = []
+    for g in state.entity_groups:
+        if not g.enabled:
+            continue
+        for occ in g.occurrences:
+            ctx_snippet = strip_html_markup(occ.context_html) if occ.context_html else g.original_text
+            candidates.append({
+                "occ_id": occ.occ_id,
+                "original_text": g.original_text,
+                "entity_type": g.entity_type,
+                "role": g.role,
+                "context_snippet": ctx_snippet,
+            })
+
+    if not candidates:
+        if not triggered_from_analysis:
+            notify("Keine aktiven Fundstellen zum Prüfen gefunden.", "info")
+        return
+
+    snapshot_hash = compute_triage_snapshot(state.raw_text, state.analysis_revision, state.entity_groups) if compute_triage_snapshot else ""
+    batches = prepare_triage_batches(candidates, state.document_revision, snapshot_hash) if prepare_triage_batches else []
+
+    # Re-verify readiness against /api/ps if claimed ready
+    if state.llm_ready_info is not None and state.llm_provider_type == "ollama" and verify_ollama_model_running is not None:
+        active_info = await verify_ollama_model_running(state.config.llm_base_url, state.config.llm_model_name)
+        if active_info is None:
+            state.invalidate_llm_ready()
+
+    try:
+        if (
+            state.llm_provider is None
+            or getattr(state.llm_provider, "model_name", "") != state.config.llm_model_name.strip()
+            or getattr(state.llm_provider, "base_url", "") != state.config.llm_base_url.strip()
+        ):
+            if state.llm_provider is not None:
+                await state.close_llm_provider()
+            state.llm_provider = LocalApiProvider(
+                base_url=state.config.llm_base_url,
+                model_name=state.config.llm_model_name,
+            )
+    except Exception as e:
+        notify(f"Fehler bei LLM-Initialisierung: {e}", "negative")
+        return
+
+    state.llm_partial_failure = False
+    state.llm_unprocessed_occ_ids.clear()
+    state.llm_triage_results.clear()
+    state.llm_staged_selections.clear()
+    state.llm_triage_snapshot = snapshot_hash
+
+    if on_batch_complete:
+        on_batch_complete()
+
+    notify(f"Starte LLM-Triage ({len(candidates)} Fundstellen in {len(batches)} Batches)...", "info")
+
+    try:
+        await run_triage_batch_loop(
+            state,
+            batches,
+            snapshot_hash,
+            on_batch_complete=on_batch_complete,
+        )
+
+        if state.llm_partial_failure:
+            notify(
+                f"LLM-Triage unvollständig ({len(state.llm_triage_results)} geprüft, {len(state.llm_unprocessed_occ_ids)} ungeprüft).",
+                "warning",
+            )
+        else:
+            notify(f"LLM-Triage abgeschlossen ({len(state.llm_triage_results)} Fundstellen geprüft).", "positive")
+
+    except asyncio.CancelledError:
+        notify("LLM-Triage abgebrochen.", "info")
+        state.llm_triage_results.clear()
+        state.llm_triage_snapshot = ""
+        state.llm_staged_selections.clear()
+    except Exception as e:
+        notify(f"Fehler bei LLM-Triage: {e}", "negative")
+
+
+def launch_llm_triage_for_state(
+    state: "AppState",
+    triggered_from_analysis: bool = False,
+    notify_cb: Optional[Callable[[str, str], None]] = None,
+    on_update_ui: Optional[Callable[[], None]] = None,
+    client: Any = None,
+) -> Optional[asyncio.Task]:
+    """
+    Synchronously validate preconditions and atomically launch LLM triage in a background task.
+    """
+    def notify(msg: str, type_: str = "info"):
+        if notify_cb:
+            notify_cb(msg, type_)
+        else:
+            try:
+                ui.notify(msg, type=type_)
+            except Exception:
+                pass
+
+    if state.is_llm_running or (state.llm_active_task and not state.llm_active_task.done()):
+        if not triggered_from_analysis:
+            notify("Eine LLM-Prüfung läuft bereits.", "info")
+        return state.llm_active_task
+
+    if state.llm_setup_state != "idle":
+        if not triggered_from_analysis:
+            notify("LLM-Prüfung kann während laufendem Setup nicht gestartet werden.", "warning")
+        return None
+
+    if state.is_analyzing and not triggered_from_analysis:
+        notify("LLM-Prüfung kann während laufender Textanalyse nicht gestartet werden.", "warning")
+        return None
+
+    if not LLM_AVAILABLE:
+        notify("LLM-Paket nicht verfügbar. Bitte `pip install local-anonymizer[llm]` installieren.", "warning")
+        return None
+
+    if not state.config.llm_enabled:
+        if not triggered_from_analysis:
+            notify("Lokale LLM-Review-Assistenz ist deaktiviert. Bitte in den Einstellungen aktivieren.", "info")
+        return None
+
+    if not state.config.llm_model_name or not state.config.llm_model_name.strip():
+        notify("Bitte geben Sie einen Modellnamen in den LLM-Einstellungen an (z. B. qwen3:8b).", "warning")
+        return None
+
+    if not state.raw_text or not state.entity_groups:
+        if not triggered_from_analysis:
+            notify("Keine analysierten Fundstellen vorhanden.", "info")
+        return None
+
+    # Synchronously lock busy state and transfer ownership from analysis
+    state.is_analyzing = False
+    state.is_llm_running = True
+
+    if on_update_ui:
+        on_update_ui()
+
+    async def _runner():
+        try:
+            if client is not None:
+                with client:
+                    await run_llm_triage_for_state(
+                        state,
+                        triggered_from_analysis=triggered_from_analysis,
+                        notify_cb=notify_cb,
+                        on_batch_complete=on_update_ui,
+                    )
+            else:
+                await run_llm_triage_for_state(
+                    state,
+                    triggered_from_analysis=triggered_from_analysis,
+                    notify_cb=notify_cb,
+                    on_batch_complete=on_update_ui,
+                )
+        finally:
+            state.is_llm_running = False
+            state.llm_active_task = None
+            if on_update_ui:
+                on_update_ui()
+
+    state.llm_active_task = asyncio.create_task(_runner())
+    return state.llm_active_task
 
 
 async def load_document_into_state_async(
@@ -2309,15 +2513,17 @@ def create_ui(client: Optional[Client] = None):
 
                 expiry_ts = parse_iso_expiry(getattr(ps_info, "expires_at", None))
                 if expiry_ts <= 0.0:
-                    expiry_ts = time.time() + 300.0
-
-                state.llm_ready_info = ps_info
-                state.llm_ready_timestamp = time.time()
-                state.llm_ready_expires_at = expiry_ts
-                state.llm_ready_bound_url = url_snap
-                state.llm_ready_bound_model = model_snap
-                state.llm_setup_status_msg = "Modell bereit"
-                ui.notify(f"Modell '{model_snap}' erfolgreich in Ollama geladen.", type="positive")
+                    state.invalidate_llm_ready()
+                    state.llm_setup_status_msg = "Bereitschaft nicht verifizierbar"
+                    ui.notify(f"Modell '{model_snap}' geladen, aber Ablaufzeit nicht verifizierbar.", type="warning")
+                else:
+                    state.llm_ready_info = ps_info
+                    state.llm_ready_timestamp = time.time()
+                    state.llm_ready_expires_at = expiry_ts
+                    state.llm_ready_bound_url = url_snap
+                    state.llm_ready_bound_model = model_snap
+                    state.llm_setup_status_msg = "Modell bereit"
+                    ui.notify(f"Modell '{model_snap}' erfolgreich in Ollama geladen.", type="positive")
             except asyncio.CancelledError:
                 pass
             except Exception as ex:
@@ -2657,8 +2863,6 @@ def create_ui(client: Optional[Client] = None):
 
             # Check if LLM review should immediately chain into execution (Decision 1 from Handoff 1316)
             if state.config.llm_enabled and state.config.llm_auto_review and LLM_AVAILABLE and state.entity_groups:
-                state.is_analyzing = False
-                await asyncio.sleep(0.05)
                 task = launch_llm_triage(triggered_from_analysis=True)
                 if task is not None:
                     try:
@@ -2683,40 +2887,22 @@ def create_ui(client: Optional[Client] = None):
             if progress_holder:
                 progress_holder.clear()
 
+    def update_triage_ui():
+        set_mutating_controls_disabled(state.is_busy)
+        if llm_panel_holder is not None:
+            build_llm_panel()
+        if table_holder is not None:
+            build_review_table()
+
     def launch_llm_triage(triggered_from_analysis: bool = False) -> Optional[asyncio.Task]:
         """Central launcher for LLM triage runs, creating exactly one tracked task in state.llm_active_task."""
-        if state.is_llm_running or (state.llm_active_task and not state.llm_active_task.done()):
-            if not triggered_from_analysis:
-                ui.notify("Eine LLM-Prüfung läuft bereits.", type="info")
-            return state.llm_active_task
-
-        if state.llm_setup_state != "idle":
-            if not triggered_from_analysis:
-                ui.notify("LLM-Prüfung kann während laufendem Setup nicht gestartet werden.", type="warning")
-            return None
-
-        if state.is_analyzing and not triggered_from_analysis:
-            ui.notify("LLM-Prüfung kann während laufender Textanalyse nicht gestartet werden.", type="warning")
-            return None
-
-        # Synchronously lock busy state before creating task
-        state.is_llm_running = True
-        set_mutating_controls_disabled(True)
-
-        async def _runner():
-            try:
-                if client is not None:
-                    with client:
-                        await run_llm_triage(triggered_from_analysis=triggered_from_analysis)
-                else:
-                    await run_llm_triage(triggered_from_analysis=triggered_from_analysis)
-            finally:
-                state.is_llm_running = False
-                state.llm_active_task = None
-                set_mutating_controls_disabled(False)
-
-        state.llm_active_task = asyncio.create_task(_runner())
-        return state.llm_active_task
+        return launch_llm_triage_for_state(
+            state,
+            triggered_from_analysis=triggered_from_analysis,
+            notify_cb=lambda msg, t: ui.notify(msg, type=t),
+            on_update_ui=update_triage_ui,
+            client=client,
+        )
 
     def check_mutation_allowed() -> bool:
         """Central guard against mutating state while analysis, LLM triage or setup is running."""
@@ -3133,110 +3319,6 @@ def create_ui(client: Optional[Client] = None):
                                     apply_bulk_btn.tooltip("Sammelübernahme bei unvollständigem Gesamtlauf gesperrt. Bitte Einzelübernahmen nutzen.")
 
                     render_proposal_categories(keep_items, recat_items, discard_items)
-
-    async def run_llm_triage(triggered_from_analysis: bool = False):
-        if state.is_llm_running:
-            ui.notify("Eine LLM-Prüfung läuft bereits.", type="info")
-            return
-
-        if not LLM_AVAILABLE:
-            ui.notify("LLM-Paket nicht verfügbar. Bitte `pip install local-anonymizer[llm]` installieren.", type="warning")
-            return
-
-        if not state.config.llm_enabled:
-            if not triggered_from_analysis:
-                ui.notify("Lokale LLM-Review-Assistenz ist deaktiviert. Bitte in den Einstellungen aktivieren.", type="info")
-            return
-
-        if not state.config.llm_model_name or not state.config.llm_model_name.strip():
-            ui.notify("Bitte geben Sie einen Modellnamen in den LLM-Einstellungen an (z. B. qwen3:8b).", type="warning")
-            return
-
-        if not state.raw_text or not state.entity_groups:
-            if not triggered_from_analysis:
-                ui.notify("Keine analysierten Fundstellen vorhanden.", type="info")
-            return
-
-        candidates = []
-        for g in state.entity_groups:
-            if not g.enabled:
-                continue
-            for occ in g.occurrences:
-                ctx_snippet = strip_html_markup(occ.context_html) if occ.context_html else g.original_text
-                candidates.append({
-                    "occ_id": occ.occ_id,
-                    "original_text": g.original_text,
-                    "entity_type": g.entity_type,
-                    "role": g.role,
-                    "context_snippet": ctx_snippet,
-                })
-
-        if not candidates:
-            if not triggered_from_analysis:
-                ui.notify("Keine aktiven Fundstellen zum Prüfen gefunden.", type="info")
-            return
-
-        snapshot_hash = compute_triage_snapshot(state.raw_text, state.analysis_revision, state.entity_groups)
-        batches = prepare_triage_batches(candidates, state.document_revision, snapshot_hash)
-
-        try:
-            if (
-                state.llm_provider is None
-                or getattr(state.llm_provider, "model_name", "") != state.config.llm_model_name.strip()
-                or getattr(state.llm_provider, "base_url", "") != state.config.llm_base_url.strip()
-            ):
-                if state.llm_provider is not None:
-                    await state.close_llm_provider()
-                state.llm_provider = LocalApiProvider(
-                    base_url=state.config.llm_base_url,
-                    model_name=state.config.llm_model_name,
-                )
-        except Exception as e:
-            ui.notify(f"Fehler bei LLM-Initialisierung: {e}", type="negative")
-            return
-
-        state.is_llm_running = True
-        state.llm_partial_failure = False
-        state.llm_unprocessed_occ_ids.clear()
-        state.llm_triage_results.clear()
-        state.llm_staged_selections.clear()
-        state.llm_triage_snapshot = snapshot_hash
-
-        set_mutating_controls_disabled(True)
-        build_llm_panel()
-        build_review_table()
-
-        ui.notify(f"Starte LLM-Triage ({len(candidates)} Fundstellen in {len(batches)} Batches)...", type="info")
-
-        try:
-            await run_triage_batch_loop(
-                state,
-                batches,
-                snapshot_hash,
-                on_batch_complete=build_llm_panel,
-            )
-
-            if state.llm_partial_failure:
-                ui.notify(
-                    f"LLM-Triage unvollständig ({len(state.llm_triage_results)} geprüft, {len(state.llm_unprocessed_occ_ids)} ungeprüft).",
-                    type="warning",
-                )
-            else:
-                ui.notify(f"LLM-Triage abgeschlossen ({len(state.llm_triage_results)} Fundstellen geprüft).", type="positive")
-
-        except asyncio.CancelledError:
-            ui.notify("LLM-Triage abgebrochen.", type="info")
-            state.llm_triage_results.clear()
-            state.llm_triage_snapshot = ""
-            state.llm_staged_selections.clear()
-        except Exception as e:
-            ui.notify(f"Fehler bei LLM-Triage: {e}", type="negative")
-        finally:
-            state.is_llm_running = False
-            state.llm_active_task = None
-            set_mutating_controls_disabled(False)
-            build_llm_panel()
-            build_review_table()
 
     def get_sorted_groups() -> List[EntityGroup]:
         """Return entity groups sorted according to user selection."""
@@ -4794,12 +4876,25 @@ def create_ui(client: Optional[Client] = None):
 
                         asyncio.create_task(load_and_render())
 
-    def check_readiness_expiry():
-        if state.llm_ready_info is not None and state.llm_ready_expires_at > 0.0:
-            if time.time() >= state.llm_ready_expires_at:
+    async def check_readiness_expiry():
+        if state.llm_ready_info is not None:
+            if state.llm_ready_expires_at > 0.0 and time.time() >= state.llm_ready_expires_at:
                 state.invalidate_llm_ready()
                 build_llm_setup_panel()
                 build_llm_panel()
+                return
+
+            if state.llm_setup_state == "idle" and not state.is_llm_running and state.llm_provider_type == "ollama" and verify_ollama_model_running is not None:
+                url_snap = state.config.llm_base_url.strip()
+                model_snap = state.config.llm_model_name.strip()
+                try:
+                    active_info = await verify_ollama_model_running(url_snap, model_snap)
+                    if active_info is None and state.llm_ready_info is not None:
+                        state.invalidate_llm_ready()
+                        build_llm_setup_panel()
+                        build_llm_panel()
+                except Exception:
+                    pass
 
     ui.timer(2.0, check_readiness_expiry)
 
