@@ -138,7 +138,7 @@ class AppConfig:
         config.llm_auto_review = bool(data.get("llm_auto_review", True))
         return config
 
-    def save(self) -> None:
+    def save(self) -> bool:
         """
         Save global settings to manifest.json and active project profile.
         Falls back to logging an error if ProfileStore is unavailable.
@@ -150,6 +150,7 @@ class AppConfig:
             store = ProfileStore(CONFIG_DIR)
             store.initialize_or_migrate()
             manifest = store.load_manifest()
+            manifest_revision = int(manifest["revision"])
             manifest.update(
                 {
                     "format_mode": self.format_mode,
@@ -166,7 +167,7 @@ class AppConfig:
                     "llm_auto_review": self.llm_auto_review,
                 }
             )
-            store.save_manifest(manifest)
+            store.save_manifest(manifest, expected_revision=manifest_revision)
 
             active_id = manifest.get("active_project_id")
             if active_id:
@@ -217,13 +218,14 @@ class AppConfig:
                                     i_terms[k] = ScopedTerm(term=it_text, term_key=k)
                         proj.ignore_terms = i_terms
 
-                    store.save_project_profile(proj)
+                    store.save_project_profile(proj, expected_revision=proj.revision)
                 except Exception as ex:
-                    logger.warning(
-                        f"Could not save active project profile during AppConfig.save: {ex}"
-                    )
+                    logger.warning(f"Could not save active project profile during AppConfig.save: {ex}")
+                    raise
+            return True
         except Exception as e:
             logging.error(f"Failed to save config: {e}")
+            return False
 
     @classmethod
     def load(cls) -> "AppConfig":

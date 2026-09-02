@@ -1606,3 +1606,176 @@ class ProfileStore:
                 migrated_legacy.unlink(missing_ok=True)
                 count += 1
             return count
+
+
+class DirtyOverlayError(RuntimeError):
+    """Raised when a document overlay would be lost without explicit discard."""
+
+
+class ProfileController:
+    """Single mutation boundary for durable profiles and volatile overlays."""
+
+    def __init__(self, store: ProfileStore, active_project_id: Optional[str] = None):
+        self.store = store
+        self.available_entities = set(store.available_entities)
+        self.manifest: Dict[str, Any] = {}
+        self.system_profile: SystemProfile
+        self.project_profile: ProjectProfile
+        self.document_overlay = DocumentProfileOverlay()
+        self.reload(active_project_id=active_project_id)
+
+    @staticmethod
+    def _clone_profile(profile: Any) -> Any:
+        if isinstance(profile, SystemProfile):
+            return SystemProfile.from_dict(profile.to_dict(), set(AVAILABLE_ENTITIES))
+        if isinstance(profile, ProjectProfile):
+            return ProjectProfile.from_dict(profile.to_dict(), set(AVAILABLE_ENTITIES))
+        raise TypeError(f"Unsupported profile type: {type(profile)!r}")
+
+    @staticmethod
+    def _scope(scope: Any) -> ScopeLevel:
+        if isinstance(scope, ScopeLevel):
+            return scope
+        try:
+            return ScopeLevel(str(scope))
+        except ValueError as ex:
+            raise ValueError(f"Unknown profile scope: {scope!r}") from ex
+
+    def reload(self, active_project_id: Optional[str] = None) -> None:
+        self.manifest = self.store.load_manifest()
+        self.system_profile = self.store.load_system_profile()
+        project_id = active_project_id or self.manifest["active_project_id"]
+        self.project_profile = self.store.load_project_profile(project_id)
+        self.document_overlay = DocumentProfileOverlay()
+
+    def effective_config(self) -> EffectiveConfig:
+        return ScopeResolutionEngine.resolve(
+            self.system_profile, self.project_profile, self.document_overlay, self.available_entities
+        )
+
+    def discard_overlay(self) -> DocumentProfileOverlay:
+        previous_revision = self.document_overlay.overlay_revision
+        self.document_overlay = DocumentProfileOverlay(overlay_revision=previous_revision + 1)
+        return self.document_overlay
+
+    def switch_project(self, project_id: str, discard_overlay: bool = False) -> ProjectProfile:
+        if self.document_overlay.dirty and not discard_overlay:
+            raise DirtyOverlayError("Document overlay contains unsaved changes")
+        if discard_overlay:
+            self.discard_overlay()
+        project = self.store.load_project_profile(project_id)
+        manifest = dict(self.manifest)
+        expected_revision = int(manifest["revision"])
+        manifest["active_project_id"] = project.project_id
+        self.manifest = self.store.save_manifest(manifest, expected_revision=expected_revision)
+        self.project_profile = project
+        return project
+
+    def _touch_overlay(self) -> None:
+        self.document_overlay.dirty = True
+        self.document_overlay.overlay_revision += 1
+
+    def set_entity_mode(self, scope: Any, entity: str, mode: str) -> None:
+        scope_level = self._scope(scope)
+        if entity not in self.available_entities or mode not in VALID_ENTITY_MODES:
+            raise ValueError(f"Invalid entity mode: {entity}={mode}")
+        if scope_level == ScopeLevel.PROJECT:
+            self.project_profile.entity_modes[entity] = mode
+        elif scope_level == ScopeLevel.DOCUMENT:
+            self.document_overlay.entity_modes[entity] = mode
+            self._touch_overlay()
+        else:
+            raise ValueError("Entity modes are supported in project or document scope only")
+
+    def _term_target(self, scope: ScopeLevel, glossary: bool) -> Dict[str, ScopedTerm]:
+        if scope == ScopeLevel.SYSTEM:
+            target = self.system_profile
+        elif scope == ScopeLevel.PROJECT:
+            target = self.project_profile
+        elif scope == ScopeLevel.DOCUMENT:
+            target = self.document_overlay
+        else:
+            raise ValueError("App-default terms are read-only")
+        return getattr(target, "glossary_terms" if glossary else "ignore_terms")
+
+    def upsert_glossary(self, scope: Any, term: str, entity_type: str, role: Optional[str] = None) -> ScopedTerm:
+        scope_level = self._scope(scope)
+        term_value = validate_clean_string(term, "term", 200, allow_empty=False).strip()
+        entity_value = entity_type.strip().upper()
+        if entity_value not in self.available_entities:
+            raise ValueError(f"Invalid glossary entity type: {entity_type!r}")
+        role_value = role.strip() if isinstance(role, str) and role.strip() else None
+        item = ScopedTerm(term_value, normalize_term_key(term_value), entity_value, role_value)
+        item.validate(self.available_entities, is_ignore_term=False)
+        self._term_target(scope_level, glossary=True)[item.term_key] = item
+        if scope_level == ScopeLevel.DOCUMENT:
+            self._touch_overlay()
+        return item
+
+    def upsert_ignore(self, scope: Any, term: str) -> ScopedTerm:
+        scope_level = self._scope(scope)
+        term_value = validate_clean_string(term, "term", 200, allow_empty=False).strip()
+        item = ScopedTerm(term_value, normalize_term_key(term_value))
+        item.validate(self.available_entities, is_ignore_term=True)
+        self._term_target(scope_level, glossary=False)[item.term_key] = item
+        if scope_level == ScopeLevel.DOCUMENT:
+            self._touch_overlay()
+        return item
+
+    def remove_term(self, scope: Any, term: str, glossary: bool) -> None:
+        scope_level = self._scope(scope)
+        self._term_target(scope_level, glossary=glossary).pop(normalize_term_key(term), None)
+        if scope_level == ScopeLevel.DOCUMENT:
+            self._touch_overlay()
+
+    def disable_inherited(self, scope: Any, term: str, glossary: bool, disabled: bool = True) -> None:
+        scope_level = self._scope(scope)
+        if scope_level not in (ScopeLevel.PROJECT, ScopeLevel.DOCUMENT):
+            raise ValueError("Inherited terms can only be disabled in project or document scope")
+        target = self.project_profile if scope_level == ScopeLevel.PROJECT else self.document_overlay
+        field_name = "disabled_inherited_glossary" if glossary else "disabled_inherited_ignore"
+        values = getattr(target, field_name)
+        key = normalize_term_key(term)
+        (values.add if disabled else values.discard)(key)
+        if scope_level == ScopeLevel.DOCUMENT:
+            self._touch_overlay()
+
+    def save_system(self, expected_revision: Optional[int] = None) -> SystemProfile:
+        expected = self.system_profile.revision if expected_revision is None else expected_revision
+        self.system_profile = self.store.save_system_profile(
+            self._clone_profile(self.system_profile), expected_revision=expected
+        )
+        return self.system_profile
+
+    def save_project(self, expected_revision: Optional[int] = None) -> ProjectProfile:
+        expected = self.project_profile.revision if expected_revision is None else expected_revision
+        self.project_profile = self.store.save_project_profile(
+            self._clone_profile(self.project_profile), expected_revision=expected
+        )
+        return self.project_profile
+
+    def acknowledge_warning(self, expected_revision: Optional[int] = None) -> Dict[str, Any]:
+        expected = int(self.manifest["revision"] if expected_revision is None else expected_revision)
+        manifest = dict(self.manifest)
+        manifest["warning_acknowledged_version"] = 1
+        self.manifest = self.store.save_manifest(manifest, expected_revision=expected)
+        return self.manifest
+
+    def warning_required(self) -> bool:
+        return int(self.manifest.get("warning_acknowledged_version", 0)) < 1
+
+    def list_all_templates(self) -> List[CategoryTemplate]:
+        return self.store.list_all_templates()
+
+    def save_custom_template(self, template: CategoryTemplate, expected_revision: Optional[int] = None) -> CategoryTemplate:
+        return self.store.save_custom_template(template, expected_revision=expected_revision)
+
+    def apply_template(self, template_id: str, expected_revision: Optional[int] = None) -> ProjectProfile:
+        expected = self.project_profile.revision if expected_revision is None else expected_revision
+        self.project_profile = self.store.apply_template_to_project(
+            self.project_profile.project_id, template_id, expected_revision=expected
+        )
+        return self.project_profile
+
+    def delete_custom_template(self, template_id: str) -> None:
+        self.store.delete_custom_template(template_id)

@@ -48,8 +48,12 @@ from local_anonymizer.config import (
 from local_anonymizer.profiles import (
     CategoryTemplate,
     DocumentProfileOverlay,
+    EffectiveConfig,
+    ProfileController,
     ProfileStore,
+    RevisionConflictError,
     ScopedTerm,
+    ScopeLevel,
     ScopeResolutionEngine,
     get_builtin_templates,
     normalize_term_key,
@@ -650,6 +654,13 @@ def reset_app_state(st: "AppState") -> None:
     st.llm_unprocessed_occ_ids.clear()
     st.llm_provider = None
     st.invalidate_llm_ready()
+    # A document reset starts a fresh transient scope. Durable project/system
+    # profiles remain untouched.
+    if getattr(st, "profile_controller", None) is not None:
+        st.document_overlay = st.profile_controller.discard_overlay()
+    else:
+        st.document_overlay = DocumentProfileOverlay()
+    st.refresh_effective_config()
 
 
 async def reset_app_state_async(st: "AppState") -> None:
@@ -928,6 +939,16 @@ def launch_llm_triage_for_state(
             notify("Keine analysierten Fundstellen vorhanden.", "info")
         return None
 
+    if state.analyzed_config_hash is not None and (
+        state.preview_stale
+        or (
+            state.effective_config is not None
+            and state.analyzed_config_hash != state.effective_config.snapshot_hash
+        )
+    ):
+        notify("LLM-Triage gesperrt: Die Konfiguration wurde seit der Analyse geändert. Bitte zuerst neu analysieren.", "warning")
+        return None
+
     # Synchronously lock busy state and transfer ownership from analysis
     state.is_analyzing = False
     state.is_llm_running = True
@@ -1063,16 +1084,21 @@ class AppState:
     def __init__(self):
         self.config: AppConfig = AppConfig.load()
         self.profile_store = ProfileStore(CONFIG_DIR)
+        self.profile_controller: Optional[ProfileController] = None
         try:
             self.profile_store.initialize_or_migrate()
-            manifest = self.profile_store.load_manifest()
-            self.system_profile = self.profile_store.load_system_profile()
-            self.project_profile = self.profile_store.load_project_profile(manifest["active_project_id"])
+            self.profile_controller = ProfileController(self.profile_store)
+            self.system_profile = self.profile_controller.system_profile
+            self.project_profile = self.profile_controller.project_profile
         except Exception as ex:
             logging.warning("Could not load profile scopes; using AppConfig compatibility state: %s", ex)
             self.system_profile = None
             self.project_profile = None
-        self.document_overlay = DocumentProfileOverlay()
+        self.document_overlay = (
+            self.profile_controller.document_overlay
+            if self.profile_controller is not None
+            else DocumentProfileOverlay()
+        )
         self.effective_config = None
         self.filename: str = ""
         self.raw_text: str = ""
@@ -1168,11 +1194,19 @@ class AppState:
 
     def refresh_effective_config(self, reload_profiles: bool = False) -> Any:
         """Rebuild the immutable profile snapshot and update stale-result state."""
+        if self.profile_controller is not None:
+            self.profile_controller.system_profile = self.system_profile
+            self.profile_controller.project_profile = self.project_profile
+            self.profile_controller.document_overlay = self.document_overlay
         if reload_profiles and self.project_profile is not None:
             try:
                 manifest = self.profile_store.load_manifest()
                 self.system_profile = self.profile_store.load_system_profile()
                 self.project_profile = self.profile_store.load_project_profile(manifest["active_project_id"])
+                if self.profile_controller is not None:
+                    self.profile_controller.manifest = manifest
+                    self.profile_controller.system_profile = self.system_profile
+                    self.profile_controller.project_profile = self.project_profile
             except Exception as ex:
                 logging.warning("Could not reload profile scopes: %s", ex)
         if self.system_profile is not None and self.project_profile is not None:
@@ -1340,20 +1374,23 @@ def parse_ignore_terms(text: str) -> List[str]:
     return terms
 
 
-def build_anonymizer(app_state: Optional[AppState] = None):
+def build_anonymizer(
+    app_state: Optional[AppState] = None,
+    effective_config: Optional[EffectiveConfig] = None,
+):
     """Build LocalAnonymizer instance with specified state settings or loaded config."""
     from local_anonymizer.anonymizer import LocalAnonymizer
 
     if app_state is not None:
-        glossary = parse_glossary(app_state.glossary_text)
-        glossary_roles = parse_glossary_roles(app_state.glossary_text)
-        ignore_terms = parse_ignore_terms(app_state.ignore_terms_text)
-        general_entities, glossary_entities = get_recognizer_entities(app_state.entity_modes)
+        snapshot = effective_config or app_state.effective_config
+        if snapshot is None:
+            raise RuntimeError("No EffectiveConfig snapshot available for anonymizer construction")
+        general_entities, glossary_entities = get_recognizer_entities(dict(snapshot.entity_modes))
         return LocalAnonymizer(
             language="de",
-            glossary=glossary,
-            glossary_roles=glossary_roles,
-            ignore_terms=ignore_terms,
+            glossary=dict(snapshot.glossary),
+            glossary_roles=dict(snapshot.glossary_roles),
+            ignore_terms=list(snapshot.ignore_terms),
             enabled_entities=general_entities,
             enabled_glossary_entities=glossary_entities,
             gliner_model=app_state.gliner_model_name,
@@ -1361,7 +1398,7 @@ def build_anonymizer(app_state: Optional[AppState] = None):
             enable_eupii=app_state.enable_eupii,
             eupii_threshold=app_state.eupii_threshold,
             eupii_model=app_state.eupii_model_name,
-            entity_modes=app_state.entity_modes,
+            entity_modes=dict(snapshot.entity_modes),
         )
     else:
         cfg = AppConfig.load()
@@ -1383,7 +1420,11 @@ def build_anonymizer(app_state: Optional[AppState] = None):
         )
 
 
-def sync_cached_anonymizer_settings(anon, app_state: "AppState") -> None:
+def sync_cached_anonymizer_settings(
+    anon,
+    app_state: "AppState",
+    effective_config: Optional[EffectiveConfig] = None,
+) -> None:
     """
     Push the current UI-configured settings (entity modes, threshold, ignore terms, glossary)
     onto an already-built LocalAnonymizer instance, so a cached instance stays in sync with
@@ -1393,25 +1434,30 @@ def sync_cached_anonymizer_settings(anon, app_state: "AppState") -> None:
     glossary update silently wrote to a dead `.terms` attribute instead of the real `.glossary`
     for a while without anyone noticing.
     """
-    general_entities, glossary_entities = get_recognizer_entities(app_state.entity_modes)
+    snapshot = effective_config or app_state.effective_config
+    if snapshot is None:
+        raise RuntimeError("No EffectiveConfig snapshot available for anonymizer synchronization")
+    general_entities, glossary_entities = get_recognizer_entities(dict(snapshot.entity_modes))
     anon.enabled_entities = general_entities
     anon.enabled_glossary_entities = glossary_entities
     anon.gliner_recognizer.threshold = app_state.gliner_threshold
     anon.set_eupii_enabled(app_state.enable_eupii, app_state.eupii_threshold)
-    anon.set_entity_modes(app_state.entity_modes)
-    anon.set_ignore_terms(parse_ignore_terms(app_state.ignore_terms_text))
-    new_glossary = parse_glossary(app_state.glossary_text)
-    anon.set_glossary(new_glossary, glossary_roles=parse_glossary_roles(app_state.glossary_text))
+    anon.set_entity_modes(dict(snapshot.entity_modes))
+    anon.set_ignore_terms(list(snapshot.ignore_terms))
+    anon.set_glossary(dict(snapshot.glossary), glossary_roles=dict(snapshot.glossary_roles))
 
 
-def get_synced_cached_anonymizer(app_state: "AppState"):
+def get_synced_cached_anonymizer(
+    app_state: "AppState",
+    effective_config: Optional[EffectiveConfig] = None,
+):
     """Return the shared cached LocalAnonymizer, building it if needed and syncing it to the
     current UI settings. Must be called while holding `_model_lock`."""
     global _cached_anonymizer
     if _cached_anonymizer is None:
-        _cached_anonymizer = build_anonymizer(app_state)
+        _cached_anonymizer = build_anonymizer(app_state, effective_config=effective_config)
     else:
-        sync_cached_anonymizer_settings(_cached_anonymizer, app_state)
+        sync_cached_anonymizer_settings(_cached_anonymizer, app_state, effective_config=effective_config)
     return _cached_anonymizer
 
 
@@ -1654,6 +1700,59 @@ if not is_pdf_worker():
 
 def save_current_config(st: AppState):
     """Save user modifications back to persistent config."""
+    manifest = st.profile_store.load_manifest()
+    warning_required = int(manifest.get("warning_acknowledged_version", 0)) < 1
+    if warning_required and not getattr(st, "_profile_warning_confirmed", False):
+        if getattr(st, "_profile_warning_dialog_open", False):
+            return False
+        st._profile_warning_dialog_open = True
+        understood = {"value": False}
+        with ui.dialog() as warning_dialog, ui.card().classes("p-5 max-w-xl bg-white rounded-xl shadow-xl"):
+            ui.label("⚠️ Wichtiger Hinweis zur lokalen Datenspeicherung").classes("text-lg font-bold text-slate-800")
+            ui.markdown(
+                "Profile, Begriffe, Rollen und Ignore-Einträge werden lokal im Benutzerordner gespeichert, "
+                "standardmässig unverschlüsselt. BitLocker/FileVault schützt nur das Gerät im ausgeschalteten "
+                "Zustand; andere Programme bei entsperrter Sitzung können die Dateien lesen. Eine Cloud-Synchronisation "
+                "kann Kopien ausserhalb dieses Geräts erzeugen."
+            ).classes("text-sm text-slate-700 leading-relaxed mt-2")
+            confirmation = ui.checkbox("Ich habe diesen Hinweis verstanden und möchte fortfahren.")
+            with ui.row().classes("w-full justify-end gap-2 mt-3"):
+                def cancel_warning() -> None:
+                    st._profile_warning_dialog_open = False
+                    warning_dialog.close()
+
+                def confirm_warning() -> None:
+                    if not confirmation.value:
+                        ui.notify("Bitte bestätige zuerst den Datenschutzhinweis.", type="warning")
+                        return
+                    try:
+                        current = st.profile_store.load_manifest()
+                        saved_manifest = dict(current)
+                        saved_manifest["warning_acknowledged_version"] = 1
+                        saved_manifest = st.profile_store.save_manifest(
+                            saved_manifest, expected_revision=int(current["revision"])
+                        )
+                        if st.profile_controller is not None:
+                            st.profile_controller.manifest = saved_manifest
+                        st._profile_warning_confirmed = True
+                        st._profile_warning_dialog_open = False
+                        warning_dialog.close()
+                        save_current_config(st)
+                    except RevisionConflictError:
+                        st._profile_warning_dialog_open = False
+                        warning_dialog.close()
+                        ui.notify("Speichern abgebrochen: Der Hinweisstatus wurde extern geändert. Bitte erneut versuchen.", type="warning")
+                    except Exception as ex:
+                        st._profile_warning_dialog_open = False
+                        warning_dialog.close()
+                        ui.notify(f"Datenschutzhinweis konnte nicht bestätigt werden: {ex}", type="negative")
+
+                ui.button("Abbrechen", on_click=cancel_warning).props("flat")
+                ui.button("Bestätigen & Fortfahren", on_click=confirm_warning, color="primary").props("unelevated")
+        warning_dialog.open()
+        return False
+
+    st._profile_warning_confirmed = False
     st.config.format_mode = st.format_mode
     st.config.entity_modes = dict(st.entity_modes)
     st.config.active_entities = [
@@ -1668,20 +1767,34 @@ def save_current_config(st: AppState):
     st.config.ignore_terms = st.ignore_terms_text
     st.config.glossary = st.glossary_text
     st.config.export_format = st.export_format
-    st.config.save()
+    saved = st.config.save()
+    if not saved:
+        st.refresh_effective_config(reload_profiles=True)
+        try:
+            ui.notify("Speichern fehlgeschlagen: Das Profil wurde extern geändert. Die aktuelle Version wurde neu geladen.", type="warning", close_button=True)
+        except Exception:
+            pass
+        return False
     st.refresh_effective_config(reload_profiles=True)
+    return True
 
 
-async def ensure_models_downloaded_with_dialog(state: AppState) -> bool:
+async def ensure_models_downloaded_with_dialog(
+    state: AppState,
+    effective_config: Optional[EffectiveConfig] = None,
+) -> bool:
     """
     Ensure all AI models required by the current configuration are available in the local cache.
     If a model needs to be downloaded for the first time, prompts the user with an explicit
     confirmation dialog detailing download size, cache location, and offline privacy guarantees.
     Returns True if models are ready to use, False if cancelled or download failed.
     """
-    needs_gliner = any(m == ENTITY_MODE_ALL for m in state.entity_modes.values())
+    snapshot = effective_config or state.effective_config
+    if snapshot is None:
+        raise RuntimeError("No EffectiveConfig snapshot available for model selection")
+    needs_gliner = any(m == ENTITY_MODE_ALL for m in snapshot.entity_modes.values())
     needs_eupii = state.enable_eupii and any(
-        state.entity_modes.get(e) in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
+        snapshot.entity_modes.get(e) in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
         for e in ["PERSON", "LOCATION", "ID_NUMBER", "HEALTH_DATA"]
     )
 
@@ -1746,7 +1859,7 @@ async def ensure_models_downloaded_with_dialog(state: AppState) -> bool:
         try:
             def load_model():
                 with _model_lock:
-                    anon = get_synced_cached_anonymizer(state)
+                    anon = get_synced_cached_anonymizer(state, effective_config=snapshot)
                     if m["type"] == "gliner":
                         anon.gliner_recognizer.load()
                     else:
@@ -2033,9 +2146,38 @@ def create_ui(client: Optional[Client] = None):
     map_json_input = None
     restored_preview = None
 
+    def ask_discard_document_overlay(action: Callable[[], Any]) -> None:
+        """Require an explicit discard before replacing the current document scope."""
+        if not state.document_overlay.dirty:
+            result = action()
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+            return
+        with ui.dialog() as discard_dialog, ui.card().classes("p-4 max-w-lg"):
+            ui.label("Ungespeicherte Dokumentänderungen").classes("text-lg font-bold")
+            ui.label("Die aktuelle Dokumentebene enthält flüchtige Änderungen. Beim Fortfahren gehen diese Änderungen verloren.").classes("text-sm text-slate-700")
+            with ui.row().classes("justify-end w-full mt-3 gap-2"):
+                ui.button("Abbrechen", on_click=discard_dialog.close).props("flat")
+                async def discard_and_continue() -> None:
+                    discard_dialog.close()
+                    state.document_overlay = DocumentProfileOverlay(
+                        overlay_revision=state.document_overlay.overlay_revision + 1
+                    )
+                    state.refresh_effective_config()
+                    result = action()
+                    if asyncio.iscoroutine(result):
+                        await result
+                ui.button("Änderungen verwerfen", on_click=discard_and_continue, color="negative").props("unelevated")
+        discard_dialog.open()
+
     async def load_content_into_workspace(text: str, filename: str, raw_bytes: Optional[bytes] = None):
         """Unified asynchronous workspace loader."""
         if not check_mutation_allowed():
+            return
+        if state.document_overlay.dirty:
+            ask_discard_document_overlay(
+                lambda: load_content_into_workspace(text, filename, raw_bytes=raw_bytes)
+            )
             return
         await load_document_into_state_async(state, text, filename, raw_bytes=raw_bytes)
         if raw_text_area is not None:
@@ -2124,6 +2266,9 @@ def create_ui(client: Optional[Client] = None):
     async def reset_workspace():
         """Reset raw text, filename, and analysis table."""
         if not check_mutation_allowed():
+            return
+        if state.document_overlay.dirty:
+            ask_discard_document_overlay(reset_workspace)
             return
         await reset_app_state_async(state)
         if raw_text_area is not None:
@@ -2863,14 +3008,19 @@ def create_ui(client: Optional[Client] = None):
             ui.notify("Bitte laden Sie zuerst ein Dokument hoch oder fügen Sie Text ein.", type="warning")
             return
 
+        # Freeze the complete scope resolution before any model work starts.
+        # The same immutable object drives model selection, recognizer sync and
+        # the analyzed hash; later UI edits can only make the preview stale.
+        analysis_snapshot = state.refresh_effective_config()
+        if analysis_snapshot is None:
+            ui.notify("Analyse abgebrochen: Keine gültige Konfiguration verfügbar.", type="negative")
+            return
+        analysis_snapshot_hash = analysis_snapshot.snapshot_hash
         state.is_analyzing = True
-        analysis_snapshot_hash = (
-            state.effective_config.snapshot_hash if state.effective_config is not None else None
-        )
         set_mutating_controls_disabled(True)
         try:
             # Ensure required AI models are confirmed and downloaded before starting analysis
-            ready = await ensure_models_downloaded_with_dialog(state)
+            ready = await ensure_models_downloaded_with_dialog(state, effective_config=analysis_snapshot)
             if not ready:
                 ui.notify("Analyse abgebrochen: Modell-Download wurde nicht bestätigt.", type="warning")
                 return
@@ -2938,13 +3088,15 @@ def create_ui(client: Optional[Client] = None):
             # Step 2: Local AI & Presidio NER (with periodic live ticker updates every 2s)
             update_step_ui(1, 0.25, "Inferenz läuft...")
 
-            def do_analysis(text):
+            def do_analysis(text, snapshot: EffectiveConfig):
                 with _model_lock:
-                    anon = get_synced_cached_anonymizer(state)
+                    anon = get_synced_cached_anonymizer(state, effective_config=snapshot)
                 return anon.analyze(text)
 
             loop = asyncio.get_running_loop()
-            analysis_task = asyncio.create_task(asyncio.to_thread(do_analysis, state.raw_text))
+            analysis_task = asyncio.create_task(
+                asyncio.to_thread(do_analysis, state.raw_text, analysis_snapshot)
+            )
 
             start_t = loop.time()
             ticker_messages = [
@@ -4262,24 +4414,16 @@ def create_ui(client: Optional[Client] = None):
         select.options = options
         select.update()
 
-    def switch_project(project_id: str) -> None:
+    def switch_project(project_id: str, confirmed_discard: bool = False) -> None:
         if not check_mutation_allowed():
             return
-        if state.document_overlay.dirty:
-            ui.notify("Projektwechsel abgebrochen: ungespeicherte Dokumentbegriffe würden verworfen.", type="warning")
+        if state.document_overlay.dirty and not confirmed_discard:
+            ask_discard_document_overlay(lambda: switch_project(project_id, confirmed_discard=True))
             return
         try:
-            manifest = state.profile_store.load_manifest()
-            project = state.profile_store.load_project_profile(project_id)
-            manifest["active_project_id"] = project.project_id
-            state.profile_store.save_manifest(manifest, expected_revision=manifest.get("revision"))
-            state.project_profile = project
-            state.document_overlay = DocumentProfileOverlay()
-            state.glossary_text = profile_terms_text(project.glossary_terms, include_role=True)
-            state.ignore_terms_text = ", ".join(term.term for term in project.ignore_terms.values())
-            state.analyzed_config_hash = None if not state.entity_groups else state.analyzed_config_hash
-            state.refresh_effective_config()
-            state.preview_stale = bool(state.entity_groups)
+            controller = _profile_controller()
+            project = controller.switch_project(project_id, discard_overlay=confirmed_discard)
+            _sync_profile_controller()
             refresh_profile_select_options(project_select)
             project_select.value = project.project_id
             if state.entity_groups:
@@ -4299,9 +4443,12 @@ def create_ui(client: Optional[Client] = None):
                 ui.button("Abbrechen", on_click=dialog.close).props("flat")
                 def create_project() -> None:
                     try:
-                        project = state.profile_store.create_project(name_input.value or "")
-                        dialog.close()
-                        switch_project(project.project_id)
+                        created: Dict[str, Any] = {}
+                        def action() -> None:
+                            created["project"] = state.profile_store.create_project(name_input.value or "")
+                            dialog.close()
+                            switch_project(created["project"].project_id)
+                        _run_durable_profile_action(action)
                     except Exception as ex:
                         ui.notify(f"Projekt konnte nicht angelegt werden: {ex}", type="negative")
                 ui.button("Anlegen", on_click=create_project, color="primary").props("unelevated")
@@ -4317,27 +4464,39 @@ def create_ui(client: Optional[Client] = None):
                 ui.button("Abbrechen", on_click=dialog.close).props("flat")
                 def rename_project() -> None:
                     try:
-                        state.project_profile.project_name = (name_input.value or "").strip()
-                        state.profile_store.save_project_profile(
-                            state.project_profile,
-                            expected_revision=state.project_profile.revision,
-                        )
-                        dialog.close()
-                        refresh_profile_select_options(project_select)
-                        ui.notify("Projekt umbenannt.", type="positive")
+                        controller = _profile_controller()
+                        def action() -> None:
+                            controller.project_profile.project_name = (name_input.value or "").strip()
+                            controller.save_project(expected_revision=controller.project_profile.revision)
+                            _sync_profile_controller()
+                            dialog.close()
+                            refresh_profile_select_options(project_select)
+                            ui.notify("Projekt umbenannt.", type="positive")
+                        _run_durable_profile_action(action)
                     except Exception as ex:
                         ui.notify(f"Projekt konnte nicht umbenannt werden: {ex}", type="negative")
                 ui.button("Speichern", on_click=rename_project, color="primary").props("unelevated")
         dialog.open()
 
-    def delete_active_project() -> None:
+    def delete_active_project(confirmed: bool = False) -> None:
         if not check_mutation_allowed() or state.project_profile is None:
+            return
+        if not confirmed:
+            with ui.dialog() as delete_dialog, ui.card().classes("p-4"):
+                ui.label("Projekt löschen?").classes("text-lg font-bold")
+                ui.label(f"„{state.project_profile.project_name}“ wird dauerhaft gelöscht. Das Standardprojekt bleibt erhalten.").classes("text-sm text-slate-700")
+                with ui.row().classes("justify-end w-full mt-3 gap-2"):
+                    ui.button("Abbrechen", on_click=delete_dialog.close).props("flat")
+                    ui.button("Dauerhaft löschen", on_click=lambda: (delete_dialog.close(), delete_active_project(True)), color="negative").props("unelevated")
+            delete_dialog.open()
             return
         try:
             state.profile_store.delete_project(state.project_profile.project_id)
             manifest = state.profile_store.load_manifest()
             state.project_profile = state.profile_store.load_project_profile(manifest["active_project_id"])
             state.document_overlay = DocumentProfileOverlay()
+            if state.profile_controller is not None:
+                state.profile_controller.reload(active_project_id=manifest["active_project_id"])
             state.refresh_effective_config()
             state.preview_stale = bool(state.entity_groups)
             refresh_profile_select_options(project_select)
@@ -4372,6 +4531,328 @@ def create_ui(client: Optional[Client] = None):
                 ui.button("Schliessen", on_click=dialog.close).props("flat")
         dialog.open()
 
+    def _template_is_custom(template_id: Optional[str]) -> bool:
+        return bool(template_id) and template_id not in {t.template_id for t in get_builtin_templates(set(AVAILABLE_ENTITIES)).values()}
+
+    def _refresh_template_select() -> None:
+        templates = state.profile_store.list_all_templates()
+        template_select.options = {
+            tpl.template_id: (f"{tpl.name} · eingebaut" if tpl.is_builtin else f"{tpl.name} · eigene")
+            for tpl in templates
+        }
+        template_select.update()
+        if state.project_profile is not None and state.project_profile.template_id:
+            if state.profile_store.load_template(state.project_profile.template_id) is None:
+                template_reference_label.set_text("⚠️ Früher verwendete Vorlage nicht verfügbar · Modi bleiben als Snapshot erhalten")
+                template_reference_label.set_visibility(True)
+            else:
+                template_reference_label.set_visibility(False)
+
+    def open_save_template_dialog() -> None:
+        if not check_mutation_allowed():
+            return
+        with ui.dialog() as dialog, ui.card().classes("p-4"):
+            ui.label("Eigene Vorlage speichern").classes("text-lg font-bold")
+            name_input = ui.input("Vorlagenname").props("autofocus outlined dense").classes("w-80")
+            description_input = ui.input("Beschreibung (optional)").props("outlined dense").classes("w-80")
+            with ui.row().classes("justify-end w-full mt-2 gap-2"):
+                ui.button("Abbrechen", on_click=dialog.close).props("flat")
+                def save_template() -> None:
+                    try:
+                        template = CategoryTemplate(
+                            template_id=str(uuid.uuid4()),
+                            name=(name_input.value or "").strip(),
+                            description=(description_input.value or "").strip(),
+                            entity_modes=dict(state.entity_modes),
+                        )
+                        def action() -> None:
+                            _profile_controller().save_custom_template(template)
+                            _refresh_template_select()
+                            template_select.value = template.template_id
+                            ui.notify("Eigene Vorlage gespeichert.", type="positive")
+                        _run_durable_profile_action(action)
+                        dialog.close()
+                    except Exception as ex:
+                        ui.notify(f"Vorlage konnte nicht gespeichert werden: {ex}", type="negative")
+                ui.button("Speichern", on_click=save_template, color="primary").props("unelevated")
+        dialog.open()
+
+    def update_selected_template() -> None:
+        template_id = template_select.value
+        if not _template_is_custom(template_id) or not check_mutation_allowed():
+            ui.notify("Bitte zuerst eine eigene Vorlage auswählen.", type="info")
+            return
+        current = state.profile_store.load_template(template_id)
+        if current is None:
+            ui.notify("Diese Vorlage ist nicht mehr verfügbar.", type="warning")
+            _refresh_template_select()
+            return
+        def action() -> None:
+            current.entity_modes = dict(state.entity_modes)
+            _profile_controller().save_custom_template(current, expected_revision=current.revision)
+            _refresh_template_select()
+            ui.notify("Eigene Vorlage aktualisiert.", type="positive")
+        _run_durable_profile_action(action)
+
+    def open_rename_template_dialog() -> None:
+        template_id = template_select.value
+        if not _template_is_custom(template_id) or not check_mutation_allowed():
+            ui.notify("Bitte zuerst eine eigene Vorlage auswählen.", type="info")
+            return
+        current = state.profile_store.load_template(template_id)
+        if current is None:
+            ui.notify("Diese Vorlage ist nicht mehr verfügbar.", type="warning")
+            return
+        with ui.dialog() as dialog, ui.card().classes("p-4"):
+            ui.label("Eigene Vorlage umbenennen").classes("text-lg font-bold")
+            name_input = ui.input("Vorlagenname", value=current.name).props("autofocus outlined dense").classes("w-80")
+            with ui.row().classes("justify-end w-full mt-2 gap-2"):
+                ui.button("Abbrechen", on_click=dialog.close).props("flat")
+                def rename_template() -> None:
+                    def action() -> None:
+                        current.name = (name_input.value or "").strip()
+                        _profile_controller().save_custom_template(current, expected_revision=current.revision)
+                        _refresh_template_select()
+                        ui.notify("Eigene Vorlage umbenannt.", type="positive")
+                    _run_durable_profile_action(action)
+                    dialog.close()
+                ui.button("Umbenennen", on_click=rename_template, color="primary").props("unelevated")
+        dialog.open()
+
+    def delete_selected_template() -> None:
+        template_id = template_select.value
+        if not _template_is_custom(template_id) or not check_mutation_allowed():
+            ui.notify("Bitte zuerst eine eigene Vorlage auswählen.", type="info")
+            return
+        with ui.dialog() as dialog, ui.card().classes("p-4"):
+            ui.label("Eigene Vorlage löschen?").classes("text-lg font-bold")
+            ui.label("Bereits angewendete Projektmodi bleiben unverändert; nur die Vorlage wird entfernt.").classes("text-sm text-slate-700")
+            with ui.row().classes("justify-end w-full mt-2 gap-2"):
+                ui.button("Abbrechen", on_click=dialog.close).props("flat")
+                def confirm_delete() -> None:
+                    try:
+                        _profile_controller().delete_custom_template(template_id)
+                        dialog.close()
+                        _refresh_template_select()
+                        ui.notify("Eigene Vorlage gelöscht.", type="positive")
+                    except Exception as ex:
+                        ui.notify(f"Vorlage konnte nicht gelöscht werden: {ex}", type="negative")
+                ui.button("Löschen", on_click=confirm_delete, color="negative").props("unelevated")
+        dialog.open()
+
+    def open_backup_cleanup_dialog() -> None:
+        if not check_mutation_allowed():
+            return
+        backup_paths = list(state.profile_store.backups_dir.glob("config.v1.backup.*.json"))
+        migrated_path = state.profile_store.root_dir / "config.v1.migrated.json"
+        if migrated_path.exists():
+            backup_paths.append(migrated_path)
+        count = len(backup_paths)
+        with ui.dialog() as dialog, ui.card().classes("p-4 max-w-lg"):
+            ui.label("Alte Migrationsbackups löschen?").classes("text-lg font-bold")
+            ui.label(f"{count} Datei(en) würden aus dem lokalen Backup-Ordner entfernt.").classes("text-sm text-slate-700")
+            ui.label("Das ist keine sichere Löschung. Für eine vollständige Entfernung müssen zusätzlich Betriebssystem-Backups und Synchronisationskopien berücksichtigt werden.").classes("text-xs text-amber-800 mt-2")
+            with ui.row().classes("justify-end w-full mt-3 gap-2"):
+                ui.button("Abbrechen", on_click=dialog.close).props("flat")
+                def confirm_cleanup() -> None:
+                    try:
+                        removed = state.profile_store.delete_migration_backups()
+                        dialog.close()
+                        ui.notify(f"{removed} Migrationsbackup(s) entfernt.", type="positive")
+                    except Exception as ex:
+                        ui.notify(f"Backups konnten nicht entfernt werden: {ex}", type="negative")
+                ui.button("Entfernen", on_click=confirm_cleanup, color="negative").props("unelevated")
+        dialog.open()
+
+    def _profile_controller() -> ProfileController:
+        """Return the controller bound to this session's current scope objects."""
+        if state.profile_controller is None:
+            state.profile_controller = ProfileController(state.profile_store)
+        state.profile_controller.system_profile = state.system_profile
+        state.profile_controller.project_profile = state.project_profile
+        state.profile_controller.document_overlay = state.document_overlay
+        return state.profile_controller
+
+    def _sync_profile_controller() -> None:
+        controller = _profile_controller()
+        state.system_profile = controller.system_profile
+        state.project_profile = controller.project_profile
+        state.document_overlay = controller.document_overlay
+        state.glossary_text = profile_terms_text(state.project_profile.glossary_terms, include_role=True)
+        state.ignore_terms_text = ", ".join(term.term for term in state.project_profile.ignore_terms.values())
+        state.refresh_effective_config()
+        state.preview_stale = bool(state.entity_groups)
+
+    def _run_durable_profile_action(action: Callable[[], None]) -> None:
+        """Run a profile/template write only after the one-time local-storage warning."""
+        controller = _profile_controller()
+        if not controller.warning_required():
+            try:
+                action()
+            except RevisionConflictError:
+                controller.reload(active_project_id=state.project_profile.project_id)
+                _sync_profile_controller()
+                ui.notify("Speichern fehlgeschlagen: Das Profil wurde extern geändert und neu geladen.", type="warning", close_button=True)
+            except Exception as ex:
+                ui.notify(f"Profiländerung konnte nicht gespeichert werden: {ex}", type="negative")
+            return
+
+        with ui.dialog() as warning_dialog, ui.card().classes("p-5 max-w-xl bg-white rounded-xl shadow-xl"):
+            ui.label("⚠️ Wichtiger Hinweis zur lokalen Datenspeicherung").classes("text-lg font-bold text-slate-800")
+            ui.markdown(
+                "Profile, Begriffe, Rollen und Ignore-Einträge werden lokal im Benutzerordner gespeichert, "
+                "standardmässig unverschlüsselt. BitLocker/FileVault schützt nur das Gerät im ausgeschalteten "
+                "Zustand; bei entsperrter Sitzung können andere Programme die Dateien lesen. Eine Cloud-Synchronisation "
+                "kann Kopien ausserhalb dieses Geräts erzeugen."
+            ).classes("text-sm text-slate-700 leading-relaxed mt-2")
+            understood = ui.checkbox("Ich habe diesen Hinweis verstanden und möchte fortfahren.")
+            with ui.row().classes("w-full justify-end gap-2 mt-3"):
+                ui.button("Abbrechen", on_click=warning_dialog.close).props("flat")
+                def confirm_profile_warning() -> None:
+                    if not understood.value:
+                        ui.notify("Bitte bestätige zuerst den Datenschutzhinweis.", type="warning")
+                        return
+                    try:
+                        controller.acknowledge_warning(expected_revision=int(controller.manifest["revision"]))
+                        action()
+                        warning_dialog.close()
+                    except RevisionConflictError:
+                        controller.reload(active_project_id=state.project_profile.project_id)
+                        _sync_profile_controller()
+                        warning_dialog.close()
+                        ui.notify("Speichern abgebrochen: Der Profilstand wurde extern geändert und neu geladen.", type="warning")
+                    except Exception as ex:
+                        warning_dialog.close()
+                        ui.notify(f"Profiländerung konnte nicht gespeichert werden: {ex}", type="negative")
+                ui.button("Bestätigen & Fortfahren", on_click=confirm_profile_warning, color="primary").props("unelevated")
+        warning_dialog.open()
+
+    def open_profile_manager() -> None:
+        if not check_mutation_allowed():
+            return
+        controller = _profile_controller()
+        with ui.dialog() as dialog, ui.card().classes("w-[1000px] max-w-full p-4"):
+            ui.label("Profile & Begriffe verwalten").classes("text-lg font-bold text-slate-800")
+            ui.label("Systemänderungen gelten global, Projektänderungen dauerhaft für das Projekt, Dokumentänderungen nur für diese Sitzung.").classes("text-xs text-slate-600 mb-2")
+            scope_select = ui.select(
+                {"document": "Dokument (flüchtig)", "project": "Projekt (dauerhaft)", "system": "System (dauerhaft, global)"},
+                value="project",
+                label="Bearbeitungsebene",
+            ).props("dense outlined").classes("w-72")
+            with ui.tabs().classes("w-full") as profile_tabs:
+                categories_tab = ui.tab("Kategorien")
+                glossary_tab = ui.tab("Glossar")
+                ignore_tab = ui.tab("Ignore-Liste")
+            category_holder = ui.column().classes("w-full")
+            glossary_holder = ui.column().classes("w-full")
+            ignore_holder = ui.column().classes("w-full")
+
+            def mutate(scope: str, action: Callable[[], None]) -> None:
+                if not check_mutation_allowed():
+                    return
+                controller = _profile_controller()
+                if scope == "document":
+                    action()
+                    _sync_profile_controller()
+                    render_all()
+                    return
+                def durable_action() -> None:
+                    action()
+                    if scope == "system":
+                        controller.save_system(expected_revision=controller.system_profile.revision)
+                    else:
+                        controller.save_project(expected_revision=controller.project_profile.revision)
+                    _sync_profile_controller()
+                    render_all()
+                _run_durable_profile_action(durable_action)
+
+            def render_categories() -> None:
+                category_holder.clear()
+                cfg = controller.effective_config()
+                scope = scope_select.value or "project"
+                with category_holder:
+                    for entity in AVAILABLE_ENTITIES:
+                        with ui.row().classes("w-full items-center gap-2 mb-1"):
+                            ui.label(entity).classes("font-mono text-xs w-44")
+                            if scope == "system":
+                                ui.badge("System: nur Begriffe", color="grey-7").props("dense")
+                                continue
+                            selector = ui.select(get_entity_mode_options(entity), value=cfg.entity_modes.get(entity, ENTITY_MODE_OFF)).props("dense outlined").classes("w-80 text-xs")
+                            def on_mode(event: Any, ent: str = entity, selected: Any = selector) -> None:
+                                selected.set_value(event.value)
+                                mutate(scope_select.value or "project", lambda: controller.set_entity_mode(scope_select.value or "project", ent, event.value))
+                            selector.on_value_change(on_mode)
+                            state.register_mutating_element(selector, "sidebar")
+
+            def render_terms() -> None:
+                glossary_holder.clear()
+                ignore_holder.clear()
+                cfg = controller.effective_config()
+                scope = scope_select.value or "project"
+                with glossary_holder:
+                    with ui.row().classes("w-full items-end gap-2 mb-2"):
+                        g_term = ui.input("Begriff").props("dense outlined").classes("flex-grow")
+                        g_type = ui.select({e: e for e in AVAILABLE_ENTITIES}, label="Kategorie").props("dense outlined").classes("w-48")
+                        g_role = ui.input("Rolle (optional)").props("dense outlined").classes("w-44")
+                        def add_glossary() -> None:
+                            if not g_term.value or not g_type.value:
+                                ui.notify("Begriff und Kategorie sind erforderlich.", type="warning")
+                                return
+                            mutate(scope_select.value or "project", lambda: controller.upsert_glossary(scope_select.value or "project", g_term.value, g_type.value, g_role.value))
+                            g_term.value = ""
+                            g_role.value = ""
+                        ui.button("Hinzufügen", icon="add", on_click=add_glossary, color="primary").props("dense")
+                    for key, value in sorted(cfg.glossary.items(), key=lambda item: item[0].casefold()):
+                        provenance = cfg.glossary_provenance.get(key)
+                        label = provenance[1] if provenance else "wirksam"
+                        with ui.row().classes("w-full items-center gap-2 mb-1"):
+                            ui.label(f"{value} · {key}").classes("font-mono text-xs flex-grow")
+                            ui.badge(label, color="teal" if provenance and provenance[0] == ScopeLevel.PROJECT else "grey-7").props("dense")
+                            source_scope = provenance[0] if provenance else ScopeLevel.PROJECT
+                            selected_scope = ScopeLevel(scope)
+                            if source_scope == selected_scope:
+                                ui.button("Löschen", on_click=lambda k=key: mutate(scope, lambda: controller.remove_term(scope, k, True))).props("dense flat color=negative")
+                            elif selected_scope in (ScopeLevel.PROJECT, ScopeLevel.DOCUMENT):
+                                ui.button("Ausblenden", on_click=lambda k=key: mutate(scope, lambda: controller.disable_inherited(scope, k, True))).props("dense flat")
+                    ui.label("Begriffe mit Badge «System» oder «Projekt» sind geerbt bzw. wirksam aus dieser Ebene.").classes("text-[11px] text-slate-500 mt-2")
+                with ignore_holder:
+                    with ui.row().classes("w-full items-end gap-2 mb-2"):
+                        i_term = ui.input("Ignorierter Begriff").props("dense outlined").classes("flex-grow")
+                        def add_ignore() -> None:
+                            if not i_term.value:
+                                return
+                            mutate(scope_select.value or "project", lambda: controller.upsert_ignore(scope_select.value or "project", i_term.value))
+                            i_term.value = ""
+                        ui.button("Hinzufügen", icon="add", on_click=add_ignore, color="primary").props("dense")
+                    for key in sorted(cfg.ignore_provenance, key=str.casefold):
+                        provenance = cfg.ignore_provenance.get(key)
+                        with ui.row().classes("w-full items-center gap-2 mb-1"):
+                            ui.label(key).classes("font-mono text-xs flex-grow")
+                            ui.badge(provenance[1] if provenance else "wirksam", color="grey-7").props("dense")
+                            source_scope = provenance[0] if provenance else ScopeLevel.PROJECT
+                            selected_scope = ScopeLevel(scope)
+                            if source_scope == selected_scope:
+                                ui.button("Löschen", on_click=lambda k=key: mutate(scope, lambda: controller.remove_term(scope, k, False))).props("dense flat color=negative")
+                            elif selected_scope in (ScopeLevel.PROJECT, ScopeLevel.DOCUMENT):
+                                ui.button("Ausblenden", on_click=lambda k=key: mutate(scope, lambda: controller.disable_inherited(scope, k, False))).props("dense flat")
+
+            def render_all() -> None:
+                render_categories()
+                render_terms()
+
+            scope_select.on_value_change(lambda _: render_all())
+            with ui.tab_panels(profile_tabs, value=categories_tab).classes("w-full"):
+                with ui.tab_panel(categories_tab):
+                    category_holder
+                with ui.tab_panel(glossary_tab):
+                    glossary_holder
+                with ui.tab_panel(ignore_tab):
+                    ignore_holder
+            with ui.row().classes("justify-end w-full mt-3"):
+                ui.button("Schliessen", on_click=dialog.close).props("flat")
+            render_all()
+        dialog.open()
+
     with ui.card().classes("w-full mb-3 p-3 bg-white border border-slate-200 rounded-lg shadow-sm"):
         with ui.row().classes("w-full items-center gap-3 flex-wrap"):
             ui.label("Projekt").classes("text-sm font-semibold text-slate-700")
@@ -4381,32 +4862,64 @@ def create_ui(client: Optional[Client] = None):
                 value=(state.project_profile.project_id if state.project_profile else None),
                 on_change=lambda event: switch_project(event.value),
             ).props("dense outlined").classes("min-w-48")
+            state.register_mutating_element(project_select, "sidebar")
             new_project_btn = ui.button("➕ Neues Projekt", on_click=lambda: open_new_project_dialog()).props("outline dense")
             rename_project_btn = ui.button("✏️ Umbenennen", on_click=lambda: open_rename_project_dialog()).props("outline dense")
             delete_project_btn = ui.button("🗑️ Löschen", on_click=lambda: delete_active_project()).props("outline dense color=negative")
+            for control in (new_project_btn, rename_project_btn, delete_project_btn):
+                state.register_mutating_element(control, "sidebar")
             ui.separator().props("vertical")
             ui.label("Vorlage").classes("text-sm font-semibold text-slate-700")
-            template_options = {tid: tpl.name for tid, tpl in get_builtin_templates(set(AVAILABLE_ENTITIES)).items()}
+            template_options = {
+                tpl.template_id: (f"{tpl.name} · eingebaut" if tpl.is_builtin else f"{tpl.name} · eigene")
+                for tpl in state.profile_store.list_all_templates()
+            }
 
-            def apply_template(template_id: str) -> None:
+            def apply_template(template_id: str, confirmed: bool = False) -> None:
                 if not template_id or not check_mutation_allowed() or state.project_profile is None:
                     return
+                template = state.profile_store.load_template(template_id)
+                if template is None:
+                    ui.notify("Diese Vorlage ist nicht mehr verfügbar; die Projektmodi bleiben unverändert.", type="warning")
+                    return
+                changed = dict(state.project_profile.entity_modes) != dict(template.entity_modes)
+                if changed and not confirmed:
+                    with ui.dialog() as confirm_dialog, ui.card().classes("p-4 max-w-lg"):
+                        ui.label("Projektmodi überschreiben?").classes("text-lg font-bold")
+                        ui.label("Die aktuelle Projektkonfiguration wird durch eine Kopie der Vorlage ersetzt. Eigene Begriffe bleiben erhalten.").classes("text-sm text-slate-700")
+                        with ui.row().classes("justify-end w-full mt-3 gap-2"):
+                            ui.button("Abbrechen", on_click=confirm_dialog.close).props("flat")
+                            ui.button("Anwenden", on_click=lambda: (confirm_dialog.close(), apply_template(template_id, True)), color="primary").props("unelevated")
+                    confirm_dialog.open()
+                    return
                 try:
-                    state.project_profile = state.profile_store.apply_template_to_project(
-                        state.project_profile.project_id,
-                        template_id,
-                        expected_revision=state.project_profile.revision,
-                    )
-                    state.refresh_effective_config()
-                    state.preview_stale = bool(state.entity_groups)
-                    ui.notify("Vorlage als Snapshot auf das Projekt angewendet.", type="positive")
-                    if state.entity_groups:
-                        refresh_preview_and_exports()
+                    controller = _profile_controller()
+                    def action() -> None:
+                        controller.apply_template(template_id, expected_revision=controller.project_profile.revision)
+                        _sync_profile_controller()
+                        ui.notify("Vorlage als Snapshot auf das Projekt angewendet.", type="positive")
+                        if state.entity_groups:
+                            refresh_preview_and_exports()
+                    _run_durable_profile_action(action)
                 except Exception as ex:
                     ui.notify(f"Vorlage konnte nicht angewendet werden: {ex}", type="negative")
 
             template_select = ui.select(options=template_options, on_change=lambda event: apply_template(event.value)).props("dense outlined").classes("min-w-64")
-            ui.button("⚙️ Profile & Begriffe verwalten", on_click=open_profile_manager).props("outline dense")
+            state.register_mutating_element(template_select, "sidebar")
+            template_reference_label = ui.label().classes("text-[11px] text-amber-700")
+            template_reference_label.set_visibility(
+                bool(state.project_profile and state.project_profile.template_id and state.profile_store.load_template(state.project_profile.template_id) is None)
+            )
+            template_save_btn = ui.button("💾 Als Vorlage speichern", on_click=lambda: open_save_template_dialog()).props("outline dense")
+            template_rename_btn = ui.button("✏️ Vorlage umbenennen", on_click=lambda: open_rename_template_dialog()).props("outline dense")
+            template_update_btn = ui.button("↻ Vorlage aktualisieren", on_click=lambda: update_selected_template()).props("outline dense")
+            template_delete_btn = ui.button("🗑️ Eigene Vorlage löschen", on_click=lambda: delete_selected_template()).props("outline dense color=negative")
+            for control in (template_save_btn, template_rename_btn, template_update_btn, template_delete_btn):
+                state.register_mutating_element(control, "sidebar")
+            profile_manager_btn = ui.button("⚙️ Profile & Begriffe verwalten", on_click=open_profile_manager).props("outline dense")
+            state.register_mutating_element(profile_manager_btn, "sidebar")
+            backup_cleanup_btn = ui.button("🧹 Migrationsbackups", on_click=open_backup_cleanup_dialog).props("outline dense")
+            state.register_mutating_element(backup_cleanup_btn, "sidebar")
         with ui.row().classes("items-center gap-2 mt-2"):
             ui.badge("Projekt-Scope", color="teal").props("dense outline")
             ui.label("Projektänderungen dauerhaft · Dokumentoverlay nur für diese Sitzung").classes("text-xs text-slate-600")

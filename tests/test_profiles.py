@@ -25,6 +25,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from typing import Dict, Optional
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -45,6 +46,7 @@ from local_anonymizer.profiles import (
     TEMPLATE_CH_STANDARD,
     TEMPLATE_MEDICAL,
     CategoryTemplate,
+    DirtyOverlayError,
     DocumentProfileOverlay,
     EffectiveConfig,
     ProjectProfile,
@@ -54,6 +56,7 @@ from local_anonymizer.profiles import (
     ScopeResolutionEngine,
     SystemProfile,
     ProfileStore,
+    ProfileController,
     get_builtin_templates,
     normalize_term_key,
     validate_id_string,
@@ -989,3 +992,89 @@ class TestBuiltinTemplates:
         builtins = get_builtin_templates(AVAILABLE)
         for tpl in builtins.values():
             assert tpl.is_builtin is True
+
+
+class TestProfileControllerR1ToR5:
+    def test_document_overlay_is_volatile_and_switch_requires_discard(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        project_path = store.projects_dir / f"{controller.project_profile.project_id}.json"
+        before_project = project_path.read_bytes()
+        before_manifest_revision = controller.manifest["revision"]
+
+        controller.upsert_ignore(ScopeLevel.DOCUMENT, "Nur für dieses Dokument")
+        assert controller.document_overlay.dirty is True
+        assert controller.document_overlay.overlay_revision > 1
+        assert project_path.read_bytes() == before_project
+        assert store.load_manifest()["revision"] == before_manifest_revision
+        with pytest.raises(DirtyOverlayError):
+            controller.switch_project(controller.project_profile.project_id)
+
+        controller.discard_overlay()
+        assert controller.document_overlay.dirty is False
+        controller.switch_project(controller.project_profile.project_id)
+        assert "Nur für dieses Dokument" not in controller.effective_config().ignore_terms
+
+    def test_custom_template_crud_and_deleted_reference_keeps_snapshot(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        template = CategoryTemplate(
+            template_id=_valid_uuid4(),
+            name="R5 Testvorlage",
+            description="CRUD",
+            entity_modes={"PERSON": ENTITY_MODE_OFF},
+        )
+        saved = controller.save_custom_template(template)
+        assert any(item.template_id == saved.template_id for item in controller.list_all_templates())
+        controller.apply_template(saved.template_id)
+        applied_modes = dict(controller.project_profile.entity_modes)
+        controller.delete_custom_template(saved.template_id)
+        assert store.load_template(saved.template_id) is None
+        project = store.load_project_profile(controller.project_profile.project_id)
+        assert project.template_id == saved.template_id
+        assert project.entity_modes == applied_modes
+
+    def test_warning_acknowledgement_is_one_time_and_cas_checked(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        first = ProfileController(store)
+        second = ProfileController(store)
+        assert first.warning_required() is True
+        first.acknowledge_warning(expected_revision=first.manifest["revision"])
+        assert first.warning_required() is False
+        with pytest.raises(RevisionConflictError):
+            second.acknowledge_warning(expected_revision=second.manifest["revision"])
+        assert store.load_manifest()["warning_acknowledged_version"] == 1
+
+    def test_actual_analyze_uses_frozen_effective_scope_precedence(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        controller.upsert_glossary(ScopeLevel.SYSTEM, "ZHAW", "ORGANIZATION", role="Hochschule")
+        controller.save_system()
+        controller.upsert_ignore(ScopeLevel.PROJECT, "ZHAW")
+        controller.save_project()
+        controller.upsert_glossary(ScopeLevel.DOCUMENT, "ZHAW", "PERSON", role="Projektleitung")
+        for entity in AVAILABLE:
+            controller.set_entity_mode(ScopeLevel.PROJECT, entity, ENTITY_MODE_OFF)
+        controller.set_entity_mode(ScopeLevel.PROJECT, "PERSON", ENTITY_MODE_EXPLICIT_ONLY)
+        controller.save_project()
+        snapshot = controller.effective_config()
+
+        import app
+
+        state = SimpleNamespace(
+            effective_config=snapshot,
+            gliner_model_name=app.GLINER_MODEL_NAME,
+            gliner_threshold=0.55,
+            enable_eupii=False,
+            eupii_threshold=0.5,
+            eupii_model_name=app.EUPII_MODEL_NAME,
+        )
+        anonymizer = app.build_anonymizer(state, effective_config=snapshot)
+        results = anonymizer.analyze("ZHAW")
+        assert len(results) == 1
+        assert results[0].entity_type == "PERSON"
+        assert results[0].recognition_metadata.get("custom_role") == "Projektleitung"
