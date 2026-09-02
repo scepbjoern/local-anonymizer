@@ -199,7 +199,7 @@ Run the full automated test suite (covers all recognizers, extractors, multi-enc
 ```bash
 uv run pytest
 ```
-* **Full test suite passes cleanly (230+ passed, 2 integration tests deselected by default).**
+* **Full test suite passes cleanly (250 passed, 2 integration tests deselected by default).**
 * Run the live EU-PII model integration test with `uv run pytest -m integration`.
 
 Weitere Dokumentation ist über den [Dokumentations-Wegweiser](docs/INDEX.md)

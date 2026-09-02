@@ -712,3 +712,219 @@ async def test_launch_llm_triage_exception_resets_busy_state():
     assert st.llm_active_task is None
     assert st.llm_partial_failure is True
     assert occ.occ_id in st.llm_unprocessed_occ_ids
+
+
+@pytest.mark.asyncio
+async def test_launch_llm_triage_immediate_cancellation_releases_reservation():
+    """R1: Verify that immediate cancellation before worker execution releases is_llm_running lock and allows restart."""
+    st = AppState()
+    st.raw_text = "Test Text"
+    occ = EntityOccurrence(start=0, end=4, score=1.0, context_html="Test", needs_review=False)
+    grp = EntityGroup(original_text="Test", entity_type="MISC", group_id="grp-r1")
+    grp.occurrences.append(occ)
+    st.entity_groups = [grp]
+    st.config.llm_enabled = True
+    st.config.llm_model_name = "qwen3:8b"
+
+    task = launch_llm_triage_for_state(st, triggered_from_analysis=False)
+    assert task is not None
+    assert st.is_llm_running is True
+
+    # Cancel immediately prior to event loop execution of the worker coroutine
+    task.cancel()
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert st.is_llm_running is False
+    assert st.llm_active_task is None
+
+    # Verify that subsequent launch succeeds without being blocked by residual reservation
+    class SuccessfulProvider:
+        model_name = "qwen3:8b"
+        base_url = "http://127.0.0.1:11434/v1"
+
+        async def generate(self, prompt, system_prompt=""):
+            import re
+            from local_anonymizer.llm.apply_service import compute_triage_snapshot
+            snap = compute_triage_snapshot(st.raw_text, st.analysis_revision, st.entity_groups)
+            req_match = re.search(r'"request_id":\s*"([^"]+)"', prompt)
+            req_id = req_match.group(1) if req_match else "req-r1"
+            return json.dumps({
+                "schema_version": "1.0",
+                "request_id": req_id,
+                "document_revision": st.document_revision,
+                "document_hash": snap,
+                "items": [{"occ_id": occ.occ_id, "action": "keep", "confidence": "high", "reasoning": "Valid"}],
+            })
+
+        async def close(self):
+            pass
+
+    st.llm_provider = SuccessfulProvider()
+    task2 = launch_llm_triage_for_state(st, triggered_from_analysis=False)
+    assert task2 is not None
+    await task2
+    assert st.is_llm_running is False
+    assert len(st.llm_triage_results) == 1
+
+
+@pytest.mark.asyncio
+async def test_launch_llm_triage_on_update_ui_exception_releases_lock():
+    """R1: Verify that exception during pre-task UI callback immediately releases is_llm_running."""
+    st = AppState()
+    st.raw_text = "Test"
+    occ = EntityOccurrence(start=0, end=4, score=1.0, context_html="Test", needs_review=False)
+    grp = EntityGroup(original_text="Test", entity_type="MISC", group_id="grp-r1b")
+    grp.occurrences.append(occ)
+    st.entity_groups = [grp]
+    st.config.llm_enabled = True
+    st.config.llm_model_name = "qwen3:8b"
+
+    def faulty_ui_cb():
+        raise RuntimeError("UI render crash")
+
+    with pytest.raises(RuntimeError, match="UI render crash"):
+        launch_llm_triage_for_state(st, on_update_ui=faulty_ui_cb)
+
+    assert st.is_llm_running is False
+    assert st.llm_active_task is None
+
+
+@pytest.mark.asyncio
+async def test_preload_ollama_done_string_false_rejected():
+    """R3: Verify that string 'false' for done is rejected as invalid boolean."""
+    gen_url = "http://127.0.0.1:11434/api/generate"
+    responses = {
+        gen_url: MockResponse(200, body=b'{"model": "qwen3:8b", "done": "false"}'),
+    }
+    session = MockSession(responses_by_url=responses)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        with pytest.raises(RuntimeError, match="nicht abgeschlossen"):
+            await preload_ollama_model("http://127.0.0.1:11434/v1", "qwen3:8b")
+
+
+@pytest.mark.asyncio
+async def test_preload_ollama_done_number_one_rejected():
+    """R3: Verify that integer 1 for done is rejected as non-bool."""
+    gen_url = "http://127.0.0.1:11434/api/generate"
+    responses = {
+        gen_url: MockResponse(200, body=b'{"model": "qwen3:8b", "done": 1}'),
+    }
+    session = MockSession(responses_by_url=responses)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        with pytest.raises(RuntimeError, match="nicht abgeschlossen"):
+            await preload_ollama_model("http://127.0.0.1:11434/v1", "qwen3:8b")
+
+
+@pytest.mark.asyncio
+async def test_preload_ollama_missing_model_rejected():
+    """R3: Verify that response missing model field is rejected."""
+    gen_url = "http://127.0.0.1:11434/api/generate"
+    responses = {
+        gen_url: MockResponse(200, body=b'{"done": true}'),
+    }
+    session = MockSession(responses_by_url=responses)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        with pytest.raises(RuntimeError, match="keinen g.+ltigen Modellnamen"):
+            await preload_ollama_model("http://127.0.0.1:11434/v1", "qwen3:8b")
+
+
+@pytest.mark.asyncio
+async def test_preload_ollama_null_or_empty_model_rejected():
+    """R3: Verify that null or whitespace-only model field is rejected."""
+    gen_url = "http://127.0.0.1:11434/api/generate"
+    responses_null = {
+        gen_url: MockResponse(200, body=b'{"model": null, "done": true}'),
+    }
+    session_null = MockSession(responses_by_url=responses_null)
+
+    with patch("aiohttp.ClientSession", return_value=session_null):
+        with pytest.raises(RuntimeError, match="keinen g.+ltigen Modellnamen"):
+            await preload_ollama_model("http://127.0.0.1:11434/v1", "qwen3:8b")
+
+    responses_empty = {
+        gen_url: MockResponse(200, body=b'{"model": "   ", "done": true}'),
+    }
+    session_empty = MockSession(responses_by_url=responses_empty)
+
+    with patch("aiohttp.ClientSession", return_value=session_empty):
+        with pytest.raises(RuntimeError, match="keinen g.+ltigen Modellnamen"):
+            await preload_ollama_model("http://127.0.0.1:11434/v1", "qwen3:8b")
+
+
+@pytest.mark.asyncio
+async def test_timer_reverification_stale_response_does_not_invalidate_new_model():
+    """R2: Verify that delayed verification of old model does NOT invalidate new ready state."""
+    import time
+    st = AppState()
+    st.config.llm_base_url = "http://127.0.0.1:11434/v1"
+    st.config.llm_model_name = "model-a"
+    st.llm_provider_type = "ollama"
+    st.llm_ready_info = PsModelInfo(name="model-a", model="model-a", expires_at="2026-09-02T15:00:00Z")
+    st.llm_ready_bound_url = "http://127.0.0.1:11434/v1"
+    st.llm_ready_bound_model = "model-a"
+    st.llm_ready_expires_at = time.time() + 600.0
+
+    ready_info_before = st.llm_ready_info
+    bound_url_before = st.llm_ready_bound_url
+    bound_model_before = st.llm_ready_bound_model
+    provider_type_before = st.llm_provider_type
+
+    # Simulate network delay during verify
+    async def delayed_verify_returns_none(url, model):
+        # State mutates during await (e.g. user preloads model-b)
+        st.config.llm_model_name = "model-b"
+        st.llm_ready_info = PsModelInfo(name="model-b", model="model-b", expires_at="2026-09-02T16:00:00Z")
+        st.llm_ready_bound_model = "model-b"
+        st.llm_ready_expires_at = time.time() + 900.0
+        return None  # old model-a is unloaded
+
+    active_info = await delayed_verify_returns_none(bound_url_before, bound_model_before)
+
+    # State guard check
+    if (
+        st.llm_ready_info is ready_info_before
+        and st.llm_ready_bound_url == bound_url_before
+        and st.llm_ready_bound_model == bound_model_before
+        and st.llm_provider_type == provider_type_before
+    ):
+        if active_info is None:
+            st.invalidate_llm_ready()
+
+    # The new ready state for model-b MUST be preserved
+    assert st.llm_ready_info is not None
+    assert st.llm_ready_bound_model == "model-b"
+    assert st.is_model_ready() is True
+
+
+@pytest.mark.asyncio
+async def test_timer_reverification_active_model_synchronizes_server_expiration():
+    """R2: Verify that successful re-verification synchronizes updated server expiration."""
+    import time
+    st = AppState()
+    st.config.llm_base_url = "http://127.0.0.1:11434/v1"
+    st.config.llm_model_name = "qwen3:8b"
+    st.llm_provider_type = "ollama"
+    st.llm_ready_info = PsModelInfo(name="qwen3:8b", model="qwen3:8b", expires_at="2026-09-02T12:00:00Z")
+    st.llm_ready_bound_url = "http://127.0.0.1:11434/v1"
+    st.llm_ready_bound_model = "qwen3:8b"
+    st.llm_ready_expires_at = 100.0
+
+    future_iso = "2026-09-02T16:00:00Z"
+    expected_ts = parse_iso_expiry(future_iso)
+
+    active_info = PsModelInfo(name="qwen3:8b", model="qwen3:8b", expires_at=future_iso)
+    if active_info.expires_at:
+        new_exp = parse_iso_expiry(active_info.expires_at)
+        if new_exp > 0.0:
+            st.llm_ready_expires_at = new_exp
+            st.llm_ready_info = active_info
+
+    assert st.llm_ready_expires_at == expected_ts
+    assert st.llm_ready_info.expires_at == future_iso

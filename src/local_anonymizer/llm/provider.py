@@ -400,15 +400,16 @@ async def preload_ollama_model(
                     raise RuntimeError("Antwort von /api/generate ist kein gültiges JSON-Objekt.")
                 if "error" in gen_data and gen_data["error"]:
                     raise RuntimeError(f"Ollama meldete Fehler beim Vorladen: {gen_data['error']}")
-                if not gen_data.get("done", False):
+                if gen_data.get("done") is not True or not isinstance(gen_data.get("done"), bool):
                     raise RuntimeError("Ollama Vorlade-Anfrage nicht abgeschlossen ('done' ist nicht True).")
                 resp_model = gen_data.get("model")
-                if resp_model:
-                    resp_model_str = resp_model.strip().lower()
-                    if resp_model_str not in (clean_name.lower(), target_tag.lower()):
-                        raise RuntimeError(
-                            f"Modell-Identitätskonflikt bei Vorladung: Angefordert '{target_tag}', aber Ollama antwortete mit '{resp_model}'."
-                        )
+                if not isinstance(resp_model, str) or not resp_model.strip():
+                    raise RuntimeError("Antwort von /api/generate enthält keinen gültigen Modellnamen.")
+                resp_model_str = resp_model.strip().lower()
+                if resp_model_str not in (clean_name.lower(), target_tag.lower()):
+                    raise RuntimeError(
+                        f"Modell-Identitätskonflikt bei Vorladung: Angefordert '{target_tag}', aber Ollama antwortete mit '{resp_model}'."
+                    )
 
             # 2. Check /api/ps for active running model
             async with session.get(ps_endpoint, allow_redirects=False) as ps_resp:
@@ -441,12 +442,16 @@ async def preload_ollama_model(
                             rm_name_str in (clean_lower, target_lower)
                             or rm_model_str in (clean_lower, target_lower)
                         ):
+                            res_name = rm_name.strip() if isinstance(rm_name, str) and rm_name.strip() else clean_name
+                            res_model = rm_model.strip() if isinstance(rm_model, str) and rm_model.strip() else clean_name
+                            expires_raw = rm.get("expires_at")
+                            expires_str = expires_raw.strip() if isinstance(expires_raw, str) and expires_raw.strip() else None
                             return PsModelInfo(
-                                name=str(rm.get("name", clean_name)),
-                                model=str(rm.get("model", clean_name)),
+                                name=res_name,
+                                model=res_model,
                                 size=rm.get("size") if isinstance(rm.get("size"), int) else None,
                                 size_vram=rm.get("size_vram") if isinstance(rm.get("size_vram"), int) else None,
-                                expires_at=str(rm.get("expires_at", "")) if rm.get("expires_at") else None,
+                                expires_at=expires_str,
                             )
 
                 raise RuntimeError(f"Modell '{clean_name}' wurde nicht als aktiv in Ollama gemeldet.")
@@ -511,16 +516,21 @@ async def verify_ollama_model_running(
 
                 for rm in ps_data["models"]:
                     if isinstance(rm, dict):
-                        rm_name = str(rm.get("name", "")).strip().lower()
-                        rm_model = str(rm.get("model", "")).strip().lower()
-                        if rm_name in (clean_lower, target_lower) or rm_model in (clean_lower, target_lower):
-                            expires_str = str(rm.get("expires_at", "")) if rm.get("expires_at") else None
+                        rm_name = rm.get("name")
+                        rm_model = rm.get("model")
+                        rm_name_str = rm_name.strip().lower() if isinstance(rm_name, str) else ""
+                        rm_model_str = rm_model.strip().lower() if isinstance(rm_model, str) else ""
+                        if rm_name_str in (clean_lower, target_lower) or rm_model_str in (clean_lower, target_lower):
+                            expires_raw = rm.get("expires_at")
+                            expires_str = expires_raw.strip() if isinstance(expires_raw, str) and expires_raw.strip() else None
                             exp_ts = parse_iso_expiry(expires_str)
                             if exp_ts <= 0.0 or time.time() >= exp_ts:
                                 return None
+                            res_name = rm_name.strip() if isinstance(rm_name, str) and rm_name.strip() else clean_name
+                            res_model = rm_model.strip() if isinstance(rm_model, str) and rm_model.strip() else clean_name
                             return PsModelInfo(
-                                name=str(rm.get("name", clean_name)),
-                                model=str(rm.get("model", clean_name)),
+                                name=res_name,
+                                model=res_model,
                                 size=rm.get("size") if isinstance(rm.get("size"), int) else None,
                                 size_vram=rm.get("size_vram") if isinstance(rm.get("size_vram"), int) else None,
                                 expires_at=expires_str,

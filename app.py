@@ -773,9 +773,30 @@ async def run_llm_triage_for_state(
 
     # Re-verify readiness against /api/ps if claimed ready
     if state.llm_ready_info is not None and state.llm_provider_type == "ollama" and verify_ollama_model_running is not None:
-        active_info = await verify_ollama_model_running(state.config.llm_base_url, state.config.llm_model_name)
-        if active_info is None:
-            state.invalidate_llm_ready()
+        ready_info_before = state.llm_ready_info
+        bound_url_before = state.llm_ready_bound_url
+        bound_model_before = state.llm_ready_bound_model
+        provider_type_before = state.llm_provider_type
+        url_snap = state.config.llm_base_url.strip()
+        model_snap = state.config.llm_model_name.strip()
+
+        try:
+            active_info = await verify_ollama_model_running(url_snap, model_snap)
+            if (
+                state.llm_ready_info is ready_info_before
+                and state.llm_ready_bound_url == bound_url_before
+                and state.llm_ready_bound_model == bound_model_before
+                and state.llm_provider_type == provider_type_before
+            ):
+                if active_info is None:
+                    state.invalidate_llm_ready()
+                elif active_info.expires_at:
+                    new_exp = parse_iso_expiry(active_info.expires_at) if parse_iso_expiry else 0.0
+                    if new_exp > 0.0:
+                        state.llm_ready_expires_at = new_exp
+                        state.llm_ready_info = active_info
+        except Exception:
+            pass
 
     try:
         if (
@@ -884,10 +905,26 @@ def launch_llm_triage_for_state(
     state.is_analyzing = False
     state.is_llm_running = True
 
-    if on_update_ui:
-        on_update_ui()
+    try:
+        if on_update_ui:
+            on_update_ui()
+    except Exception:
+        state.is_llm_running = False
+        raise
+
+    def _cleanup_task(t: asyncio.Task) -> None:
+        """Identity-bound idempotent cleanup callback that safely releases reservation even if cancelled prior to worker start."""
+        if state.llm_active_task is t or state.llm_active_task is None:
+            state.is_llm_running = False
+            state.llm_active_task = None
+            if on_update_ui:
+                try:
+                    on_update_ui()
+                except Exception:
+                    pass
 
     async def _runner():
+        current_task = asyncio.current_task()
         try:
             if client is not None:
                 with client:
@@ -905,13 +942,13 @@ def launch_llm_triage_for_state(
                     on_batch_complete=on_update_ui,
                 )
         finally:
-            state.is_llm_running = False
-            state.llm_active_task = None
-            if on_update_ui:
-                on_update_ui()
+            if current_task is not None:
+                _cleanup_task(current_task)
 
-    state.llm_active_task = asyncio.create_task(_runner())
-    return state.llm_active_task
+    task = asyncio.create_task(_runner())
+    state.llm_active_task = task
+    task.add_done_callback(_cleanup_task)
+    return task
 
 
 async def load_document_into_state_async(
@@ -4885,14 +4922,31 @@ def create_ui(client: Optional[Client] = None):
                 return
 
             if state.llm_setup_state == "idle" and not state.is_llm_running and state.llm_provider_type == "ollama" and verify_ollama_model_running is not None:
+                ready_info_before = state.llm_ready_info
+                bound_url_before = state.llm_ready_bound_url
+                bound_model_before = state.llm_ready_bound_model
+                provider_type_before = state.llm_provider_type
                 url_snap = state.config.llm_base_url.strip()
                 model_snap = state.config.llm_model_name.strip()
+
                 try:
                     active_info = await verify_ollama_model_running(url_snap, model_snap)
-                    if active_info is None and state.llm_ready_info is not None:
-                        state.invalidate_llm_ready()
-                        build_llm_setup_panel()
-                        build_llm_panel()
+                    # Verify state did not drift during await
+                    if (
+                        state.llm_ready_info is ready_info_before
+                        and state.llm_ready_bound_url == bound_url_before
+                        and state.llm_ready_bound_model == bound_model_before
+                        and state.llm_provider_type == provider_type_before
+                    ):
+                        if active_info is None:
+                            state.invalidate_llm_ready()
+                            build_llm_setup_panel()
+                            build_llm_panel()
+                        elif active_info.expires_at:
+                            new_exp = parse_iso_expiry(active_info.expires_at) if parse_iso_expiry else 0.0
+                            if new_exp > 0.0:
+                                state.llm_ready_expires_at = new_exp
+                                state.llm_ready_info = active_info
                 except Exception:
                     pass
 
