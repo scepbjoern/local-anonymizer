@@ -204,3 +204,30 @@ async def test_fetch_generic_models_data_not_a_list():
         assert res.status == "invalid_response"
         assert "Array" in res.message or "data" in res.message
 
+
+@pytest.mark.asyncio
+async def test_read_limited_body_chunked_streaming_abort():
+    """Verify that _read_limited_body aborts mid-stream without buffering all data when limit is exceeded."""
+    from local_anonymizer.llm.provider import _read_limited_body
+
+    class ChunkedStream:
+        def __init__(self, chunk_count=500, chunk_size=10000):
+            self.chunk_count = chunk_count
+            self.chunk_size = chunk_size
+            self.yielded = 0
+
+        async def iter_chunked(self, n):
+            for _ in range(self.chunk_count):
+                self.yielded += 1
+                yield b"x" * self.chunk_size
+
+    class ChunkedResp:
+        def __init__(self):
+            self.content = ChunkedStream()
+
+    resp = ChunkedResp()
+    with pytest.raises(ValueError, match="Größenlimit|Limit"):
+        await _read_limited_body(resp, max_bytes=50000)
+
+    # Aborted early after ~6 chunks, NOT reading through all 500 chunks
+    assert resp.content.yielded < 10

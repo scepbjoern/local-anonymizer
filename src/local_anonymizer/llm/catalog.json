@@ -6,7 +6,7 @@
       "aliases": [],
       "tested_tag": "qwen3:8b",
       "provider": "Ollama",
-      "hardware_class": "Apple M-Series / NVIDIA RTX UAT-Referenzumgebung",
+      "hardware_class": "Lokale UAT-Referenzumgebung (Windows / NVIDIA RTX)",
       "test_date": "2026-09-01",
       "phase_6a_triage": {
         "status": "recommended",
@@ -22,7 +22,7 @@
       "aliases": [],
       "tested_tag": "ministral-3:8b",
       "provider": "Ollama",
-      "hardware_class": "Apple M-Series / NVIDIA RTX UAT-Referenzumgebung",
+      "hardware_class": "Lokale UAT-Vorprüfung",
       "test_date": "2026-09-01",
       "phase_6a_triage": {
         "status": "suitable",
@@ -38,7 +38,7 @@
       "aliases": [],
       "tested_tag": "qwen3.5:9b",
       "provider": "Ollama",
-      "hardware_class": "Apple M-Series / NVIDIA RTX UAT-Referenzumgebung",
+      "hardware_class": "Lokale UAT-Vorprüfung",
       "test_date": "2026-09-01",
       "phase_6a_triage": {
         "status": "suitable",
@@ -54,7 +54,7 @@
       "aliases": [],
       "tested_tag": "phi4:latest",
       "provider": "Ollama",
-      "hardware_class": "Apple M-Series / NVIDIA RTX UAT-Referenzumgebung",
+      "hardware_class": "Lokale UAT-Vorprüfung",
       "test_date": "2026-09-01",
       "phase_6a_triage": {
         "status": "limited",

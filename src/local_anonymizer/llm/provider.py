@@ -169,6 +169,24 @@ def _parse_strict_json(body_bytes: bytes) -> Any:
         raise ValueError("Antwort ist kein gültiges JSON.") from jde
 
 
+def parse_iso_expiry(expires_str: Optional[str]) -> float:
+    """
+    Parse ISO expiry timestamp with timezone to UNIX epoch float.
+    Returns 0.0 if expires_str is missing or unparseable, preventing unverified infinite readiness.
+    """
+    if not expires_str or not isinstance(expires_str, str):
+        return 0.0
+    try:
+        from datetime import datetime
+        cleaned = expires_str.strip()
+        if cleaned.endswith("Z"):
+            cleaned = cleaned[:-1] + "+00:00"
+        dt = datetime.fromisoformat(cleaned)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
 async def fetch_ollama_models(
     base_url: str,
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
@@ -371,7 +389,12 @@ async def preload_ollama_model(
                 raw_ct = resp.headers.get("Content-Type", "")
                 if not is_valid_json_mime(raw_ct):
                     raise RuntimeError(f"Ungültiger Content-Type bei /api/generate: '{raw_ct}'.")
-                await _read_limited_body(resp, MAX_RESPONSE_BYTES)
+                gen_body_bytes = await _read_limited_body(resp, MAX_RESPONSE_BYTES)
+                gen_data = _parse_strict_json(gen_body_bytes)
+                if not isinstance(gen_data, dict):
+                    raise RuntimeError("Antwort von /api/generate ist kein gültiges JSON-Objekt.")
+                if "error" in gen_data and gen_data["error"]:
+                    raise RuntimeError(f"Ollama meldete Fehler beim Vorladen: {gen_data['error']}")
 
             # 2. Check /api/ps for active running model
             async with session.get(ps_endpoint, allow_redirects=False) as ps_resp:

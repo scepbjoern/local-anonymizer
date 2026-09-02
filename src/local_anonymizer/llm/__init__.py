@@ -35,6 +35,7 @@ from local_anonymizer.llm.provider import (
     fetch_generic_models,
     preload_ollama_model,
     test_generic_connection,
+    parse_iso_expiry,
     DEFAULT_OLLAMA_KEEP_ALIVE,
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_READ_TIMEOUT,

@@ -97,7 +97,7 @@ pip install -e ".[gui,llm]"
    # Or browser mode:
    uv run --extra gui --extra llm python app.py --browser
    ```
-4. In the Desktop GUI sidebar, enable LLM review and set the model name (`qwen3:8b`).
+4. In the Desktop GUI, enable the LLM Review Assistant (top area), select or enter your local model (e.g. `qwen3:8b`), and optionally preload it.
 
 > [!NOTE]
 > **Hardware & Performance:**

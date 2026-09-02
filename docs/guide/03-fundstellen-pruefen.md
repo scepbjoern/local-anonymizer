@@ -110,7 +110,7 @@ Kontext, bevor du sie übernimmst.
 
 ## Optionale lokale LLM-Review-Assistenz (Triage-Panel)
 
-Wenn du das optionale Zusatzpaket `[llm]` installiert und in der Seitenleiste ein lokales Modell (z. B. `qwen3:8b` über Ollama) eingerichtet hast, steht dir das **LLM-Triage-Panel** zur Verfügung.
+Wenn du das optionale Zusatzpaket `[llm]` installiert und im oberen LLM-Bereich ein lokales Modell (z. B. `qwen3:8b` über Ollama) eingerichtet hast, steht dir das **LLM-Triage-Panel** zur Verfügung.
 
 ### Wie die Assistenz funktioniert
 1. **Sequenzielle Batches:** Die erkannten Fundstellen werden in kleinen, tokenbegrenzten Portionen mit ihrem jeweiligen Textkontext an das lokale Modell übergeben.
@@ -136,4 +136,3 @@ Wenn du das optionale Zusatzpaket `[llm]` installiert und in der Seitenleiste ei
 Bricht die Modellverbindung ab oder kann ein Batch wegen eines Timeouts nicht verarbeitet werden, zeigt die Anwendung einen amberfarbenen Hinweis mit den betroffenen ungeprüften Fundstellen.
 - **Sicherheit:** Die Sammelübernahme („Ausgewählte Änderungen übernehmen“) wird bei unvollständigen Läufen gesperrt.
 - **Einzelübernahme:** Erfolgreich geprüfte Vorschläge können weiterhin einzeln geprüft und übernommen werden. Ungeprüfte Fundstellen verbleiben im ursprünglichen Zustand der Review-Tabelle.
-

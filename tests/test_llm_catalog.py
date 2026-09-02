@@ -209,3 +209,12 @@ def test_catalog_package_resource_loading():
     data = json.loads(content)
     assert data.get("schema_version") == "1.0.0"
 
+
+def test_find_catalog_entry_corrupted_raises_catalog_error(tmp_path, monkeypatch):
+    corrupt_file = tmp_path / "corrupt_catalog.json"
+    corrupt_file.write_text("{corrupted-json", encoding="utf-8")
+    monkeypatch.setattr("local_anonymizer.llm.catalog.DEFAULT_CATALOG_PATH", corrupt_file)
+    monkeypatch.setattr("local_anonymizer.llm.catalog._CACHED_CATALOG", None)
+
+    with pytest.raises(CatalogError):
+        find_catalog_entry("qwen3:8b")

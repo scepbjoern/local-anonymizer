@@ -83,6 +83,7 @@ try:
         CatalogError,
         DiscoveryResult,
         PsModelInfo,
+        parse_iso_expiry,
         PROVIDER_TYPE_OLLAMA,
         PROVIDER_TYPE_GENERIC,
     )
@@ -101,6 +102,7 @@ except ImportError:
     find_catalog_entry = None  # type: ignore
     get_model_suitability_badge = None  # type: ignore
     CatalogError = Exception  # type: ignore
+    parse_iso_expiry = lambda s: 0.0  # type: ignore
     PROVIDER_TYPE_OLLAMA = "ollama"
     PROVIDER_TYPE_GENERIC = "generic"
 
@@ -598,6 +600,7 @@ def reset_app_state(st: "AppState") -> None:
         st.llm_setup_task.cancel()
     st.llm_setup_task = None
     st.llm_setup_state = "idle"
+    st.llm_setup_request_id = ""
     if getattr(st, "llm_active_task", None) and not st.llm_active_task.done():
         st.llm_active_task.cancel()
     st.llm_active_task = None
@@ -617,6 +620,7 @@ def reset_app_state(st: "AppState") -> None:
     st.llm_partial_failure = False
     st.llm_unprocessed_occ_ids.clear()
     st.llm_provider = None
+    st.invalidate_llm_ready()
 
 
 async def reset_app_state_async(st: "AppState") -> None:
@@ -706,6 +710,21 @@ async def run_triage_batch_loop(
         await asyncio.sleep(0.01)
 
 
+async def load_document_into_state_async(
+    state: "AppState",
+    text: str,
+    filename: str,
+    raw_bytes: Optional[bytes] = None,
+) -> None:
+    """
+    Asynchronously clean up active LLM session and load new document text/bytes into AppState.
+    """
+    await reset_app_state_async(state)
+    state.filename = filename
+    state.raw_text = text
+    state.last_raw_bytes = raw_bytes
+
+
 def load_document_into_state(
     state: "AppState",
     text: str,
@@ -713,7 +732,7 @@ def load_document_into_state(
     raw_bytes: Optional[bytes] = None,
 ) -> None:
     """
-    Load extracted document text and optional raw bytes into AppState.
+    Synchronous fallback to load extracted document text and optional raw bytes into AppState.
     Clears previous analysis and overrides via reset_app_state while preserving the new raw_bytes.
     """
     reset_app_state(state)
@@ -904,6 +923,8 @@ class AppState:
         self.llm_ready_expires_at = 0.0
         self.llm_ready_bound_url = ""
         self.llm_ready_bound_model = ""
+        if self.llm_setup_status_msg == "Modell bereit":
+            self.llm_setup_status_msg = ""
 
     def is_model_ready(self) -> bool:
         """
@@ -915,8 +936,9 @@ class AppState:
             and self.llm_provider_type == "ollama"
             and self.llm_ready_bound_url == self.config.llm_base_url.strip()
             and self.llm_ready_bound_model == self.config.llm_model_name.strip()
+            and self.llm_ready_expires_at > 0.0
         ):
-            if self.llm_ready_expires_at > 0.0 and time.time() >= self.llm_ready_expires_at:
+            if time.time() >= self.llm_ready_expires_at:
                 self.invalidate_llm_ready()
                 return False
             return True
@@ -1675,11 +1697,11 @@ def create_ui(client: Optional[Client] = None):
     map_json_input = None
     restored_preview = None
 
-    def load_content_into_workspace(text: str, filename: str, raw_bytes: Optional[bytes] = None):
-        """Unified workspace loader."""
+    async def load_content_into_workspace(text: str, filename: str, raw_bytes: Optional[bytes] = None):
+        """Unified asynchronous workspace loader."""
         if not check_mutation_allowed():
             return
-        load_document_into_state(state, text, filename, raw_bytes=raw_bytes)
+        await load_document_into_state_async(state, text, filename, raw_bytes=raw_bytes)
         if raw_text_area is not None:
             raw_text_area.value = text
         if analyze_btn is not None:
@@ -1723,7 +1745,7 @@ def create_ui(client: Optional[Client] = None):
                 state.include_headers_footers,
                 state.extract_picture_text,
             )
-            load_content_into_workspace(text, filename, raw_bytes=raw_bytes)
+            await load_content_into_workspace(text, filename, raw_bytes=raw_bytes)
         except Exception as ex:
             err_msg = f"{type(ex).__name__}: {str(ex)}"
             logging.error(f"File extraction error: {err_msg}", exc_info=True)
@@ -2174,12 +2196,21 @@ def create_ui(client: Optional[Client] = None):
                         state.register_mutating_element(auto_review_checkbox, "llm_setup")
 
                     # Row 3: Catalog Info & Privacy Notice (Discreet and compact)
-                    curr_entry = find_catalog_entry(state.config.llm_model_name)
+                    catalog_err_msg: Optional[str] = None
+                    curr_entry: Optional[Any] = None
+                    try:
+                        curr_entry = find_catalog_entry(state.config.llm_model_name)
+                    except CatalogError as ce:
+                        catalog_err_msg = str(ce)
+
                     with ui.row().classes("w-full items-center justify-between gap-2 px-2.5 py-1 bg-slate-100/70 border border-slate-200 rounded text-xs text-slate-600 flex-wrap"):
                         with ui.row().classes("items-center gap-2"):
-                            if curr_entry is not None:
+                            if catalog_err_msg is not None:
+                                ui.badge("Katalog-Fehler", color="negative").props("dense").tooltip(f"Modellkatalog nicht verfügbar: {catalog_err_msg}")
+                                ui.label("Katalog-Integritätsfehler").classes("text-[11px] text-red-600 font-medium")
+                            elif curr_entry is not None:
                                 lbl, col, tt = get_model_suitability_badge(state.config.llm_model_name)
-                                ui.badge(f"Katalog: {lbl}", color=col).props("dense")
+                                ui.badge(f"Katalog: {lbl}", color=col).props("dense").tooltip(tt)
                                 ui.label(f"{curr_entry.phase_6a_triage.reason}").classes("text-[11px] text-slate-600")
                                 if curr_entry.hardware_class:
                                     ui.label(f"({curr_entry.hardware_class})").classes("text-[10px] text-slate-400 font-mono")
@@ -2190,17 +2221,6 @@ def create_ui(client: Optional[Client] = None):
                         with ui.row().classes("items-center gap-1 text-[11px] text-slate-500"):
                             ui.icon("lock", size="xs").classes("text-slate-400")
                             ui.label("Empfehlung: Ollama im Local-Only-Modus betreiben (OLLAMA_NO_CLOUD=1) · ':cloud' gesperrt").classes("text-[10px]")
-
-    def parse_iso_expiry(expires_str: Optional[str], default_ttl_seconds: float = 300.0) -> float:
-        """Parse ISO expiry timestamp to UNIX epoch float or return now + default_ttl_seconds."""
-        if not expires_str or not isinstance(expires_str, str):
-            return time.time() + default_ttl_seconds
-        try:
-            from datetime import datetime
-            dt = datetime.fromisoformat(expires_str.strip())
-            return dt.timestamp()
-        except Exception:
-            return time.time() + default_ttl_seconds
 
     async def trigger_model_discovery():
         if not check_mutation_allowed():
@@ -2287,9 +2307,13 @@ def create_ui(client: Optional[Client] = None):
                 ):
                     return
 
+                expiry_ts = parse_iso_expiry(getattr(ps_info, "expires_at", None))
+                if expiry_ts <= 0.0:
+                    expiry_ts = time.time() + 300.0
+
                 state.llm_ready_info = ps_info
                 state.llm_ready_timestamp = time.time()
-                state.llm_ready_expires_at = parse_iso_expiry(getattr(ps_info, "expires_at", None))
+                state.llm_ready_expires_at = expiry_ts
                 state.llm_ready_bound_url = url_snap
                 state.llm_ready_bound_model = model_snap
                 state.llm_setup_status_msg = "Modell bereit"
@@ -2633,7 +2657,8 @@ def create_ui(client: Optional[Client] = None):
 
             # Check if LLM review should immediately chain into execution (Decision 1 from Handoff 1316)
             if state.config.llm_enabled and state.config.llm_auto_review and LLM_AVAILABLE and state.entity_groups:
-                await asyncio.sleep(0.5)
+                state.is_analyzing = False
+                await asyncio.sleep(0.05)
                 task = launch_llm_triage(triggered_from_analysis=True)
                 if task is not None:
                     try:
@@ -2651,7 +2676,8 @@ def create_ui(client: Optional[Client] = None):
             ui.notify(f"Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
         finally:
             state.is_analyzing = False
-            set_mutating_controls_disabled(False)
+            if not state.is_llm_running and state.llm_setup_state == "idle":
+                set_mutating_controls_disabled(False)
             if analyze_btn:
                 analyze_btn.props(remove="loading")
             if progress_holder:
@@ -2664,12 +2690,30 @@ def create_ui(client: Optional[Client] = None):
                 ui.notify("Eine LLM-Prüfung läuft bereits.", type="info")
             return state.llm_active_task
 
+        if state.llm_setup_state != "idle":
+            if not triggered_from_analysis:
+                ui.notify("LLM-Prüfung kann während laufendem Setup nicht gestartet werden.", type="warning")
+            return None
+
+        if state.is_analyzing and not triggered_from_analysis:
+            ui.notify("LLM-Prüfung kann während laufender Textanalyse nicht gestartet werden.", type="warning")
+            return None
+
+        # Synchronously lock busy state before creating task
+        state.is_llm_running = True
+        set_mutating_controls_disabled(True)
+
         async def _runner():
-            if client is not None:
-                with client:
+            try:
+                if client is not None:
+                    with client:
+                        await run_llm_triage(triggered_from_analysis=triggered_from_analysis)
+                else:
                     await run_llm_triage(triggered_from_analysis=triggered_from_analysis)
-            else:
-                await run_llm_triage(triggered_from_analysis=triggered_from_analysis)
+            finally:
+                state.is_llm_running = False
+                state.llm_active_task = None
+                set_mutating_controls_disabled(False)
 
         state.llm_active_task = asyncio.create_task(_runner())
         return state.llm_active_task
@@ -2974,7 +3018,7 @@ def create_ui(client: Optional[Client] = None):
                         with ui.row().classes("items-center gap-2 text-slate-700 text-xs"):
                             ui.icon("psychology", size="sm").classes("text-slate-400")
                             ui.label("Lokale LLM-Review-Assistenz ist deaktiviert.").classes("font-semibold")
-                            ui.label("Aktivieren Sie die Option in der Konfiguration (Seitenleiste), um Fundstellen automatisch durch ein lokales LLM prüfen zu lassen.").classes("text-slate-500")
+                            ui.label("Aktivieren Sie die Option in der LLM-Konfiguration (oberer Bereich), um Fundstellen automatisch durch ein lokales LLM prüfen zu lassen.").classes("text-slate-500")
                         def enable_in_config():
                             state.config.llm_enabled = True
                             save_current_config(state)
@@ -3029,7 +3073,7 @@ def create_ui(client: Optional[Client] = None):
                             if not has_entities:
                                 triage_start_btn.tooltip("Führen Sie zuerst eine Textanalyse durch, um Fundstellen zu ermitteln.")
                             elif not has_model:
-                                triage_start_btn.tooltip("Geben Sie in der Seitenleiste einen Modellnamen an (z. B. qwen3:8b).")
+                                triage_start_btn.tooltip("Geben Sie im oberen LLM-Bereich einen Modellnamen an (z. B. qwen3:8b).")
 
                 if state.is_llm_running:
                     with ui.column().classes("w-full mt-2"):
@@ -4749,6 +4793,15 @@ def create_ui(client: Optional[Client] = None):
                                 render_entity_source_overview(overview)
 
                         asyncio.create_task(load_and_render())
+
+    def check_readiness_expiry():
+        if state.llm_ready_info is not None and state.llm_ready_expires_at > 0.0:
+            if time.time() >= state.llm_ready_expires_at:
+                state.invalidate_llm_ready()
+                build_llm_setup_panel()
+                build_llm_panel()
+
+    ui.timer(2.0, check_readiness_expiry)
 
 
 def main():
