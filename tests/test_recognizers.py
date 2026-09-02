@@ -471,6 +471,99 @@ def test_eupii_subtoken_span_score_aggregation():
     assert res.score >= 0.50
 
 
+def test_eupii_mixed_fine_grained_subtoken_labels_aggregation():
+    """
+    Verify that subtokens with different fine-grained labels mapping to the same canonical
+    category (e.g. B-DOCUMENT_REFERENCE, I-DOCUMENT_IDENTIFIER, I-ACCOUNT_IDENTIFIER)
+    are seamlessly aggregated into a single continuous ID_NUMBER span.
+    """
+    import torch
+    from local_anonymizer.recognizers import EUPiiRecognizer
+
+    rec = EUPiiRecognizer(threshold=0.50)
+    text = "LEISTUNGSABRECHNUNG 1752347575 Winterthur"
+
+    class DummyBatch(dict):
+        def pop(self, key, default=None):
+            return super().pop(key, default)
+
+    class DummyTokenizer:
+        def __call__(self, text, **kwargs):
+            # Token offsets for "1752347575":
+            # 0: [0, 19] "LEISTUNGSABRECHNUNG" -> O
+            # 1: [19, 20] " " -> O
+            # 2: [20, 23] "175" -> B-DOCUMENT_REFERENCE (maps to ID_NUMBER)
+            # 3: [23, 25] "23" -> I-DOCUMENT_IDENTIFIER (maps to ID_NUMBER)
+            # 4: [25, 26] "4" -> I-DOCUMENT_IDENTIFIER (maps to ID_NUMBER)
+            # 5: [26, 28] "75" -> I-ACCOUNT_IDENTIFIER (maps to ID_NUMBER)
+            # 6: [28, 30] "75" -> I-ORGANIZATION_IDENTIFIER (maps to ID_NUMBER)
+            # 7: [30, 31] " " -> O
+            # 8: [31, 41] "Winterthur" -> B-LOCATION
+            offsets = [
+                (0, 19),
+                (19, 20),
+                (20, 23),
+                (23, 25),
+                (25, 26),
+                (26, 28),
+                (28, 30),
+                (30, 31),
+                (31, 41),
+            ]
+            batch = DummyBatch({
+                "input_ids": torch.tensor([[1] * len(offsets)]),
+                "attention_mask": torch.tensor([[1] * len(offsets)]),
+                "offset_mapping": [offsets],
+            })
+            return batch
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = type("Config", (), {
+                "id2label": {
+                    0: "O",
+                    1: "B-DOCUMENT_REFERENCE",
+                    2: "I-DOCUMENT_IDENTIFIER",
+                    3: "I-ACCOUNT_IDENTIFIER",
+                    4: "I-ORGANIZATION_IDENTIFIER",
+                    5: "B-LOCATION",
+                }
+            })()
+
+        def forward(self, **kwargs):
+            num_tokens = 9
+            logits = torch.full((1, num_tokens, 6), -10.0)
+            logits[0, 0, 0] = 10.0  # O
+            logits[0, 1, 0] = 10.0  # O
+            logits[0, 2, 1] = 10.0  # 175 -> B-DOCUMENT_REFERENCE
+            logits[0, 3, 2] = 10.0  # 23 -> I-DOCUMENT_IDENTIFIER
+            logits[0, 4, 2] = 10.0  # 4 -> I-DOCUMENT_IDENTIFIER
+            logits[0, 5, 3] = 10.0  # 75 -> I-ACCOUNT_IDENTIFIER
+            logits[0, 6, 4] = 10.0  # 75 -> I-ORGANIZATION_IDENTIFIER
+            logits[0, 7, 0] = 10.0  # O
+            logits[0, 8, 5] = 10.0  # Winterthur -> B-LOCATION
+            return type("Outputs", (), {"logits": logits})()
+
+    rec.tokenizer = DummyTokenizer()
+    rec.model = DummyModel()
+    rec.id2label = rec.model.config.id2label
+    rec.device = "cpu"
+
+    results = rec.analyze(text)
+    assert len(results) == 2
+
+    id_res = next((r for r in results if r.entity_type == "ID_NUMBER"), None)
+    loc_res = next((r for r in results if r.entity_type == "LOCATION"), None)
+
+    assert id_res is not None
+    assert text[id_res.start:id_res.end] == "1752347575"
+    assert id_res.score >= 0.50
+
+    assert loc_res is not None
+    assert text[loc_res.start:loc_res.end] == "Winterthur"
+
+
 def test_is_model_cached_offline_check(monkeypatch):
     """Verify is_model_cached correctly checks local cache without triggering downloads."""
     import transformers

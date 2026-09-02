@@ -1095,18 +1095,18 @@ class EUPiiRecognizer(EntityRecognizer):
             w_offsets = offset_mapping[window_idx]
             w_tokens = inputs["input_ids"][window_idx]
 
-            current_entity_type: Optional[str] = None
+            current_canonical_type: Optional[str] = None
             current_start: Optional[int] = None
             current_end: Optional[int] = None
             current_scores: List[float] = []
 
             def flush_entity():
-                if current_entity_type and current_start is not None and current_end is not None:
+                nonlocal current_canonical_type, current_start, current_end, current_scores
+                if current_canonical_type and current_start is not None and current_end is not None:
                     avg_score = sum(current_scores) / len(current_scores)
                     if avg_score >= self.threshold:
-                        std_type = EU_PII_CATEGORY_MAPPING.get(current_entity_type, current_entity_type)
                         raw_candidates.append({
-                            "type": std_type,
+                            "type": current_canonical_type,
                             "start": current_start,
                             "end": current_end,
                             "score": avg_score,
@@ -1119,28 +1119,33 @@ class EUPiiRecognizer(EntityRecognizer):
             for token_id, score, (start_char, end_char) in zip(w_ids, w_scores, w_offsets):
                 if start_char == end_char:
                     flush_entity()
-                    current_entity_type = None
+                    current_canonical_type = None
                     continue
 
                 pred_label = self.id2label.get(token_id, "O")
 
                 if pred_label == "O":
                     flush_entity()
-                    current_entity_type = None
+                    current_canonical_type = None
                     continue
 
                 bio_tag = pred_label[:1]
-                ent_type = pred_label[2:]
+                raw_ent_type = pred_label[2:]
+                canonical_type = EU_PII_CATEGORY_MAPPING.get(raw_ent_type, raw_ent_type)
 
-                # Expand the current entity if it is a sub-token (continuation of a word)
-                # or an explicit I- tag of the same entity type.
+                # Expand the current entity if:
+                # 1) It is a direct sub-token continuation without intervening whitespace (e.g. BPE/wordpiece split of number or word)
+                #    belonging to the same canonical category.
+                # 2) It is an explicit I- tag of the same canonical category.
                 is_subtoken = current_start is not None and current_end == start_char
-                if current_entity_type == ent_type and (bio_tag == "I" or (is_subtoken and bio_tag == "B")):
+                is_same_canonical = current_canonical_type == canonical_type
+
+                if is_same_canonical and (bio_tag == "I" or is_subtoken):
                     current_end = end_char
                     current_scores.append(score)
                 else:
                     flush_entity()
-                    current_entity_type = ent_type
+                    current_canonical_type = canonical_type
                     current_start = start_char
                     current_end = end_char
                     current_scores = [score]
@@ -1167,6 +1172,12 @@ class EUPiiRecognizer(EntityRecognizer):
             c_end -= r_strip
 
             if c_start >= c_end:
+                continue
+
+            # Reject sub-word fragments sliced inside unbroken alphanumeric words
+            if c_start > 0 and text[c_start - 1].isalnum() and text[c_start].isalnum():
+                continue
+            if c_end < len(text) and text[c_end - 1].isalnum() and text[c_end].isalnum():
                 continue
 
             overlaps_accepted = any(
