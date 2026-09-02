@@ -1349,7 +1349,35 @@ class TestProfileControllerR1ToR5:
         assert "term_value = str(g_term.value or \"\").strip()" in source
         assert "role = cfg.glossary_roles.get(key)" in source
         profile_block = source[source.index("def open_profile_manager"):source.index("with ui.card().classes(\"w-full mb-3", panel_start)]
-        assert profile_block.count("max-h-64 overflow-y-auto") == 3
+        assert "w-[1000px] max-w-full h-[82vh] max-h-[92vh] p-4" in profile_block
+        assert profile_block.count("max-h-[60vh] overflow-y-auto") == 3
+        assert "rerender=False" in profile_block
+        assert "mode_state: list[Any] = selected_mode" in profile_block
+        assert "on_abort=lambda target=selected, previous=previous_mode" in profile_block
+
+    def test_category_mutation_can_keep_profile_manager_list_rendered(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        controller.acknowledge_warning(expected_revision=controller.manifest["revision"])
+        fake_ui = _FakeUi()
+        state, ns = _make_gui_adapter_context(store, controller, fake_ui, {"value": False})
+        render_calls = []
+        after_success_calls = []
+        ns["render_all"] = lambda: render_calls.append("render")
+        ns["mutate"].__globals__.update(ns)
+
+        ns["mutate"](
+            "project",
+            lambda: controller.set_entity_mode(ScopeLevel.PROJECT, "PERSON", ENTITY_MODE_OFF),
+            after_success=lambda: after_success_calls.append("after"),
+            expected_project_id=state.project_profile.project_id,
+            rerender=False,
+        )
+
+        assert controller.project_profile.entity_modes["PERSON"] == ENTITY_MODE_OFF
+        assert after_success_calls == ["after"]
+        assert render_calls == []
 
     def test_actual_profile_sync_updates_sidebar_category_selectors(self, tmp_path):
         store = _make_store(tmp_path)

@@ -4863,7 +4863,7 @@ def create_ui(client: Optional[Client] = None):
         if not check_mutation_allowed():
             return
         controller = _profile_controller()
-        with ui.dialog() as dialog, ui.card().classes("w-[1000px] max-w-full p-4"):
+        with ui.dialog() as dialog, ui.card().classes("w-[1000px] max-w-full h-[82vh] max-h-[92vh] p-4"):
             ui.label("Profile & Begriffe verwalten").classes("text-lg font-bold text-slate-800")
             ui.label("Systemänderungen gelten global, Projektänderungen dauerhaft für das Projekt, Dokumentänderungen nur für diese Sitzung.").classes("text-xs text-slate-600 mb-2")
             scope_select = ui.select(
@@ -4884,6 +4884,8 @@ def create_ui(client: Optional[Client] = None):
                 action: Callable[[], None],
                 after_success: Optional[Callable[[], None]] = None,
                 expected_project_id: Optional[str] = None,
+                rerender: bool = True,
+                on_abort: Optional[Callable[[], None]] = None,
             ) -> None:
                 if not check_mutation_allowed():
                     return
@@ -4897,7 +4899,8 @@ def create_ui(client: Optional[Client] = None):
                 if scope == "document":
                     action()
                     _sync_profile_controller()
-                    render_all()
+                    if rerender:
+                        render_all()
                     if after_success:
                         after_success()
                     return
@@ -4916,33 +4919,50 @@ def create_ui(client: Optional[Client] = None):
                         action()
                         controller.save_project(expected_revision=controller.project_profile.revision)
                     _sync_profile_controller()
-                    render_all()
+                    if rerender:
+                        render_all()
                     if after_success:
                         after_success()
-                _run_durable_profile_action(durable_action, system_mutation=(scope == "system"))
+                _run_durable_profile_action(
+                    durable_action,
+                    system_mutation=(scope == "system"),
+                    on_abort=on_abort,
+                )
 
             def render_categories() -> None:
                 category_holder.clear()
                 cfg = controller.effective_config()
                 scope = scope_select.value or "project"
                 with category_holder:
-                    with ui.column().classes("w-full max-h-64 overflow-y-auto gap-1 pr-1"):
+                    with ui.column().classes("w-full max-h-[60vh] overflow-y-auto gap-1 pr-1"):
                         for entity in AVAILABLE_ENTITIES:
                             with ui.row().classes("w-full items-center gap-2 mb-1"):
                                 ui.label(entity).classes("font-mono text-xs w-44")
                                 if scope == "system":
                                     ui.badge("System: nur Begriffe", color="grey-7").props("dense")
                                     continue
-                                selector = ui.select(get_entity_mode_options(entity), value=cfg.entity_modes.get(entity, ENTITY_MODE_OFF)).props("dense outlined").classes("w-80 text-xs")
-                                def on_mode(event: Any, ent: str = entity, selected: Any = selector) -> None:
+                                selected_mode = [cfg.entity_modes.get(entity, ENTITY_MODE_OFF)]
+                                selector = ui.select(get_entity_mode_options(entity), value=selected_mode[0]).props("dense outlined").classes("w-80 text-xs")
+                                def on_mode(
+                                    event: Any,
+                                    ent: str = entity,
+                                    selected: Any = selector,
+                                    mode_state: list[Any] = selected_mode,
+                                ) -> None:
+                                    if profile_ui_sync_depth[0]:
+                                        return
                                     mode_value = event.value
+                                    previous_mode = mode_state[0]
                                     _set_profile_ui_value(selected, mode_value)
                                     selected_scope = str(scope_select.value or "project")
                                     selected_project_id = state.project_profile.project_id if state.project_profile else None
                                     mutate(
                                         selected_scope,
                                         lambda: controller.set_entity_mode(selected_scope, ent, mode_value),
+                                        after_success=lambda: mode_state.__setitem__(0, mode_value),
                                         expected_project_id=selected_project_id,
+                                        rerender=False,
+                                        on_abort=lambda target=selected, previous=previous_mode: _set_profile_ui_value(target, previous),
                                     )
                                 selector.on_value_change(on_mode)
                                 state.register_mutating_element(selector, "sidebar")
@@ -4973,7 +4993,7 @@ def create_ui(client: Optional[Client] = None):
                                 expected_project_id=selected_project_id,
                             )
                         ui.button("Hinzufügen", icon="add", on_click=add_glossary, color="primary").props("dense")
-                    with ui.column().classes("w-full max-h-64 overflow-y-auto gap-1 pr-1"):
+                    with ui.column().classes("w-full max-h-[60vh] overflow-y-auto gap-1 pr-1"):
                         for key, value in sorted(cfg.glossary.items(), key=lambda item: item[0].casefold()):
                             provenance = cfg.glossary_provenance.get(normalize_term_key(key))
                             label = provenance[1] if provenance else "wirksam"
@@ -5005,7 +5025,7 @@ def create_ui(client: Optional[Client] = None):
                                 expected_project_id=selected_project_id,
                             )
                         ui.button("Hinzufügen", icon="add", on_click=add_ignore, color="primary").props("dense")
-                    with ui.column().classes("w-full max-h-64 overflow-y-auto gap-1 pr-1"):
+                    with ui.column().classes("w-full max-h-[60vh] overflow-y-auto gap-1 pr-1"):
                         for key in sorted(cfg.ignore_provenance, key=str.casefold):
                             provenance = cfg.ignore_provenance.get(key)
                             with ui.row().classes("w-full items-center gap-2 mb-1"):
