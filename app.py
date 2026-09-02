@@ -2091,7 +2091,6 @@ def create_ui(client: Optional[Client] = None):
                                 state.invalidate_llm_ready()
                                 await state.close_llm_provider()
                                 save_current_config(state)
-                                build_llm_setup_panel()
                                 build_llm_panel()
 
                         base_url_input = ui.input(
