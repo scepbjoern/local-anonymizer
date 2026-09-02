@@ -1785,6 +1785,7 @@ def save_current_config(st: AppState):
         for term in parse_ignore_terms(st.ignore_terms_text)
         if normalize_term_key(term)
     }
+    config = getattr(st, "config", None)
     manifest_updates = {
         "format_mode": st.format_mode,
         "gliner_model_name": st.gliner_model_name,
@@ -1793,6 +1794,11 @@ def save_current_config(st: AppState):
         "eupii_threshold": st.eupii_threshold,
         "eupii_model_name": st.eupii_model_name,
         "export_format": st.export_format,
+        "llm_enabled": getattr(config, "llm_enabled", False),
+        "llm_base_url": getattr(config, "llm_base_url", "http://127.0.0.1:11434/v1"),
+        "llm_model_name": getattr(config, "llm_model_name", "qwen3:8b"),
+        "llm_provider_type": getattr(config, "llm_provider_type", "ollama"),
+        "llm_auto_review": getattr(config, "llm_auto_review", True),
     }
     try:
         controller.save_project(expected_revision=project.revision)
@@ -4701,12 +4707,10 @@ def create_ui(client: Optional[Client] = None):
         """Return the controller bound to this session's current scope objects."""
         if state.profile_controller is None:
             state.profile_controller = ProfileController(state.profile_store)
-        state.profile_controller.system_profile = state.system_profile
-        state.profile_controller.project_profile = state.project_profile
-        state.profile_controller.document_overlay = state.document_overlay
         return state.profile_controller
 
     def _sync_profile_controller() -> None:
+        """Copy the controller's authoritative result into the session state."""
         controller = _profile_controller()
         state.system_profile = controller.system_profile
         state.project_profile = controller.project_profile
@@ -4797,20 +4801,40 @@ def create_ui(client: Optional[Client] = None):
                 categories_tab = ui.tab("Kategorien")
                 glossary_tab = ui.tab("Glossar")
                 ignore_tab = ui.tab("Ignore-Liste")
-            category_holder = ui.column().classes("w-full")
-            glossary_holder = ui.column().classes("w-full")
-            ignore_holder = ui.column().classes("w-full")
+            category_holder = None
+            glossary_holder = None
+            ignore_holder = None
 
-            def mutate(scope: str, action: Callable[[], None]) -> None:
+            def mutate(
+                scope: str,
+                action: Callable[[], None],
+                after_success: Optional[Callable[[], None]] = None,
+                expected_project_id: Optional[str] = None,
+            ) -> None:
                 if not check_mutation_allowed():
                     return
                 controller = _profile_controller()
+                if expected_project_id and (
+                    state.project_profile is None
+                    or state.project_profile.project_id != expected_project_id
+                ):
+                    ui.notify("Änderung abgebrochen: Das aktive Projekt wurde inzwischen gewechselt.", type="warning")
+                    return
                 if scope == "document":
                     action()
                     _sync_profile_controller()
                     render_all()
+                    if after_success:
+                        after_success()
                     return
                 def durable_action() -> None:
+                    if not check_mutation_allowed():
+                        raise RevisionConflictError("Profile mutation became unavailable while the dialog was open")
+                    if expected_project_id and (
+                        state.project_profile is None
+                        or state.project_profile.project_id != expected_project_id
+                    ):
+                        raise RevisionConflictError("Active project changed while the dialog was open")
                     if scope == "system":
                         controller.run_system_mutation(action, confirmed=True)
                         controller.save_system(expected_revision=controller.system_profile.revision)
@@ -4819,6 +4843,8 @@ def create_ui(client: Optional[Client] = None):
                         controller.save_project(expected_revision=controller.project_profile.revision)
                     _sync_profile_controller()
                     render_all()
+                    if after_success:
+                        after_success()
                 _run_durable_profile_action(durable_action, system_mutation=(scope == "system"))
 
             def render_categories() -> None:
@@ -4834,8 +4860,15 @@ def create_ui(client: Optional[Client] = None):
                                 continue
                             selector = ui.select(get_entity_mode_options(entity), value=cfg.entity_modes.get(entity, ENTITY_MODE_OFF)).props("dense outlined").classes("w-80 text-xs")
                             def on_mode(event: Any, ent: str = entity, selected: Any = selector) -> None:
-                                selected.set_value(event.value)
-                                mutate(scope_select.value or "project", lambda: controller.set_entity_mode(scope_select.value or "project", ent, event.value))
+                                mode_value = event.value
+                                selected.set_value(mode_value)
+                                selected_scope = str(scope_select.value or "project")
+                                selected_project_id = state.project_profile.project_id if state.project_profile else None
+                                mutate(
+                                    selected_scope,
+                                    lambda: controller.set_entity_mode(selected_scope, ent, mode_value),
+                                    expected_project_id=selected_project_id,
+                                )
                             selector.on_value_change(on_mode)
                             state.register_mutating_element(selector, "sidebar")
 
@@ -4850,18 +4883,28 @@ def create_ui(client: Optional[Client] = None):
                         g_type = ui.select({e: e for e in AVAILABLE_ENTITIES}, label="Kategorie").props("dense outlined").classes("w-48")
                         g_role = ui.input("Rolle (optional)").props("dense outlined").classes("w-44")
                         def add_glossary() -> None:
-                            if not g_term.value or not g_type.value:
+                            term_value = str(g_term.value or "").strip()
+                            entity_value = str(g_type.value or "").strip()
+                            role_value = str(g_role.value or "").strip()
+                            selected_scope = str(scope_select.value or "project")
+                            selected_project_id = state.project_profile.project_id if state.project_profile else None
+                            if not term_value or not entity_value:
                                 ui.notify("Begriff und Kategorie sind erforderlich.", type="warning")
                                 return
-                            mutate(scope_select.value or "project", lambda: controller.upsert_glossary(scope_select.value or "project", g_term.value, g_type.value, g_role.value))
-                            g_term.value = ""
-                            g_role.value = ""
+                            mutate(
+                                selected_scope,
+                                lambda: controller.upsert_glossary(selected_scope, term_value, entity_value, role_value),
+                                after_success=lambda: (setattr(g_term, "value", ""), setattr(g_role, "value", "")),
+                                expected_project_id=selected_project_id,
+                            )
                         ui.button("Hinzufügen", icon="add", on_click=add_glossary, color="primary").props("dense")
                     for key, value in sorted(cfg.glossary.items(), key=lambda item: item[0].casefold()):
                         provenance = cfg.glossary_provenance.get(normalize_term_key(key))
                         label = provenance[1] if provenance else "wirksam"
+                        role = cfg.glossary_roles.get(key)
+                        role_suffix = f" · Rolle: {role}" if role else ""
                         with ui.row().classes("w-full items-center gap-2 mb-1"):
-                            ui.label(f"{value} · {key}").classes("font-mono text-xs flex-grow")
+                            ui.label(f"Begriff: {key} · Typ: {value}{role_suffix}").classes("font-mono text-xs flex-grow")
                             ui.badge(label, color="teal" if provenance and provenance[0] == ScopeLevel.PROJECT else "grey-7").props("dense")
                             source_scope = provenance[0] if provenance else ScopeLevel.PROJECT
                             selected_scope = ScopeLevel(scope)
@@ -4874,10 +4917,17 @@ def create_ui(client: Optional[Client] = None):
                     with ui.row().classes("w-full items-end gap-2 mb-2"):
                         i_term = ui.input("Ignorierter Begriff").props("dense outlined").classes("flex-grow")
                         def add_ignore() -> None:
-                            if not i_term.value:
+                            term_value = str(i_term.value or "").strip()
+                            selected_scope = str(scope_select.value or "project")
+                            selected_project_id = state.project_profile.project_id if state.project_profile else None
+                            if not term_value:
                                 return
-                            mutate(scope_select.value or "project", lambda: controller.upsert_ignore(scope_select.value or "project", i_term.value))
-                            i_term.value = ""
+                            mutate(
+                                selected_scope,
+                                lambda: controller.upsert_ignore(selected_scope, term_value),
+                                after_success=lambda: setattr(i_term, "value", ""),
+                                expected_project_id=selected_project_id,
+                            )
                         ui.button("Hinzufügen", icon="add", on_click=add_ignore, color="primary").props("dense")
                     for key in sorted(cfg.ignore_provenance, key=str.casefold):
                         provenance = cfg.ignore_provenance.get(key)
@@ -4898,11 +4948,11 @@ def create_ui(client: Optional[Client] = None):
             scope_select.on_value_change(lambda _: render_all())
             with ui.tab_panels(profile_tabs, value=categories_tab).classes("w-full"):
                 with ui.tab_panel(categories_tab):
-                    category_holder
+                    category_holder = ui.column().classes("w-full")
                 with ui.tab_panel(glossary_tab):
-                    glossary_holder
+                    glossary_holder = ui.column().classes("w-full")
                 with ui.tab_panel(ignore_tab):
-                    ignore_holder
+                    ignore_holder = ui.column().classes("w-full")
             with ui.row().classes("justify-end w-full mt-3"):
                 ui.button("Schliessen", on_click=dialog.close).props("flat")
             render_all()

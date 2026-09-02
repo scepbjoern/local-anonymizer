@@ -1123,6 +1123,42 @@ class TestProfileControllerR1ToR5:
         assert app.save_current_config(state) is False
         assert state.project_profile.entity_modes["PERSON"] == ENTITY_MODE_OFF
 
+    def test_session_bound_sidebar_saves_twice_and_keeps_controller_state(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        controller.acknowledge_warning(expected_revision=controller.manifest["revision"])
+        import app
+
+        state = SimpleNamespace(
+            profile_store=store,
+            profile_controller=controller,
+            system_profile=controller.system_profile,
+            project_profile=controller.project_profile,
+            document_overlay=controller.document_overlay,
+            entity_modes=dict(controller.project_profile.entity_modes),
+            format_mode="numbered_role",
+            gliner_model_name=app.GLINER_MODEL_NAME,
+            gliner_threshold=0.55,
+            enable_eupii=False,
+            eupii_threshold=0.5,
+            eupii_model_name=app.EUPII_MODEL_NAME,
+            ignore_terms_text="",
+            glossary_text="",
+            export_format="txt",
+            refresh_effective_config=lambda *args, **kwargs: None,
+        )
+
+        state.entity_modes["PERSON"] = ENTITY_MODE_OFF
+        assert app.save_current_config(state) is True
+        assert state.project_profile.revision == controller.project_profile.revision == 2
+        assert store.load_project_profile(state.project_profile.project_id).revision == 2
+
+        state.entity_modes["PERSON"] = ENTITY_MODE_ALL
+        assert app.save_current_config(state) is True
+        assert state.project_profile.revision == controller.project_profile.revision == 3
+        assert store.load_project_profile(state.project_profile.project_id).entity_modes["PERSON"] == ENTITY_MODE_ALL
+
     def test_provenance_lookup_uses_normalized_surface_key(self, tmp_path):
         store = _make_store(tmp_path)
         store.initialize_or_migrate()
@@ -1131,6 +1167,35 @@ class TestProfileControllerR1ToR5:
         cfg = controller.effective_config()
         assert cfg.glossary["ZHAW"] == "ORGANIZATION"
         assert cfg.glossary_provenance[normalize_term_key("zhaw")][0] == ScopeLevel.SYSTEM
+
+    def test_provenance_badges_resolve_all_scopes_with_normalized_keys(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        controller.upsert_glossary(ScopeLevel.SYSTEM, "Systemwort", "ORGANIZATION", role="Systemrolle")
+        controller.save_system()
+        controller.upsert_glossary(ScopeLevel.PROJECT, "ProjektWort", "PERSON", role="Projektrolle")
+        controller.save_project()
+        controller.upsert_glossary(ScopeLevel.DOCUMENT, "DokumentWort", "ROLE", role="Dokumentrolle")
+        cfg = controller.effective_config()
+
+        assert cfg.glossary_provenance[normalize_term_key("systemWORT")][0] == ScopeLevel.SYSTEM
+        assert cfg.glossary_provenance[normalize_term_key("projektwort")][0] == ScopeLevel.PROJECT
+        assert cfg.glossary_provenance[normalize_term_key("DOKUMENTWORT")][0] == ScopeLevel.DOCUMENT
+        assert cfg.glossary_roles["Systemwort"] == "Systemrolle"
+        assert cfg.glossary_roles["ProjektWort"] == "Projektrolle"
+        assert cfg.glossary_roles["DokumentWort"] == "Dokumentrolle"
+
+    def test_gui_profile_manager_uses_panel_owned_holders_and_captured_terms(self):
+        source = (Path(__file__).parent.parent / "app.py").read_text(encoding="utf-8")
+        panel_start = source.index("with ui.tab_panels(profile_tabs, value=categories_tab)")
+        panel_block = source[panel_start:source.index("with ui.row().classes(\"justify-end w-full mt-3\")", panel_start)]
+        assert "with ui.tab_panel(categories_tab):\n                    category_holder = ui.column()" in panel_block
+        assert "with ui.tab_panel(glossary_tab):\n                    glossary_holder = ui.column()" in panel_block
+        assert "with ui.tab_panel(ignore_tab):\n                    ignore_holder = ui.column()" in panel_block
+        assert "category_holder\n" not in panel_block
+        assert "term_value = str(g_term.value or \"\").strip()" in source
+        assert "role = cfg.glossary_roles.get(key)" in source
 
     def test_actual_analyze_uses_frozen_effective_scope_precedence(self, tmp_path):
         store = _make_store(tmp_path)
