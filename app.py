@@ -2209,6 +2209,7 @@ def create_ui(client: Optional[Client] = None):
     map_json_input = None
     restored_preview = None
     sidebar_entity_mode_selects: Dict[str, Any] = {}
+    profile_ui_sync_depth = [0]
 
     def ask_discard_document_overlay(action: Callable[[], Any]) -> None:
         """Require an explicit discard before replacing the current document scope."""
@@ -4310,6 +4311,8 @@ def create_ui(client: Optional[Client] = None):
                         selector_ref: List[Any] = []
 
                         def change_mode(e):
+                            if profile_ui_sync_depth[0]:
+                                return
                             if not check_mutation_allowed():
                                 return
                             mode = e.value or ENTITY_MODE_OFF
@@ -4743,10 +4746,18 @@ def create_ui(client: Optional[Client] = None):
         for entity, selector in sidebar_entity_mode_selects.items():
             try:
                 mode = state.entity_modes.get(entity, ENTITY_MODE_OFF)
-                selector.set_value(mode)
+                _set_profile_ui_value(selector, mode)
                 selector.classes(replace=entity_mode_classes(mode))
             except Exception:
                 pass
+
+    def _set_profile_ui_value(element: Any, value: Any) -> None:
+        """Set a profile-related control without firing its user callback."""
+        profile_ui_sync_depth[0] += 1
+        try:
+            element.set_value(value)
+        finally:
+            profile_ui_sync_depth[0] -= 1
 
     def _run_durable_profile_action(
         action: Callable[[], None],
@@ -4924,7 +4935,7 @@ def create_ui(client: Optional[Client] = None):
                             selector = ui.select(get_entity_mode_options(entity), value=cfg.entity_modes.get(entity, ENTITY_MODE_OFF)).props("dense outlined").classes("w-80 text-xs")
                             def on_mode(event: Any, ent: str = entity, selected: Any = selector) -> None:
                                 mode_value = event.value
-                                selected.set_value(mode_value)
+                                _set_profile_ui_value(selected, mode_value)
                                 selected_scope = str(scope_select.value or "project")
                                 selected_project_id = state.project_profile.project_id if state.project_profile else None
                                 mutate(
@@ -5046,12 +5057,14 @@ def create_ui(client: Optional[Client] = None):
             }
 
             def apply_template(template_id: str, confirmed: bool = False) -> None:
+                if profile_ui_sync_depth[0]:
+                    return
                 if not template_id or not check_mutation_allowed() or state.project_profile is None:
                     return
                 previous_template_id = state.project_profile.template_id
 
                 def restore_template_selection() -> None:
-                    template_select.value = previous_template_id
+                    _set_profile_ui_value(template_select, previous_template_id)
                     template_select.update()
 
                 template = state.profile_store.load_template(template_id)
@@ -5074,7 +5087,7 @@ def create_ui(client: Optional[Client] = None):
                     def action() -> None:
                         controller.apply_template(template_id, expected_revision=controller.project_profile.revision)
                         _sync_profile_controller()
-                        template_select.value = template_id
+                        _set_profile_ui_value(template_select, template_id)
                         template_select.update()
                         ui.notify("Vorlage als Snapshot auf das Projekt angewendet.", type="positive")
                         if state.entity_groups:

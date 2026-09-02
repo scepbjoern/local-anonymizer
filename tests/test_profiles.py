@@ -95,6 +95,7 @@ class _FakeUiElement:
     def __init__(self, value=None):
         self.value = value
         self.opened = False
+        self.on_change = None
 
     def classes(self, *_args, **_kwargs):
         return self
@@ -113,6 +114,8 @@ class _FakeUiElement:
 
     def set_value(self, value):
         self.value = value
+        if self.on_change is not None:
+            self.on_change(SimpleNamespace(value=value))
 
     def clear(self):
         return None
@@ -190,11 +193,13 @@ def _make_gui_adapter_context(store, controller, fake_ui, busy):
     namespace = _extract_app_functions(
         "_profile_controller",
         "_sync_profile_controller",
-            "_run_durable_profile_action",
-            "mutate",
-            "add_glossary",
-            "add_ignore",
-            "apply_template",
+        "_set_profile_ui_value",
+        "_run_durable_profile_action",
+        "mutate",
+        "add_glossary",
+        "add_ignore",
+        "apply_template",
+        "make_entity_mode_change",
     )
     namespace.update(
         {
@@ -208,6 +213,7 @@ def _make_gui_adapter_context(store, controller, fake_ui, busy):
             ),
             "scope_select": SimpleNamespace(value="project"),
             "sidebar_entity_mode_selects": {},
+            "profile_ui_sync_depth": [0],
         }
     )
     namespace["mutate"].__globals__.update(namespace)
@@ -1352,7 +1358,20 @@ class TestProfileControllerR1ToR5:
         fake_ui = _FakeUi()
         state, ns = _make_gui_adapter_context(store, controller, fake_ui, {"value": False})
         selector = _FakeUiElement(ENTITY_MODE_ALL)
+        mode_change, selector_ref = ns["make_entity_mode_change"]("PERSON")
+        selector.on_change = mode_change
+        selector_ref.append(selector)
         ns["sidebar_entity_mode_selects"] = {"PERSON": selector}
+        save_calls = []
+        ns.update(
+            {
+                "save_current_config": lambda *_args, **_kwargs: save_calls.append("save"),
+                "compute_reactive_preview": lambda *_args, **_kwargs: None,
+                "refresh_preview_and_exports": lambda *_args, **_kwargs: None,
+                "build_review_table": lambda *_args, **_kwargs: None,
+            }
+        )
+        mode_change.__globals__.update(ns)
         ns["_sync_profile_controller"].__globals__.update(ns)
 
         controller.project_profile.entity_modes["PERSON"] = ENTITY_MODE_OFF
@@ -1360,6 +1379,41 @@ class TestProfileControllerR1ToR5:
         ns["_sync_profile_controller"]()
 
         assert selector.value == ENTITY_MODE_OFF
+        assert save_calls == []
+
+    def test_profile_ui_sync_guard_is_released_after_exception_and_user_change_still_works(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.initialize_or_migrate()
+        controller = ProfileController(store)
+        fake_ui = _FakeUi()
+        state, ns = _make_gui_adapter_context(store, controller, fake_ui, {"value": False})
+
+        class FailingElement(_FakeUiElement):
+            def set_value(self, value):
+                raise RuntimeError("synthetic UI failure")
+
+        with pytest.raises(RuntimeError, match="synthetic UI failure"):
+            ns["_set_profile_ui_value"](FailingElement(), ENTITY_MODE_OFF)
+        assert ns["profile_ui_sync_depth"] == [0]
+
+        mode_change, selector_ref = ns["make_entity_mode_change"]("PERSON")
+        selector = _FakeUiElement(ENTITY_MODE_ALL)
+        selector_ref.append(selector)
+        save_calls = []
+        ns.update(
+            {
+                "save_current_config": lambda *_args, **_kwargs: save_calls.append("save"),
+                "compute_reactive_preview": lambda *_args, **_kwargs: None,
+                "refresh_preview_and_exports": lambda *_args, **_kwargs: None,
+                "build_review_table": lambda *_args, **_kwargs: None,
+            }
+        )
+        mode_change.__globals__.update(ns)
+        mode_change(SimpleNamespace(value=ENTITY_MODE_OFF))
+
+        assert state.entity_modes["PERSON"] == ENTITY_MODE_OFF
+        assert save_calls == ["save"]
+        assert ns["profile_ui_sync_depth"] == [0]
 
     def test_actual_template_cancel_restores_selector_and_success_marks_reanalysis(self, tmp_path):
         store = _make_store(tmp_path)
@@ -1382,30 +1436,38 @@ class TestProfileControllerR1ToR5:
         state, ns = _make_gui_adapter_context(store, controller, fake_ui, {"value": False})
         state.entity_groups = [object()]
         template_select = _FakeUiElement(None)
+        template_callbacks = []
         warning_card = _FakeUiElement()
         warning_card.visibility = []
         warning_card.set_visibility = lambda visible: warning_card.visibility.append(visible)
         ns.update(
             {
                 "template_select": template_select,
+                "template_callbacks": template_callbacks,
                 "reanalysis_warning_card": warning_card,
                 "refresh_preview_and_exports": lambda: None,
                 "sidebar_entity_mode_selects": {},
             }
         )
         ns["apply_template"].__globals__.update(ns)
+        template_select.on_change = lambda event: (
+            template_callbacks.append(event.value),
+            ns["apply_template"](event.value),
+        )
 
         original_modes = dict(controller.project_profile.entity_modes)
         ns["apply_template"](template_id)
         fake_ui.click_last("Abbrechen")
         assert template_select.value is None
         assert controller.project_profile.entity_modes == original_modes
+        assert template_callbacks == [None]
 
         ns["apply_template"](template_id)
         fake_ui.click_last("Anwenden")
         assert template_select.value == template_id
         assert controller.project_profile.entity_modes == modes
         assert warning_card.visibility == [True]
+        assert template_callbacks == [None, template_id]
 
     def test_actual_profile_mutation_rejects_busy_system_confirmation_without_reload(self, tmp_path):
         store = _make_store(tmp_path)
