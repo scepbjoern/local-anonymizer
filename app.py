@@ -4926,25 +4926,26 @@ def create_ui(client: Optional[Client] = None):
                 cfg = controller.effective_config()
                 scope = scope_select.value or "project"
                 with category_holder:
-                    for entity in AVAILABLE_ENTITIES:
-                        with ui.row().classes("w-full items-center gap-2 mb-1"):
-                            ui.label(entity).classes("font-mono text-xs w-44")
-                            if scope == "system":
-                                ui.badge("System: nur Begriffe", color="grey-7").props("dense")
-                                continue
-                            selector = ui.select(get_entity_mode_options(entity), value=cfg.entity_modes.get(entity, ENTITY_MODE_OFF)).props("dense outlined").classes("w-80 text-xs")
-                            def on_mode(event: Any, ent: str = entity, selected: Any = selector) -> None:
-                                mode_value = event.value
-                                _set_profile_ui_value(selected, mode_value)
-                                selected_scope = str(scope_select.value or "project")
-                                selected_project_id = state.project_profile.project_id if state.project_profile else None
-                                mutate(
-                                    selected_scope,
-                                    lambda: controller.set_entity_mode(selected_scope, ent, mode_value),
-                                    expected_project_id=selected_project_id,
-                                )
-                            selector.on_value_change(on_mode)
-                            state.register_mutating_element(selector, "sidebar")
+                    with ui.column().classes("w-full max-h-64 overflow-y-auto gap-1 pr-1"):
+                        for entity in AVAILABLE_ENTITIES:
+                            with ui.row().classes("w-full items-center gap-2 mb-1"):
+                                ui.label(entity).classes("font-mono text-xs w-44")
+                                if scope == "system":
+                                    ui.badge("System: nur Begriffe", color="grey-7").props("dense")
+                                    continue
+                                selector = ui.select(get_entity_mode_options(entity), value=cfg.entity_modes.get(entity, ENTITY_MODE_OFF)).props("dense outlined").classes("w-80 text-xs")
+                                def on_mode(event: Any, ent: str = entity, selected: Any = selector) -> None:
+                                    mode_value = event.value
+                                    _set_profile_ui_value(selected, mode_value)
+                                    selected_scope = str(scope_select.value or "project")
+                                    selected_project_id = state.project_profile.project_id if state.project_profile else None
+                                    mutate(
+                                        selected_scope,
+                                        lambda: controller.set_entity_mode(selected_scope, ent, mode_value),
+                                        expected_project_id=selected_project_id,
+                                    )
+                                selector.on_value_change(on_mode)
+                                state.register_mutating_element(selector, "sidebar")
 
             def render_terms() -> None:
                 glossary_holder.clear()

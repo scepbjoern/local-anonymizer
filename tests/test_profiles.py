@@ -1349,7 +1349,7 @@ class TestProfileControllerR1ToR5:
         assert "term_value = str(g_term.value or \"\").strip()" in source
         assert "role = cfg.glossary_roles.get(key)" in source
         profile_block = source[source.index("def open_profile_manager"):source.index("with ui.card().classes(\"w-full mb-3", panel_start)]
-        assert profile_block.count("max-h-64 overflow-y-auto") == 2
+        assert profile_block.count("max-h-64 overflow-y-auto") == 3
 
     def test_actual_profile_sync_updates_sidebar_category_selectors(self, tmp_path):
         store = _make_store(tmp_path)
