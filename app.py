@@ -616,13 +616,7 @@ def reset_app_state(st: "AppState") -> None:
     st.is_llm_running = False
     st.llm_partial_failure = False
     st.llm_unprocessed_occ_ids.clear()
-    if getattr(st, "llm_provider", None) is not None:
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(st.close_llm_provider())
-        except Exception:
-            pass
+    st.llm_provider = None
 
 
 async def reset_app_state_async(st: "AppState") -> None:
@@ -850,6 +844,9 @@ class AppState:
         self.llm_ready_bound_model: str = ""
         self.llm_setup_status_msg: str = ""
         self.llm_show_details: bool = True
+        # Analysis Lock State
+        self.is_analyzing: bool = False
+        self.llm_ready_expires_at: float = 0.0
 
         self.mutating_ui_zones: Dict[str, List[Any]] = {
             "sidebar": [],
@@ -862,6 +859,11 @@ class AppState:
         }
 
     @property
+    def is_busy(self) -> bool:
+        """Central check whether any mutating async operation is in-flight."""
+        return self.is_analyzing or self.is_llm_running or self.llm_setup_state != "idle"
+
+    @property
     def mutating_ui_elements(self) -> List[Any]:
         """Flattened list of all registered mutating UI elements across all zones."""
         res: List[Any] = []
@@ -872,7 +874,7 @@ class AppState:
     def register_mutating_element(self, elem: Any, zone: str = "table") -> None:
         """Register a mutating UI control within a specific UI zone."""
         self.mutating_ui_zones.setdefault(zone, []).append(elem)
-        if self.is_llm_running or self.llm_setup_state != "idle":
+        if self.is_busy:
             try:
                 elem.disable()
             except Exception:
@@ -899,22 +901,30 @@ class AppState:
         """Reset transient model readiness status."""
         self.llm_ready_info = None
         self.llm_ready_timestamp = 0.0
+        self.llm_ready_expires_at = 0.0
         self.llm_ready_bound_url = ""
         self.llm_ready_bound_model = ""
 
     def is_model_ready(self) -> bool:
-        """Check if active model was verified via /api/ps and config hasn't changed."""
+        """
+        Check if active model was verified via /api/ps, config matches,
+        and keep-alive expiration time has not been exceeded.
+        """
         if (
             self.llm_ready_info is not None
             and self.llm_provider_type == "ollama"
             and self.llm_ready_bound_url == self.config.llm_base_url.strip()
             and self.llm_ready_bound_model == self.config.llm_model_name.strip()
         ):
+            if self.llm_ready_expires_at > 0.0 and time.time() >= self.llm_ready_expires_at:
+                self.invalidate_llm_ready()
+                return False
             return True
         return False
 
     async def cancel_setup_task(self) -> None:
         """Cancel and await currently active discovery or preload setup task."""
+        self.llm_setup_request_id = ""
         task = self.llm_setup_task
         if task and not task.done():
             task.cancel()
@@ -924,6 +934,7 @@ class AppState:
                 pass
         self.llm_setup_task = None
         self.llm_setup_state = "idle"
+        self.invalidate_llm_ready()
 
     async def close_llm_provider(self) -> None:
         """Close provider HTTP session safely."""
@@ -1952,7 +1963,7 @@ def create_ui(client: Optional[Client] = None):
                             else:
                                 state.llm_show_details = True
                                 if state.llm_provider_type == "ollama" and not state.llm_discovered_models:
-                                    asyncio.create_task(trigger_model_discovery())
+                                    await trigger_model_discovery()
                             build_llm_setup_panel()
                             build_llm_panel()
                             build_review_table()
@@ -2069,7 +2080,7 @@ def create_ui(client: Optional[Client] = None):
                             await state.close_llm_provider()
                             save_current_config(state)
                             if new_type == "ollama" and not state.llm_discovered_models:
-                                asyncio.create_task(trigger_model_discovery())
+                                await trigger_model_discovery()
                             build_llm_setup_panel()
                             build_llm_panel()
 
@@ -2143,6 +2154,7 @@ def create_ui(client: Optional[Client] = None):
                                     await state.cancel_setup_task()
                                     state.llm_setup_status_msg = "Abgebrochen"
                                     ui.notify("Vorgang abgebrochen.", type="info")
+                                    set_mutating_controls_disabled(False)
                                     build_llm_setup_panel()
                                 cancel_setup_btn = ui.button("Abbrechen", icon="cancel", on_click=on_cancel_setup, color="negative").props("flat dense size=sm")
 
@@ -2177,10 +2189,21 @@ def create_ui(client: Optional[Client] = None):
 
                         with ui.row().classes("items-center gap-1 text-[11px] text-slate-500"):
                             ui.icon("lock", size="xs").classes("text-slate-400")
-                            ui.label("100% lokal (OLLAMA_NO_CLOUD=1) · ':cloud' gesperrt").classes("text-[10px]")
+                            ui.label("Empfehlung: Ollama im Local-Only-Modus betreiben (OLLAMA_NO_CLOUD=1) · ':cloud' gesperrt").classes("text-[10px]")
+
+    def parse_iso_expiry(expires_str: Optional[str], default_ttl_seconds: float = 300.0) -> float:
+        """Parse ISO expiry timestamp to UNIX epoch float or return now + default_ttl_seconds."""
+        if not expires_str or not isinstance(expires_str, str):
+            return time.time() + default_ttl_seconds
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(expires_str.strip())
+            return dt.timestamp()
+        except Exception:
+            return time.time() + default_ttl_seconds
 
     async def trigger_model_discovery():
-        if state.is_llm_running or state.llm_setup_state != "idle":
+        if not check_mutation_allowed():
             return
         await state.cancel_setup_task()
 
@@ -2189,6 +2212,7 @@ def create_ui(client: Optional[Client] = None):
         state.llm_setup_request_id = req_id
         state.llm_setup_endpoint_snapshot = url_snap
         state.llm_setup_state = "discovering"
+        set_mutating_controls_disabled(True)
         build_llm_setup_panel()
 
         async def _run_discovery():
@@ -2226,6 +2250,7 @@ def create_ui(client: Optional[Client] = None):
                 if state.llm_setup_request_id == req_id:
                     state.llm_setup_state = "idle"
                     state.llm_setup_task = None
+                    set_mutating_controls_disabled(False)
                     build_llm_setup_panel()
 
         async def _runner_discovery():
@@ -2238,7 +2263,7 @@ def create_ui(client: Optional[Client] = None):
         state.llm_setup_task = asyncio.create_task(_runner_discovery())
 
     async def trigger_ollama_preload():
-        if state.is_llm_running or state.llm_setup_state != "idle":
+        if not check_mutation_allowed():
             return
         await state.cancel_setup_task()
 
@@ -2249,6 +2274,7 @@ def create_ui(client: Optional[Client] = None):
         state.llm_setup_endpoint_snapshot = url_snap
         state.llm_setup_model_snapshot = model_snap
         state.llm_setup_state = "preloading"
+        set_mutating_controls_disabled(True)
         build_llm_setup_panel()
 
         async def _run_preload():
@@ -2263,6 +2289,7 @@ def create_ui(client: Optional[Client] = None):
 
                 state.llm_ready_info = ps_info
                 state.llm_ready_timestamp = time.time()
+                state.llm_ready_expires_at = parse_iso_expiry(getattr(ps_info, "expires_at", None))
                 state.llm_ready_bound_url = url_snap
                 state.llm_ready_bound_model = model_snap
                 state.llm_setup_status_msg = "Modell bereit"
@@ -2277,6 +2304,7 @@ def create_ui(client: Optional[Client] = None):
                 if state.llm_setup_request_id == req_id:
                     state.llm_setup_state = "idle"
                     state.llm_setup_task = None
+                    set_mutating_controls_disabled(False)
                     build_llm_setup_panel()
                     build_llm_panel()
 
@@ -2290,7 +2318,7 @@ def create_ui(client: Optional[Client] = None):
         state.llm_setup_task = asyncio.create_task(_runner_preload())
 
     async def trigger_generic_test():
-        if state.is_llm_running or state.llm_setup_state != "idle":
+        if not check_mutation_allowed():
             return
         await state.cancel_setup_task()
 
@@ -2299,6 +2327,7 @@ def create_ui(client: Optional[Client] = None):
         state.llm_setup_request_id = req_id
         state.llm_setup_endpoint_snapshot = url_snap
         state.llm_setup_state = "testing"
+        set_mutating_controls_disabled(True)
         build_llm_setup_panel()
 
         async def _run_test():
@@ -2323,6 +2352,7 @@ def create_ui(client: Optional[Client] = None):
                 if state.llm_setup_request_id == req_id:
                     state.llm_setup_state = "idle"
                     state.llm_setup_task = None
+                    set_mutating_controls_disabled(False)
                     build_llm_setup_panel()
                     build_llm_panel()
 
@@ -2453,69 +2483,74 @@ def create_ui(client: Optional[Client] = None):
     ]
 
     async def run_analysis():
+        if state.is_busy:
+            ui.notify("Aktion nicht möglich: Ein Analyse- oder Setup-Vorgang läuft bereits.", type="warning")
+            return
         if not check_mutation_allowed():
             return
         if not state.raw_text or not state.raw_text.strip():
             ui.notify("Bitte laden Sie zuerst ein Dokument hoch oder fügen Sie Text ein.", type="warning")
             return
 
-        # Ensure required AI models are confirmed and downloaded before starting analysis
-        ready = await ensure_models_downloaded_with_dialog(state)
-        if not ready:
-            ui.notify("Analyse abgebrochen: Modell-Download wurde nicht bestätigt.", type="warning")
-            return
-
-        if reanalysis_warning_card is not None:
-            reanalysis_warning_card.set_visibility(False)
-
-        # Show visual indicators immediately (< 20ms)
-        if analyze_btn:
-            analyze_btn.props("loading")
-
-        progress_bar = None
-        progress_label = None
-        step_labels = []
-        if progress_holder:
-            progress_holder.clear()
-            with progress_holder:
-                progress_bar = ui.linear_progress(value=0.0, show_value=False).props("color=primary stripe rounded instant-feedback").classes("w-full mb-1")
-                progress_label = ui.label("0% - Lokale Analyse gestartet...").classes("text-xs text-slate-700 font-bold mb-1")
-                with ui.card().classes("w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg shadow-none flex flex-col gap-1 mb-2"):
-                    for idx, name in enumerate(PIPELINE_STEPS):
-                        if idx == 0:
-                            lbl = ui.label(f"⏳ {name}").classes("text-[11px] text-blue-700 font-bold")
-                        else:
-                            lbl = ui.label(f"○ {name}").classes("text-[11px] text-rose-600 font-normal")
-                        step_labels.append(lbl)
-
-        if table_holder:
-            table_holder.clear()
-            with table_holder:
-                with ui.row().classes("items-center gap-3 p-4 bg-blue-50 rounded border border-blue-200"):
-                    ui.spinner(size="md", color="primary")
-                    ui.label("Dokument wird lokal analysiert (NER, Markdown, Struktur)...").classes("text-slate-700 text-sm font-medium")
-
-        # Yield to event loop so DOM updates render immediately in the browser
-        await asyncio.sleep(0.02)
-
-        def update_step_ui(active_idx: int, val: float, msg: str):
-            if progress_bar:
-                progress_bar.set_value(val)
-            if progress_label:
-                progress_label.set_text(f"{int(val * 100)}% - {msg}")
-            for i, lbl in enumerate(step_labels):
-                name = PIPELINE_STEPS[i]
-                if i < active_idx:
-                    lbl.set_text(f"✓ {name}")
-                    lbl.classes(replace="text-[11px] text-emerald-700 font-semibold")
-                elif i == active_idx:
-                    lbl.set_text(f"⏳ {name} ({msg})")
-                    lbl.classes(replace="text-[11px] text-blue-700 font-bold")
-                else:
-                    lbl.set_text(f"○ {name}")
-                    lbl.classes(replace="text-[11px] text-rose-600 font-normal")
-
+        state.is_analyzing = True
+        set_mutating_controls_disabled(True)
         try:
+            # Ensure required AI models are confirmed and downloaded before starting analysis
+            ready = await ensure_models_downloaded_with_dialog(state)
+            if not ready:
+                ui.notify("Analyse abgebrochen: Modell-Download wurde nicht bestätigt.", type="warning")
+                return
+
+            if reanalysis_warning_card is not None:
+                reanalysis_warning_card.set_visibility(False)
+
+            # Show visual indicators immediately (< 20ms)
+            if analyze_btn:
+                analyze_btn.props("loading")
+
+            progress_bar = None
+            progress_label = None
+            step_labels = []
+            if progress_holder:
+                progress_holder.clear()
+                with progress_holder:
+                    progress_bar = ui.linear_progress(value=0.0, show_value=False).props("color=primary stripe rounded instant-feedback").classes("w-full mb-1")
+                    progress_label = ui.label("0% - Lokale Analyse gestartet...").classes("text-xs text-slate-700 font-bold mb-1")
+                    with ui.card().classes("w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg shadow-none flex flex-col gap-1 mb-2"):
+                        for idx, name in enumerate(PIPELINE_STEPS):
+                            if idx == 0:
+                                lbl = ui.label(f"⏳ {name}").classes("text-[11px] text-blue-700 font-bold")
+                            else:
+                                lbl = ui.label(f"○ {name}").classes("text-[11px] text-rose-600 font-normal")
+                            step_labels.append(lbl)
+
+            if table_holder:
+                table_holder.clear()
+                with table_holder:
+                    with ui.row().classes("items-center gap-3 p-4 bg-blue-50 rounded border border-blue-200"):
+                        ui.spinner(size="md", color="primary")
+                        ui.label("Dokument wird lokal analysiert (NER, Markdown, Struktur)...").classes("text-slate-700 text-sm font-medium")
+
+            # Yield to event loop so DOM updates render immediately in the browser
+            await asyncio.sleep(0.02)
+
+            def update_step_ui(active_idx: int, val: float, msg: str):
+                if progress_bar:
+                    progress_bar.set_value(val)
+                if progress_label:
+                    progress_label.set_text(f"{int(val * 100)}% - {msg}")
+                for i, lbl in enumerate(step_labels):
+                    name = PIPELINE_STEPS[i]
+                    if i < active_idx:
+                        lbl.set_text(f"✓ {name}")
+                        lbl.classes(replace="text-[11px] text-emerald-700 font-semibold")
+                    elif i == active_idx:
+                        lbl.set_text(f"⏳ {name} ({msg})")
+                        lbl.classes(replace="text-[11px] text-blue-700 font-bold")
+                    else:
+                        lbl.set_text(f"○ {name}")
+                        lbl.classes(replace="text-[11px] text-rose-600 font-normal")
+
             # Wait for background warmup if still running
             while not _model_ready:
                 if progress_label:
@@ -2615,6 +2650,8 @@ def create_ui(client: Optional[Client] = None):
             logging.error(f"Analysis error: {e}", exc_info=True)
             ui.notify(f"Fehler bei der Analyse: {str(e)}", type="negative", close_button=True)
         finally:
+            state.is_analyzing = False
+            set_mutating_controls_disabled(False)
             if analyze_btn:
                 analyze_btn.props(remove="loading")
             if progress_holder:
@@ -2638,7 +2675,10 @@ def create_ui(client: Optional[Client] = None):
         return state.llm_active_task
 
     def check_mutation_allowed() -> bool:
-        """Central guard against mutating state while LLM triage or setup is running."""
+        """Central guard against mutating state while analysis, LLM triage or setup is running."""
+        if state.is_analyzing:
+            ui.notify("Aktion während laufender Textanalyse gesperrt.", type="warning")
+            return False
         if state.is_llm_running:
             ui.notify("Aktion während laufender LLM-Prüfung gesperrt.", type="warning")
             return False
@@ -2648,8 +2688,8 @@ def create_ui(client: Optional[Client] = None):
         return True
 
     def set_mutating_controls_disabled(disabled: bool):
-        """Disable/enable all mutating UI controls during active LLM inference or setup."""
-        is_blocked = disabled or state.llm_setup_state != "idle" or state.is_llm_running
+        """Disable/enable all mutating UI controls during active analysis, LLM inference or setup."""
+        is_blocked = disabled or state.is_busy
         if analyze_btn:
             analyze_btn.set_enabled(not is_blocked and bool(state.raw_text and state.raw_text.strip()))
         if reset_btn:

@@ -120,6 +120,55 @@ def derive_ollama_base_url(base_url: str) -> str:
     return f"{parsed.scheme.lower()}://{host_formatted}{port_str}"
 
 
+async def _read_limited_body(
+    resp_obj: Any,
+    max_bytes: int = MAX_RESPONSE_BYTES,
+    chunk_size: int = 8192,
+) -> bytes:
+    """
+    Read response body in chunks up to max_bytes.
+    Aborts immediately and raises ValueError if total response size exceeds max_bytes.
+    """
+    chunks: List[bytes] = []
+    total_bytes = 0
+
+    if hasattr(resp_obj, "content") and hasattr(resp_obj.content, "iter_chunked"):
+        async for chunk in resp_obj.content.iter_chunked(chunk_size):
+            total_bytes += len(chunk)
+            if total_bytes > max_bytes:
+                raise ValueError(f"Antwort überschreitet das Limit / Größenlimit von {max_bytes} Bytes.")
+            chunks.append(chunk)
+    elif hasattr(resp_obj, "content") and hasattr(resp_obj.content, "read"):
+        while True:
+            chunk = await resp_obj.content.read(chunk_size)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > max_bytes:
+                raise ValueError(f"Antwort überschreitet das Limit / Größenlimit von {max_bytes} Bytes.")
+            chunks.append(chunk)
+    else:
+        # Fallback for simple mock response objects providing read()
+        raw = await resp_obj.read()
+        if len(raw) > max_bytes:
+            raise ValueError(f"Antwort überschreitet das Limit / Größenlimit von {max_bytes} Bytes.")
+        chunks.append(raw)
+
+    return b"".join(chunks)
+
+
+def _parse_strict_json(body_bytes: bytes) -> Any:
+    """Strictly decode UTF-8 without character replacement and parse JSON."""
+    try:
+        text = body_bytes.decode("utf-8")
+    except UnicodeDecodeError as ude:
+        raise ValueError("Antwort ist kein gültiges UTF-8.") from ude
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as jde:
+        raise ValueError("Antwort ist kein gültiges JSON.") from jde
+
+
 async def fetch_ollama_models(
     base_url: str,
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
@@ -159,25 +208,26 @@ async def fetch_ollama_models(
                         message="Ungültiger Content-Type von Ollama empfangen.",
                     )
 
-                body_bytes = await resp.read()
-                if len(body_bytes) > MAX_RESPONSE_BYTES:
+                try:
+                    body_bytes = await _read_limited_body(resp, MAX_RESPONSE_BYTES)
+                    data = _parse_strict_json(body_bytes)
+                except ValueError as ve:
                     return DiscoveryResult(
                         status="invalid_response",
-                        message="Antwort von Ollama überschreitet das Größenlimit.",
+                        message=f"Ungültige Antwort von Ollama: {ve}",
                     )
 
-                data = json.loads(body_bytes.decode("utf-8", errors="replace"))
-                raw_models = data.get("models", [])
-                if not isinstance(raw_models, list):
+                if not isinstance(data, dict) or "models" not in data or not isinstance(data["models"], list):
                     return DiscoveryResult(
                         status="invalid_response",
-                        message="Antwortstruktur von Ollama ist ungültig.",
+                        message="Antwortstruktur von Ollama ist ungültig (kein 'models'-Array).",
                     )
 
+                raw_models = data["models"]
                 clean_models: List[str] = []
                 for m in raw_models:
-                    if isinstance(m, dict) and "name" in m:
-                        name_val = str(m["name"]).strip()
+                    if isinstance(m, dict) and "name" in m and isinstance(m["name"], str):
+                        name_val = m["name"].strip()
                         try:
                             valid_name = validate_model_name(name_val)
                             clean_models.append(valid_name)
@@ -234,25 +284,26 @@ async def fetch_generic_models(
                         message="Ungültiger Content-Type empfangen.",
                     )
 
-                body_bytes = await resp.read()
-                if len(body_bytes) > MAX_RESPONSE_BYTES:
+                try:
+                    body_bytes = await _read_limited_body(resp, MAX_RESPONSE_BYTES)
+                    data = _parse_strict_json(body_bytes)
+                except ValueError as ve:
                     return DiscoveryResult(
                         status="invalid_response",
-                        message="Antwort überschreitet das Größenlimit.",
+                        message=f"Ungültige Antwort vom Server: {ve}",
                     )
 
-                data = json.loads(body_bytes.decode("utf-8", errors="replace"))
-                raw_models = data.get("data", [])
-                if not isinstance(raw_models, list):
+                if not isinstance(data, dict) or "data" not in data or not isinstance(data["data"], list):
                     return DiscoveryResult(
                         status="invalid_response",
                         message="Antwortstruktur ist ungültig (kein 'data'-Array).",
                     )
 
+                raw_models = data["data"]
                 clean_models: List[str] = []
                 for m in raw_models:
-                    if isinstance(m, dict) and "id" in m:
-                        name_val = str(m["id"]).strip()
+                    if isinstance(m, dict) and "id" in m and isinstance(m["id"], str):
+                        name_val = m["id"].strip()
                         try:
                             valid_name = validate_model_name(name_val)
                             clean_models.append(valid_name)
@@ -280,12 +331,21 @@ async def preload_ollama_model(
     """
     Trigger model preload via native POST /api/generate with keep_alive and verify via GET /api/ps.
     Does NOT send any document text or prompt.
-    Returns PsModelInfo on verified match in /api/ps or raises RuntimeError.
+    Returns PsModelInfo on exact verified match in /api/ps or raises RuntimeError.
     """
     if aiohttp is None:
         raise ImportError("aiohttp ist nicht installiert.")
 
     clean_name = validate_model_name(model_name)
+    from local_anonymizer.llm.catalog import find_catalog_entry, CatalogError
+    target_tag = clean_name
+    try:
+        cat_entry = find_catalog_entry(clean_name)
+        if cat_entry is not None:
+            target_tag = cat_entry.tested_tag
+    except CatalogError:
+        pass
+
     root_url = derive_ollama_base_url(base_url)
     gen_endpoint = f"{root_url}/api/generate"
     ps_endpoint = f"{root_url}/api/ps"
@@ -297,7 +357,7 @@ async def preload_ollama_model(
     )
 
     payload = {
-        "model": clean_name,
+        "model": target_tag,
         "stream": False,
         "keep_alive": keep_alive,
     }
@@ -308,6 +368,10 @@ async def preload_ollama_model(
             async with session.post(gen_endpoint, json=payload, allow_redirects=False) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"Ollama Vorlade-Anfrage meldete HTTP Status {resp.status}.")
+                raw_ct = resp.headers.get("Content-Type", "")
+                if not is_valid_json_mime(raw_ct):
+                    raise RuntimeError(f"Ungültiger Content-Type bei /api/generate: '{raw_ct}'.")
+                await _read_limited_body(resp, MAX_RESPONSE_BYTES)
 
             # 2. Check /api/ps for active running model
             async with session.get(ps_endpoint, allow_redirects=False) as ps_resp:
@@ -318,30 +382,34 @@ async def preload_ollama_model(
                 if not is_valid_json_mime(raw_ct):
                     raise RuntimeError("Ungültiger Content-Type bei /api/ps.")
 
-                body_bytes = await ps_resp.read()
-                if len(body_bytes) > MAX_RESPONSE_BYTES:
-                    raise RuntimeError("Antwort von /api/ps überschreitet das Größenlimit.")
+                body_bytes = await _read_limited_body(ps_resp, MAX_RESPONSE_BYTES)
+                ps_data = _parse_strict_json(body_bytes)
 
-                ps_data = json.loads(body_bytes.decode("utf-8", errors="replace"))
-                running_models = ps_data.get("models", [])
+                if not isinstance(ps_data, dict) or "models" not in ps_data or not isinstance(ps_data["models"], list):
+                    raise RuntimeError("Antwortstruktur von /api/ps ist ungültig.")
 
+                running_models = ps_data["models"]
                 clean_lower = clean_name.lower()
+                target_lower = target_tag.lower()
+
                 for rm in running_models:
                     if isinstance(rm, dict):
-                        rm_name = str(rm.get("name", "")).strip().lower()
-                        rm_model = str(rm.get("model", "")).strip().lower()
+                        rm_name = rm.get("name")
+                        rm_model = rm.get("model")
+                        rm_name_str = rm_name.strip().lower() if isinstance(rm_name, str) else ""
+                        rm_model_str = rm_model.strip().lower() if isinstance(rm_model, str) else ""
+
+                        # EXACT match only: do NOT allow startswith or partial prefixes!
                         if (
-                            rm_name == clean_lower
-                            or rm_model == clean_lower
-                            or rm_name.startswith(f"{clean_lower}:")
-                            or clean_lower.startswith(f"{rm_name}:")
+                            rm_name_str in (clean_lower, target_lower)
+                            or rm_model_str in (clean_lower, target_lower)
                         ):
                             return PsModelInfo(
                                 name=str(rm.get("name", clean_name)),
                                 model=str(rm.get("model", clean_name)),
-                                size=rm.get("size"),
-                                size_vram=rm.get("size_vram"),
-                                expires_at=rm.get("expires_at"),
+                                size=rm.get("size") if isinstance(rm.get("size"), int) else None,
+                                size_vram=rm.get("size_vram") if isinstance(rm.get("size_vram"), int) else None,
+                                expires_at=str(rm.get("expires_at", "")) if rm.get("expires_at") else None,
                             )
 
                 raise RuntimeError(f"Modell '{clean_name}' wurde nicht als aktiv in Ollama gemeldet.")
@@ -360,31 +428,16 @@ async def test_generic_connection(
     read_timeout: float = DEFAULT_READ_TIMEOUT,
 ) -> bool:
     """
-    Test generic OpenAI-compatible connection with a lightweight GET /models call.
-    Does NOT guarantee loaded model weights.
+    Test generic OpenAI-compatible connection using the validated fetch_generic_models discovery.
+    Ensures identical streaming limits, MIME validation, and JSON verification.
     """
-    if aiohttp is None:
-        raise ImportError("aiohttp ist nicht installiert.")
-
-    clean_url = validate_loopback_url(base_url)
-    endpoint = f"{clean_url}/models" if not clean_url.endswith("/models") else clean_url
-
-    timeout = aiohttp.ClientTimeout(
-        total=connect_timeout + read_timeout,
-        connect=connect_timeout,
-        sock_read=read_timeout,
-    )
-
-    try:
-        async with aiohttp.ClientSession(trust_env=False, timeout=timeout) as session:
-            async with session.get(endpoint, allow_redirects=False) as resp:
-                if resp.status == 200:
-                    return True
-                raise RuntimeError(f"Server meldete HTTP Status {resp.status}.")
-    except Exception as e:
-        if isinstance(e, RuntimeError):
-            raise
-        raise RuntimeError("Verbindung zum generischen Server fehlgeschlagen.")
+    res = await fetch_generic_models(base_url, connect_timeout=connect_timeout, read_timeout=read_timeout)
+    if res.status in ("success", "empty"):
+        return True
+    elif res.status == "timeout":
+        raise TimeoutError(res.message or "Zeitüberschreitung bei der Kommunikation mit dem Server.")
+    else:
+        raise RuntimeError(res.message or "Verbindung zum generischen Server fehlgeschlagen.")
 
 
 class LocalApiProvider(LlmProvider):
@@ -470,18 +523,11 @@ class LocalApiProvider(LlmProvider):
                         f"Unerwarteter Content-Type '{raw_content_type}': Erwartet wurde 'application/json' oder 'application/*+json'."
                     )
 
-                # Stream response to enforce max response size limit
-                chunks = []
-                total_bytes = 0
-                async for chunk in resp_obj.content.iter_chunked(8192):
-                    total_bytes += len(chunk)
-                    if total_bytes > self.max_response_bytes:
-                        raise ValueError(
-                            f"Antwortgröße des LLMs überschreitet das Limit von {self.max_response_bytes} Bytes."
-                        )
-                    chunks.append(chunk)
-
-                return b"".join(chunks).decode("utf-8", errors="replace")
+                body_bytes = await _read_limited_body(resp_obj, self.max_response_bytes)
+                try:
+                    return body_bytes.decode("utf-8")
+                except UnicodeDecodeError as ude:
+                    raise ValueError("Antwort des LLMs ist kein gültiges UTF-8.") from ude
 
             try:
                 async with session.post(
@@ -521,6 +567,8 @@ class LocalApiProvider(LlmProvider):
                 raise TimeoutError("Zeitüberschreitung bei der Kommunikation mit dem lokalen LLM.")
             except Exception as e:
                 # Sanitized error message without leaking prompt or document contents
+                if isinstance(e, (ValueError, TypeError)):
+                    raise
                 msg = str(e)
                 if "Antwortgröße" in msg or "HTTP Status" in msg or "Schema version" in msg or "Content-Type" in msg:
                     raise

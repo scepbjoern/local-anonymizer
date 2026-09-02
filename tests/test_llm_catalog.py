@@ -111,3 +111,101 @@ def test_catalog_extra_fields_forbidden(tmp_path):
 def test_catalog_missing_file():
     with pytest.raises(CatalogError, match="nicht gefunden"):
         load_catalog(Path("non_existent_dir/missing_catalog.json"))
+
+
+def test_catalog_duplicate_canonical_names_rejected():
+    raw_data = {
+        "schema_version": "1.0.0",
+        "models": [
+            {
+                "canonical_name": "qwen3:8b",
+                "tested_tag": "qwen3:8b",
+                "provider": "ollama",
+                "hardware_class": "test",
+                "test_date": "2026-09-01",
+                "aliases": [],
+                "phase_6a_triage": {"status": "recommended", "reason": "test"},
+                "phase_6b_smart_linking": {"status": "untested", "reason": "test"},
+            },
+            {
+                "canonical_name": "qwen3:8b",  # Duplicate canonical name
+                "tested_tag": "qwen3:8b-v2",
+                "provider": "ollama",
+                "hardware_class": "test",
+                "test_date": "2026-09-01",
+                "aliases": [],
+                "phase_6a_triage": {"status": "suitable", "reason": "test"},
+                "phase_6b_smart_linking": {"status": "untested", "reason": "test"},
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="Doppelter kanonischer Modellname"):
+        CatalogSchema.model_validate(raw_data)
+
+
+def test_catalog_duplicate_aliases_rejected():
+    raw_data = {
+        "schema_version": "1.0.0",
+        "models": [
+            {
+                "canonical_name": "model-a:latest",
+                "tested_tag": "model-a:latest",
+                "provider": "ollama",
+                "hardware_class": "test",
+                "test_date": "2026-09-01",
+                "aliases": ["shared-alias:latest"],
+                "phase_6a_triage": {"status": "recommended", "reason": "test"},
+                "phase_6b_smart_linking": {"status": "untested", "reason": "test"},
+            },
+            {
+                "canonical_name": "model-b:latest",
+                "tested_tag": "model-b:latest",
+                "provider": "ollama",
+                "hardware_class": "test",
+                "test_date": "2026-09-01",
+                "aliases": ["shared-alias:latest"],  # Duplicate alias across models
+                "phase_6a_triage": {"status": "suitable", "reason": "test"},
+                "phase_6b_smart_linking": {"status": "untested", "reason": "test"},
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="Kollidierender Tag/Alias|Doppelter Modell-Alias"):
+        CatalogSchema.model_validate(raw_data)
+
+
+def test_catalog_invalid_test_date_rejected():
+    raw_data = {
+        "canonical_name": "model:latest",
+        "tested_tag": "model:latest",
+        "provider": "ollama",
+        "hardware_class": "test",
+        "test_date": "2026-02-31",  # Invalid calendar day
+        "phase_6a_triage": {"status": "recommended", "reason": "test"},
+        "phase_6b_smart_linking": {"status": "untested", "reason": "test"},
+    }
+    with pytest.raises(ValueError, match="Ungültiges Kalenderdatum|Ungültiges Testdatum"):
+        CatalogModelEntry.model_validate(raw_data)
+
+
+def test_get_model_suitability_badge_corrupted_catalog(tmp_path, monkeypatch):
+    corrupt_file = tmp_path / "corrupt_catalog.json"
+    corrupt_file.write_text("{corrupted-json", encoding="utf-8")
+    monkeypatch.setattr("local_anonymizer.llm.catalog.DEFAULT_CATALOG_PATH", corrupt_file)
+    monkeypatch.setattr("local_anonymizer.llm.catalog._CACHED_CATALOG", None)
+
+    # get_model_suitability_badge should return error badge gracefully without crashing UI
+    lbl, col, tt = get_model_suitability_badge("qwen3:8b")
+    assert lbl == "Katalog-Fehler"
+    assert col == "negative"
+    assert "beschädigt" in tt
+
+
+def test_catalog_package_resource_loading():
+    """Verify that catalog.json is accessible via importlib.resources as packaged resource."""
+    import importlib.resources
+    resource = importlib.resources.files("local_anonymizer.llm").joinpath("catalog.json")
+    assert resource.is_file()
+    content = resource.read_text(encoding="utf-8")
+    data = json.loads(content)
+    assert data.get("schema_version") == "1.0.0"
+

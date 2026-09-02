@@ -104,7 +104,7 @@ async def test_preload_cloud_model_rejected():
 
 @pytest.mark.asyncio
 async def test_verify_generic_connection_success():
-    session = MockSession(default_resp=MockResponse(200))
+    session = MockSession(default_resp=MockResponse(200, body=b'{"data": [{"id": "local-model"}]}'))
 
     with patch("aiohttp.ClientSession", return_value=session):
         ok = await verify_generic_connection("http://127.0.0.1:1234/v1")
@@ -160,3 +160,74 @@ async def test_cleanup_session_async():
     await cleanup_session_async(st)
     assert st.llm_provider is None
     assert provider.closed is True
+
+
+@pytest.mark.asyncio
+async def test_preload_ollama_prefix_mismatch_rejected():
+    """Ensure that prefix matches (e.g. qwen3:8b-preview matching qwen3:8b) are strictly rejected."""
+    ps_resp = {
+        "models": [
+            {
+                "name": "qwen3:8b-preview",
+                "model": "qwen3:8b-preview",
+                "size_vram": 4500000000,
+            }
+        ]
+    }
+    generate_url = "http://127.0.0.1:11434/api/generate"
+    ps_url = "http://127.0.0.1:11434/api/ps"
+    responses = {
+        generate_url: MockResponse(200, body=b'{"response": ""}'),
+        ps_url: MockResponse(200, body=json.dumps(ps_resp).encode("utf-8")),
+    }
+    session = MockSession(responses_by_url=responses)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        with pytest.raises(RuntimeError, match="nicht als aktiv in Ollama gemeldet"):
+            await preload_ollama_model("http://127.0.0.1:11434/v1", "qwen3:8b")
+
+
+def test_app_state_is_model_ready_expiration():
+    """Verify that is_model_ready auto-invalidates when keep-alive expiry timestamp has passed."""
+    import time
+    st = AppState()
+    st.config.llm_base_url = "http://127.0.0.1:11434/v1"
+    st.config.llm_model_name = "qwen3:8b"
+    st.llm_provider_type = "ollama"
+    st.llm_ready_info = PsModelInfo(name="qwen3:8b", model="qwen3:8b")
+    st.llm_ready_bound_url = "http://127.0.0.1:11434/v1"
+    st.llm_ready_bound_model = "qwen3:8b"
+
+    # Future expiration: model is ready
+    st.llm_ready_expires_at = time.time() + 300.0
+    assert st.is_model_ready() is True
+
+    # Past expiration: model is no longer ready and invalidated
+    st.llm_ready_expires_at = time.time() - 10.0
+    assert st.is_model_ready() is False
+    assert st.llm_ready_info is None
+    assert st.llm_ready_expires_at == 0.0
+
+
+def test_app_state_mutual_exclusion_is_busy():
+    """Verify mutual exclusion busy lock across analysis, triage, and setup states."""
+    st = AppState()
+    assert st.is_busy is False
+
+    st.is_analyzing = True
+    assert st.is_busy is True
+    st.is_analyzing = False
+
+    st.is_llm_running = True
+    assert st.is_busy is True
+    st.is_llm_running = False
+
+    st.llm_setup_state = "discovering"
+    assert st.is_busy is True
+    st.llm_setup_state = "preloading"
+    assert st.is_busy is True
+    st.llm_setup_state = "testing"
+    assert st.is_busy is True
+    st.llm_setup_state = "idle"
+    assert st.is_busy is False
+

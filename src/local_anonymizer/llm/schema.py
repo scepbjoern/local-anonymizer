@@ -64,12 +64,44 @@ class CatalogModelEntry(BaseModel):
     def check_aliases(cls, v: List[str]) -> List[str]:
         return [validate_model_name(a) for a in v]
 
+    @field_validator("test_date")
+    @classmethod
+    def check_test_date(cls, v: str) -> str:
+        if not re.fullmatch(r"^\d{4}-\d{2}-\d{2}$", v):
+            raise ValueError(f"Ungültiges Datumsformat '{v}': Erwartet wird YYYY-MM-DD.")
+        from datetime import datetime
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+        except ValueError as e:
+            raise ValueError(f"Ungültiges Kalenderdatum '{v}': {e}") from e
+        return v
+
 
 class CatalogSchema(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     schema_version: Literal["1.0.0"] = Field("1.0.0", description="Strikte Katalog-Schemaversion")
     models: List[CatalogModelEntry] = Field(..., description="Liste geprüfter Modelle")
+
+    @field_validator("models")
+    @classmethod
+    def check_unique_models_and_tags(cls, models: List[CatalogModelEntry]) -> List[CatalogModelEntry]:
+        seen_names: Set[str] = set()
+        seen_tags: Set[str] = set()
+
+        for m in models:
+            c_name = m.canonical_name.lower()
+            if c_name in seen_names:
+                raise ValueError(f"Doppelter kanonischer Modellname im Katalog: '{m.canonical_name}'")
+            seen_names.add(c_name)
+
+            all_tags = [m.tested_tag.lower()] + [a.lower() for a in m.aliases]
+            for tag in all_tags:
+                if tag in seen_tags:
+                    raise ValueError(f"Kollidierender Tag/Alias im Katalog: '{tag}' bei Modell '{m.canonical_name}'")
+                seen_tags.add(tag)
+
+        return models
 
 
 class DiscoveryResult(BaseModel):

@@ -137,3 +137,70 @@ async def test_fetch_generic_models_success():
         res = await fetch_generic_models("http://127.0.0.1:1234/v1")
         assert res.status == "success"
         assert res.models == ["local-qwen", "local-mistral"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_ollama_models_invalid_content_type():
+    resp = MockResponse(200, headers={"Content-Type": "text/html"}, body=b"<html>error</html>")
+    session = MockSession(get_resp=resp)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        res = await fetch_ollama_models("http://127.0.0.1:11434/v1")
+        assert res.status == "invalid_response"
+        assert "Content-Type" in res.message
+
+
+@pytest.mark.asyncio
+async def test_fetch_ollama_models_missing_models_key():
+    resp = MockResponse(200, body=b'{"error": "not found"}')
+    session = MockSession(get_resp=resp)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        res = await fetch_ollama_models("http://127.0.0.1:11434/v1")
+        assert res.status == "invalid_response"
+        assert "models" in res.message
+
+
+@pytest.mark.asyncio
+async def test_fetch_ollama_models_not_a_list():
+    resp = MockResponse(200, body=b'{"models": "not-a-list"}')
+    session = MockSession(get_resp=resp)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        res = await fetch_ollama_models("http://127.0.0.1:11434/v1")
+        assert res.status == "invalid_response"
+        assert "Array" in res.message or "models" in res.message
+
+
+@pytest.mark.asyncio
+async def test_fetch_generic_models_invalid_content_type():
+    resp = MockResponse(200, headers={"Content-Type": "text/plain"}, body=b"plain text")
+    session = MockSession(get_resp=resp)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        res = await fetch_generic_models("http://127.0.0.1:1234/v1")
+        assert res.status == "invalid_response"
+        assert "Content-Type" in res.message
+
+
+@pytest.mark.asyncio
+async def test_fetch_generic_models_missing_data_key():
+    resp = MockResponse(200, body=b'{"object": "list"}')
+    session = MockSession(get_resp=resp)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        res = await fetch_generic_models("http://127.0.0.1:1234/v1")
+        assert res.status == "invalid_response"
+        assert "data" in res.message
+
+
+@pytest.mark.asyncio
+async def test_fetch_generic_models_data_not_a_list():
+    resp = MockResponse(200, body=b'{"data": {"id": "single-model"}}')
+    session = MockSession(get_resp=resp)
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        res = await fetch_generic_models("http://127.0.0.1:1234/v1")
+        assert res.status == "invalid_response"
+        assert "Array" in res.message or "data" in res.message
+

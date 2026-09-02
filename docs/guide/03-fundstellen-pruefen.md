@@ -126,7 +126,14 @@ Wenn du das optionale Zusatzpaket `[llm]` installiert und in der Seitenleiste ei
    - Ein Klick auf **Übernehmen** öffnet den **Auswirkungsdialog**. Dieser zeigt übersichtlich alle betroffenen Gruppen, allfällige Gruppen-Splits und die neue unverbindliche Kategorie-/Deskriptorvorschau.
    - Erst nach deiner expliziten Bestätigung mit **Bestätigen & Übernehmen** wird die Review-Tabelle atomar aktualisiert. Tritt ein unerwarteter Fehler auf, erfolgt ein automatischer Rollback auf den vorherigen Stand.
 
+### Modellauswahl, automatische Erkennung und Vorladung (Phase 6A.1)
+- **Automatische Discovery:** Beim Aktivieren oder Klick auf „Liste aktualisieren“ werden lokal installierte Modelle automatisch über den Loopback-Endpunkt erkannt und in der Auswahlliste angezeigt.
+- **Katalog-Transparenz:** Der integrierte Modellkatalog blendet für evaluierte Modelle automatisch Prüfhinweise ein (z. B. Referenzmodell `qwen3:8b`, `ministral-3:8b` oder `phi4:latest`).
+- **Gezielte Vorladung (`Laden`):** Lädt das gewählte Modell vorab in den VRAM/Arbeitsspeicher und bestätigt die Einsatzbereitschaft mit VRAM- und Ablaufanzeige.
+- **Netzwerk-Isolation:** Die Anwendung blockiert Cloud-Modelle (`:cloud`) und empfiehlt, Ollama im Local-Only-Modus (`OLLAMA_NO_CLOUD=1`) zu betreiben.
+
 ### Umgang mit unvollständigen Läufen (Teilantworten)
 Bricht die Modellverbindung ab oder kann ein Batch wegen eines Timeouts nicht verarbeitet werden, zeigt die Anwendung einen amberfarbenen Hinweis mit den betroffenen ungeprüften Fundstellen.
 - **Sicherheit:** Die Sammelübernahme („Ausgewählte Änderungen übernehmen“) wird bei unvollständigen Läufen gesperrt.
 - **Einzelübernahme:** Erfolgreich geprüfte Vorschläge können weiterhin einzeln geprüft und übernommen werden. Ungeprüfte Fundstellen verbleiben im ursprünglichen Zustand der Review-Tabelle.
+

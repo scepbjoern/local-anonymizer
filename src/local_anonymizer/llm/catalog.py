@@ -47,11 +47,21 @@ def load_catalog(catalog_path: Optional[Path] = None, force_reload: bool = False
         raise CatalogError(f"Ungültiger oder beschädigter Modellkatalog ({type(e).__name__})") from e
 
 
+def get_catalog_safe(catalog_path: Optional[Path] = None) -> Tuple[Optional[CatalogSchema], Optional[str]]:
+    """Return (catalog, None) on success or (None, error_message) on failure."""
+    try:
+        cat = load_catalog(catalog_path=catalog_path)
+        return cat, None
+    except CatalogError as ce:
+        return None, str(ce)
+
+
 def find_catalog_entry(model_name: str, catalog: Optional[CatalogSchema] = None) -> Optional[CatalogModelEntry]:
     """
     Look up a model in the catalog.
     Enforces exact tag match priority first, then checks explicit verified aliases.
-    Returns None if the model is not listed in the catalog.
+    Raises CatalogError if the static catalog file is corrupted or missing.
+    Returns None if the catalog is valid but the model is not listed.
     """
     if not model_name:
         return None
@@ -62,10 +72,7 @@ def find_catalog_entry(model_name: str, catalog: Optional[CatalogSchema] = None)
         return None
 
     if catalog is None:
-        try:
-            catalog = load_catalog()
-        except CatalogError:
-            return None
+        catalog = load_catalog()
 
     clean_lower = clean_name.lower()
 
@@ -89,9 +96,14 @@ def get_model_suitability_badge(
 ) -> Tuple[str, str, str]:
     """
     Return (display_label, color, tooltip_text) for a model name.
+    If catalog is corrupted, returns ('Katalog-Fehler', 'negative', error_detail).
     If not found in catalog, returns ('Nicht evaluiert', 'grey-7', 'Unbekanntes Modell').
     """
-    entry = find_catalog_entry(model_name, catalog=catalog)
+    try:
+        entry = find_catalog_entry(model_name, catalog=catalog)
+    except CatalogError as ce:
+        return ("Katalog-Fehler", "negative", f"Modellkatalog beschädigt oder nicht verfügbar: {ce}")
+
     if entry is None:
         return ("Nicht evaluiert", "grey-7", "Dieses Modell wurde noch nicht offiziell für die Anonymisierung evaluiert.")
 
