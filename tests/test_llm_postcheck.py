@@ -35,6 +35,10 @@ from app import (
     render_postcheck_ui_component,
     compute_postcheck_bound_key,
     is_postcheck_context_confirmed,
+    is_postcheck_scope_enabled,
+    reset_app_state,
+    create_ui,
+    save_current_config,
 )
 from local_anonymizer.anonymizer import LocalAnonymizer
 from local_anonymizer.llm.postcheck_schema import (
@@ -59,6 +63,7 @@ from local_anonymizer.llm.provider import LocalApiProvider, LlmProvider
 from local_anonymizer.llm.catalog import CatalogError
 from local_anonymizer.llm.schema import CatalogModelEntry, CatalogPhaseEvaluation, CatalogSchema
 from local_anonymizer.config import AppConfig
+from local_anonymizer.profiles import ProfileStore, ProfileController, RevisionConflictError
 
 
 class FakeProvider(LlmProvider):
@@ -1725,5 +1730,223 @@ async def test_gui_endpoint_change_stale_checkbox_cannot_confirm_a_config_it_was
         assert st.postcheck_confirmed_bound_key == compute_postcheck_bound_key(st)
         assert st.postcheck_confirmed_bound_key == "http://127.0.0.1:11434/v1_B|model-a"
         assert is_postcheck_context_confirmed(st) is True
+
+
+# ---------------------------------------------------------------------------
+# 14. U3 - Persistence/staleness regressions (Handoff 20260903-1357): a pure
+# LLM-/provider-settings save must not spuriously invalidate an already-completed
+# analysis, a reset document must not inherit a stale comparison target, and a
+# confirmed context badge must not imply overall start-readiness when an
+# independent gate (category/profile scope) still blocks the start. All three use
+# a REAL ProfileStore/ProfileController rooted in tmp_path (never Björn's real
+# CONFIG_DIR) and the REAL NiceGUI handlers/renderers - no save_current_config mock.
+# ---------------------------------------------------------------------------
+
+def _rewire_state_to_tmp_profile_store(st: "AppState", tmp_path) -> None:
+    """Point a real AppState at a fresh, isolated real ProfileStore/ProfileController
+    instead of the users real CONFIG_DIR. Never copies or touches production profiles."""
+    store = ProfileStore(root_dir=tmp_path)
+    store.initialize_or_migrate()
+    manifest = store.load_manifest()
+    manifest["warning_acknowledged_version"] = 1  # skip the one-time privacy dialog
+    manifest = store.save_manifest(manifest, expected_revision=int(manifest["revision"]))
+    controller = ProfileController(store)
+    st.profile_store = store
+    st.profile_controller = controller
+    st.system_profile = controller.system_profile
+    st.project_profile = controller.project_profile
+    st.document_overlay = controller.document_overlay
+    st.entity_modes = dict(controller.project_profile.entity_modes)
+    st._profile_warning_confirmed = True
+    # A real app always keeps these text mirrors in sync with the loaded project; the
+    # freshly rewired AppState() otherwise still carries whatever was loaded from the
+    # real CONFIG_DIR before the rewire.
+    st.glossary_text = ""
+    st.ignore_terms_text = ""
+    st.refresh_effective_config()
+
+
+@pytest.mark.asyncio
+async def test_pure_llm_settings_save_does_not_bump_project_revision_or_stale_preview(tmp_path):
+    from types import SimpleNamespace
+    from nicegui import Client, ui
+    from nicegui.page import page
+    """
+    Root cause A (Handoff 20260903-1357): save_current_config() is reached by every
+    LLM-/provider-/review-settings change, and unconditionally re-persisted the whole
+    project profile - whose revision is baked into EffectiveConfig.snapshot_hash - even
+    when entity_modes/glossary/ignore content was completely untouched. A real model
+    change must no longer bump the revision or flip preview_stale, so a genuinely
+    unrelated setting change cannot invalidate an already-completed analysis.
+    """
+    with Client(page('/')) as client:
+        create_ui(client)
+        st = client.state
+        _rewire_state_to_tmp_profile_store(st, tmp_path)
+
+        st.raw_text = "Dr. Anna Keller leitete das Spital in Bern."
+        st.current_anon_text = st.raw_text
+        st.analyzed_config_hash = st.refresh_effective_config().snapshot_hash
+        revision_before = st.project_profile.revision
+        assert st.preview_stale is False
+
+        model_dropdown = next(
+            el for el in client.elements.values()
+            if isinstance(el, ui.select) and el._props.get("label") == "Modellauswahl"
+        )
+        on_model_select_change = model_dropdown._change_handlers[0]
+        with client:
+            await on_model_select_change(SimpleNamespace(value="model-b"))
+
+        assert st.config.llm_model_name == "model-b"
+        assert st.project_profile.revision == revision_before, (
+            "A pure LLM model change must not bump the project profile revision."
+        )
+        assert st.preview_stale is False, (
+            "A pure LLM model change must not falsely flag the current analysis as stale."
+        )
+        confirm_checkboxes = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.checkbox) and "32.000 Tokens Kontext konfiguriert" in (el.text or "")
+        ]
+        stale_banners = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.label) and "Konfiguration geändert" in (el.text or "")
+        ]
+        assert len(confirm_checkboxes) == 1, "The context confirmation checkbox must render, not a stale banner."
+        assert stale_banners == []
+
+
+def test_document_reset_clears_analyzed_config_hash_and_preview_stale(tmp_path):
+    from nicegui import Client
+    from nicegui.page import page
+    """
+    Root cause B (Handoff 20260903-1357): analyzed_config_hash was only ever set (at
+    the end of a real analysis) and never cleared again, so a brand-new, never-yet-
+    analyzed document inherited the previous documents hash via reset_app_state() and
+    was immediately (and wrongly) shown as stale / "Konfiguration geändert".
+    """
+    with Client(page('/')) as client:
+        create_ui(client)
+        st = client.state
+        _rewire_state_to_tmp_profile_store(st, tmp_path)
+
+        st.raw_text = "Erstes Dokument mit Anna Keller."
+        st.current_anon_text = st.raw_text
+        st.analyzed_config_hash = st.refresh_effective_config().snapshot_hash
+        assert st.analyzed_config_hash is not None
+
+        reset_app_state(st)
+
+        assert st.analyzed_config_hash is None, (
+            "A document reset must clear the previous analysis's comparison target."
+        )
+        assert st.preview_stale is False, (
+            "A brand-new, never-analyzed document must not be flagged as stale."
+        )
+
+
+def test_restrictive_category_profile_disables_start_button_with_visible_reason(tmp_path):
+    from nicegui import Client, ui
+    from nicegui.page import page
+    """
+    Root cause C (Handoff 20260903-1357): the renderer's can_start computation ignored
+    the profile/category scope gate (active only for 'all'/'explicit_eupii' modes) that
+    run_postcheck_for_state enforces server-side. A user could see a genuine confirmed
+    badge, a fully enabled Start button, click it, and be silently rejected with only an
+    easy-to-miss info toast. Both the renderer and the server must now agree via the
+    shared is_postcheck_scope_enabled() rule, and the button must visibly reflect it.
+    """
+    with Client(page('/')) as client:
+        create_ui(client)
+        st = client.state
+        _rewire_state_to_tmp_profile_store(st, tmp_path)
+        st.project_profile.entity_modes = {k: "explicit_only" for k in st.project_profile.entity_modes}
+        st.refresh_effective_config()
+        assert is_postcheck_scope_enabled(st) is False
+
+        st.config.llm_model_name = "model-a"
+        st.raw_text = "Dr. Anna Keller leitete das Spital in Bern."
+        st.current_anon_text = st.raw_text
+        st.analyzed_config_hash = st.refresh_effective_config().snapshot_hash
+        st.postcheck_user_context_confirmed = True
+        st.postcheck_confirmed_bound_key = compute_postcheck_bound_key(st)
+        assert is_postcheck_context_confirmed(st) is True  # confirmation itself is genuinely fine
+
+        with client:
+            render_postcheck_ui_component(state=st, anon_text=st.current_anon_text, run_action=lambda: None)
+
+        badges = [el for el in client.elements.values() if isinstance(el, ui.badge)]
+        assert any("32k-Kontext bestätigt" in (b.text or "") for b in badges), (
+            "The confirmation badge is accurate and must still show - only Start must be blocked."
+        )
+        start_buttons = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.button) and "Ausgangskontrolle starten" in (el.text or "")
+        ]
+        assert len(start_buttons) == 1
+        assert start_buttons[0]._props.get("disabled") is True, (
+            "Start must be visibly disabled when the category profile blocks the Ausgangskontrolle, "
+            "even though the context confirmation badge is shown as valid."
+        )
+
+        notified = []
+        task = run_postcheck_for_state(st, notify_fn=lambda m, t: notified.append((m, t)))
+        assert task is None
+        assert any("im aktuellen Profil deaktiviert" in m for m, t in notified)
+
+
+def test_save_current_config_still_detects_external_conflict_when_own_view_unchanged(tmp_path):
+    from types import SimpleNamespace
+    """
+    Safety net for the fix above: skipping the project re-save when this session's own
+    view is unchanged must never bypass the CAS/revision-conflict protection (Handoff
+    20260903-1357, item 4). Session B's project content is unchanged from its own prior
+    load, but session A has already saved a real change to the same project in the
+    meantime - session B's save_current_config() must still detect and reject that.
+    """
+    store = ProfileStore(root_dir=tmp_path)
+    store.initialize_or_migrate()
+    manifest = store.load_manifest()
+    manifest["warning_acknowledged_version"] = 1
+    store.save_manifest(manifest, expected_revision=int(manifest["revision"]))
+
+    # Session B loads FIRST, so its in-memory project stays on the original revision
+    # while session A's later save moves the on-disk revision forward underneath it.
+    controller_b = ProfileController(store)
+
+    controller_a = ProfileController(store)
+    controller_a.project_profile.entity_modes["PERSON"] = "off"
+    controller_a.save_project(expected_revision=controller_a.project_profile.revision)
+
+    state_b = SimpleNamespace(
+        profile_store=store,
+        profile_controller=controller_b,
+        system_profile=controller_b.system_profile,
+        project_profile=controller_b.project_profile,
+        document_overlay=controller_b.document_overlay,
+        entity_modes=dict(controller_b.project_profile.entity_modes),  # unchanged from B's own load
+        format_mode="numbered_role",
+        gliner_model_name="urchade/gliner_multi_pii-v1",
+        gliner_threshold=0.55,
+        enable_eupii=False,
+        eupii_threshold=0.5,
+        eupii_model_name="bardsai/eu-pii-anonimization-multilang",
+        ignore_terms_text="",
+        glossary_text="",
+        export_format="txt",
+        config=SimpleNamespace(
+            llm_enabled=False, llm_base_url="http://127.0.0.1:11434/v1",
+            llm_model_name="qwen3:8b", llm_provider_type="ollama",
+            llm_auto_review=True, save=lambda: True,
+        ),
+        refresh_effective_config=lambda *a, **kw: None,
+        _profile_warning_confirmed=True,
+    )
+
+    assert save_current_config(state_b) is False, (
+        "An externally-changed project must still be detected as a conflict even when "
+        "this session's own content view looks unchanged."
+    )
 
 

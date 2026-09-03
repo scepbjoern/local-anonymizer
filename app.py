@@ -709,6 +709,12 @@ def reset_app_state(st: "AppState") -> None:
     st.current_mapping = {}
     st.current_anon_text = ""
     st.current_report = {}
+    # A never-yet-analyzed (new/reset) document must not inherit a stale-comparison
+    # target from whatever was analyzed before it (Handoff 20260903-1357): otherwise
+    # refresh_effective_config() below compares the fresh EffectiveConfig against an
+    # unrelated old hash and immediately flags an unanalyzed document as "stale".
+    st.analyzed_config_hash = None
+    st.preview_stale = False
     st.document_revision += 1
     st.llm_triage_results.clear()
     st.llm_triage_snapshot = ""
@@ -1865,10 +1871,20 @@ def save_current_config(st: AppState):
     controller.project_profile = st.project_profile
     controller.document_overlay = st.document_overlay
     project = controller.project_profile
-    project.entity_modes = dict(st.entity_modes)
+
+    def _term_snapshot(terms: Dict[str, "ScopedTerm"]) -> frozenset:
+        # Ignores created_at (freshly stamped on every reconstruction below) so a
+        # purely re-parsed-but-unchanged term set compares equal to the persisted one.
+        return frozenset((k, t.term, t.term_key, t.entity_type, t.role) for k, t in terms.items())
+
+    prev_entity_modes = dict(project.entity_modes)
+    prev_glossary_snapshot = _term_snapshot(project.glossary_terms)
+    prev_ignore_snapshot = _term_snapshot(project.ignore_terms)
+
+    new_entity_modes = dict(st.entity_modes)
     parsed_glossary = parse_glossary(st.glossary_text)
     parsed_roles = parse_glossary_roles(st.glossary_text)
-    project.glossary_terms = {
+    new_glossary_terms = {
         normalize_term_key(term): ScopedTerm(
             term=term,
             term_key=normalize_term_key(term),
@@ -1878,11 +1894,26 @@ def save_current_config(st: AppState):
         for term, entity_type in parsed_glossary.items()
         if normalize_term_key(term)
     }
-    project.ignore_terms = {
+    new_ignore_terms = {
         normalize_term_key(term): ScopedTerm(term=term, term_key=normalize_term_key(term))
         for term in parse_ignore_terms(st.ignore_terms_text)
         if normalize_term_key(term)
     }
+
+    # Detection-relevant content only: whether entity_modes/glossary/ignore actually
+    # changed FROM THIS SESSION'S OWN PRIOR VIEW. A pure LLM-/provider-/review-settings
+    # save (which always reaches this function) must not needlessly re-persist and bump
+    # the project profile revision - EffectiveConfig.snapshot_hash is keyed on that
+    # revision, so an unrelated bump would wrongly invalidate every already-completed
+    # analysis (Handoff 20260903-1357).
+    project_content_changed = (
+        new_entity_modes != prev_entity_modes
+        or _term_snapshot(new_glossary_terms) != prev_glossary_snapshot
+        or _term_snapshot(new_ignore_terms) != prev_ignore_snapshot
+    )
+    project.entity_modes = new_entity_modes
+    project.glossary_terms = new_glossary_terms
+    project.ignore_terms = new_ignore_terms
     config = getattr(st, "config", None)
     manifest_updates = {
         "format_mode": st.format_mode,
@@ -1899,7 +1930,19 @@ def save_current_config(st: AppState):
         "llm_auto_review": getattr(config, "llm_auto_review", True),
     }
     try:
-        controller.save_project(expected_revision=project.revision)
+        if project_content_changed:
+            controller.save_project(expected_revision=project.revision)
+        else:
+            # Do NOT skip the CAS check itself just because our own view is unchanged:
+            # another session/process could have modified this exact project in the
+            # meantime. Re-verify against the on-disk revision before treating this as
+            # a safe no-op, so the revision-conflict protection is never bypassed
+            # (Handoff 20260903-1357, item 4).
+            on_disk_project = controller.store.load_project_profile(project.project_id)
+            if on_disk_project.revision != project.revision:
+                raise RevisionConflictError(
+                    f"Project revision conflict: on_disk={on_disk_project.revision}, expected={project.revision}"
+                )
         controller.save_manifest(manifest_updates, expected_revision=int(controller.manifest["revision"]))
         st.system_profile = controller.system_profile
         st.project_profile = controller.project_profile
@@ -2256,6 +2299,17 @@ def is_postcheck_context_confirmed(state: "AppState") -> bool:
     )
 
 
+def is_postcheck_scope_enabled(state: "AppState") -> bool:
+    """Shared scope/category rule: the Ausgangskontrolle only ever proposes findings
+    when at least one entity type is in 'all' or 'explicit_eupii' mode. Used identically
+    by the server-side start check and the UI renderer so a '32k bestaetigt' badge can
+    never look like overall readiness while this independent gate silently blocks start
+    (Handoff 20260903-1357)."""
+    return any(
+        m in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII) for m in state.entity_modes.values()
+    )
+
+
 def run_postcheck_for_state(
     state: "AppState",
     provider: Optional[Any] = None,
@@ -2313,10 +2367,7 @@ def run_postcheck_for_state(
         notify("Kein anonymisierter Text vorhanden.", "warning")
         return None
 
-    active_postcheck_modes = [
-        m for m in state.entity_modes.values() if m in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
-    ]
-    if not active_postcheck_modes:
+    if not is_postcheck_scope_enabled(state):
         notify("Ausgangskontrolle im aktuellen Profil deaktiviert (nur bei 'all' oder 'explicit_eupii' aktiv).", "info")
         return None
 
@@ -2627,6 +2678,7 @@ def render_postcheck_ui_component(
         has_known_small_limit = known_limit is not None and known_limit < MAX_POSTCHECK_TOTAL_BUDGET
 
         context_confirmed = is_postcheck_context_confirmed(state)
+        scope_enabled = is_postcheck_scope_enabled(state)
 
         with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
             with ui.row().classes("items-center gap-2"):
@@ -2652,6 +2704,17 @@ def render_postcheck_ui_component(
                 ui.label(
                     f"Modell '{model_name}' unterstützt laut Katalog nur {known_limit} Tokens. "
                     f"Für die Ausgangskontrolle sind mindestens {MAX_POSTCHECK_TOTAL_BUDGET} Tokens erforderlich. Start blockiert."
+                ).classes("font-medium")
+
+        elif not scope_enabled and not state.is_postcheck_active:
+            # A '32k bestaetigt' badge above must never look like overall readiness while
+            # this independent, profile-driven gate silently blocks the start (Handoff
+            # 20260903-1357): show the real, current blocking reason explicitly instead.
+            with ui.row().classes("w-full my-2 p-2 bg-slate-100 border border-slate-300 rounded text-xs text-slate-700 items-center gap-2"):
+                ui.icon("block", size="sm").classes("text-slate-500")
+                ui.label(
+                    "Ausgangskontrolle im aktuellen Kategorienprofil deaktiviert (nur bei mindestens einer "
+                    "Kategorie im Modus 'all' oder 'explicit_eupii' aktiv). Kontextbestätigung bleibt davon unberührt."
                 ).classes("font-medium")
 
         elif not state.is_postcheck_active and not context_confirmed:
@@ -2738,7 +2801,13 @@ def render_postcheck_ui_component(
                 ui.label(state.postcheck_status_msg or "Ausgangskontrolle läuft...").classes("font-medium")
 
         elif not state.is_postcheck_active:
-            can_start = context_confirmed and not has_known_small_limit and not state.is_busy and bool(text_to_show)
+            can_start = (
+                context_confirmed
+                and scope_enabled
+                and not has_known_small_limit
+                and not state.is_busy
+                and bool(text_to_show)
+            )
             if run_action:
                 start_btn = ui.button(
                     "🔍 Ausgangskontrolle starten (Nachzügler suchen)",
@@ -2746,6 +2815,8 @@ def render_postcheck_ui_component(
                     color="indigo-7",
                     on_click=run_action,
                 ).props("unelevated dense size=sm" + ("" if can_start else " disabled"))
+                if not can_start and not has_known_small_limit and context_confirmed and not scope_enabled:
+                    start_btn.tooltip("Im aktuellen Kategorienprofil deaktiviert (nur bei 'all'/'explicit_eupii' aktiv).")
                 if hasattr(state, "register_mutating_element"):
                     state.register_mutating_element(start_btn, "workspace")
 

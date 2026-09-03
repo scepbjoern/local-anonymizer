@@ -1,8 +1,11 @@
 # Phase 6B: LLM-Ausgangskontrolle (Postcheck)
 
-**Status:** Implementiert, inkl. Minimaler Entkopplung, F1 Client-Binding sowie U1/U2-Nachbesserung
-(Review-Bedienelemente im Review-Assistenten, Kontextanzeige nach Modell-/Endpunktwechsel). Automatisierte
-Regressionstests grün; finale GUI-Abnahme durch Björn/PLAI-00b steht für den Folgecommit noch aus.
+**Status:** Implementiert, inkl. Minimaler Entkopplung, F1 Client-Binding, U1/U2-Nachbesserung
+(Review-Bedienelemente im Review-Assistenten, Kontextanzeige nach Modell-/Endpunktwechsel) sowie
+U3-Nachbesserung (echte GUI-Abläufe: fälschliche Stale-Warnung bei reinem LLM-Save, geerbter
+Stale-Zustand nach Dokumentwechsel, unsichtbarer Kategorien-Sperrgrund trotz bestätigtem Kontext).
+Automatisierte Regressionstests grün; finale GUI-Abnahme durch Björn/PLAI-00b steht für den
+Folgecommit noch aus.
 **Basis-Commit:** `cbf06c006a37a08e3e7745e7980a5ffc6f21a990`
 
 ---
@@ -115,3 +118,4 @@ Die Ausgangskontrolle nutzt Einzelaufrufe ohne Chunking und setzt ausreichenden 
 11. **Minimale Entkopplung:** Die Ausgangskontrolle ist auch bei deaktiviertem LLM-Review vollumfänglich start- und bedienbar. Die Modelleinstellungen und Statusanzeigen bleiben für beide Funktionen zentral zugänglich.
 12. **NiceGUI-Client-Binding (F1):** Alle asynchronen Hintergrund-Worker-Callbacks binden explizit an den aktiven UI-Client-Kontext (`with client:`), um Re-Rendering- und Notification-Abbrüche zu verhindern.
 13. **Review-Bedienplatzierung (U1):** Der Schalter „LLM-Review aktivieren“ und die Checkbox „LLM-Review direkt an die Textanalyse anschließen“ sind Teil des Review-Assistenten-Panels (nicht der gemeinsamen Modelleinstellungen), bleiben dort auch bei ausgeschaltetem Review sichtbar/bedienbar, und bilden keine zweite Konfigurationskopie (dieselben `state.config`-Felder wie zuvor).
+14. **Persistenz-Entkopplung von der Ausgangskontrolle (U3):** Ein reines Speichern von LLM-/Provider-/Review-Einstellungen (`save_current_config`) darf die Projekt-Revision nicht erhöhen, solange Kategorien/Glossar/Ignorierliste inhaltlich unverändert bleiben (`EffectiveConfig.snapshot_hash` ist über `project_revision` daran gekoppelt). Der CAS-Revisionskonfliktschutz bleibt dabei vollständig erhalten: Ein extern (z. B. von einer anderen Sitzung) tatsächlich geänderter Stand wird weiterhin erkannt und abgewiesen, auch wenn die eigene Sicht unverändert erscheint. Ein neues, noch nicht analysiertes Dokument (nach Reset/Neuladen) erbt keinen `analyzed_config_hash` eines vorherigen Dokuments und wird nicht fälschlich als veraltet markiert. Ein bestätigtes Kontext-Badge zeigt ausschliesslich die Gültigkeit der 32k-Bestätigung; ein unabhängiger Sperrgrund (z. B. Kategorienprofil ohne `all`/`explicit_eupii`) wird zusätzlich sichtbar angezeigt und deaktiviert den Start-Button konsistent, statt eine scheinbare Gesamtbereitschaft zu suggerieren.
