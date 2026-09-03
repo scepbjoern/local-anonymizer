@@ -178,13 +178,18 @@ Personen und Organisationen treten in realen Texten oft in unterschiedlichen Sch
 * **Human-in-the-Loop Triage-Panel (`app.py`):** Vorschlagskarten (Keep, Recategorize, Discard) mit Inline-Rollenanpassung, Vormerkung für Sammelübernahme, Auswirkungsdialog und transparenter Kennzeichnung ungeprüfter Teilantworten.
 * **Umfassende Testabdeckung:** 188 automatisierte Unit- und Regressionstests bestanden (100% Pass-Rate) + 1 EU-PII Live-Modell-Integrationstest.
 
+### ✅ Phase 6B: Finale Ausgangskontrolle / Postcheck (Abgeschlossen)
+* **Unabhängige Nachzügler-Suche:** Automatisierter Sicherheitscheck des bereits anonymisierten Dokuments vor dem Export; das lokale LLM sucht nach übersehenen sensiblen Daten im Klartext (`postcheck_service.py`, `postcheck_schema.py`).
+* **Minimale Entkopplung:** Start- und bedienbar unabhängig davon, ob der LLM-Review (Phase 6A) aktiviert ist; gemeinsame, zentral zugängliche Modellkonfiguration.
+* **Sicherheits- & Budgetverankerung:** Strikte 32.000 Tokens Obergrenze mit 4.096 Tokens Antwortreserve, Hard-Reject bei Budgetüberschreitung, Abweisung von Truncation (`finish_reason == "length"`).
+* **Bearbeitungssperre & Generation-Guard:** Sessionlokale Sperre aller Mutationen während des Prüflaufs und der anschließenden Auswahlphase; Schutz vor veralteten Callbacks/Cleanups via `postcheck_run_id`.
+* **Exaktes Back-Mapping & Schemavalidierung:** Strikte Integer-Offsets, exakter Slice-Match auf unveränderte Segmente, sichere Abweisung ungültiger Positionen.
+* **Atomare Sammelübernahme:** Konfliktprüfung, atomare Übernahme ausgewählter Nachzügler in Entitäten, Mapping und Text mit vollständigem Rollback.
+
 ### 🔮 Phase 5b: Projekt-Registry für dokumentübergreifende Mappings (Geplant nach CAS-Deliverable)
 * Verschlüsselte, strikt projekt- und kontextbezogene Mapping-Registry (Passphrase-geschützt via KeePass) zur Wiederverwendung konsistenter Pseudonyme über mehrere Dokumente hinweg.
 * Projektbezogene Glossare, Ignore-Listen, Entitätseinstellungen und manuell vergebene Rollen, beispielsweise `LEHRPERSON` oder `STUDIENGANGSLEITUNG`, sollen über mehrere Dokumente einer CAS-Abschlussarbeit konsistent verfügbar sein.
 * Eine kontrollierte projektübergreifende Wiederverwendung kann später geprüft werden; Speicherform und genaue Berechtigungsgrenzen sind noch offen.
-
-### 🔮 Phase 6B: Finale Ausgangskontrolle (Geplant / Ausblick)
-* Automatisierter Sicherheitscheck des bereits anonymisierten Dokuments vor dem Export: Das lokale LLM sucht nach übersehenen Rest-Identifikatoren oder Kontextlecks.
 
 ### 🔮 Smart-Linking (Geplant / Ausblick)
 * LLM-unterstütztes Co-Reference Linking für komplexe Koreferenzen (z. B. Pronomen, Spitznamen, Berufsbezeichnungen im Textfluss) mit menschlicher Freigabe.

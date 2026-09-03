@@ -39,8 +39,8 @@ def normalize_entity_type(raw_type: Optional[str]) -> Optional[str]:
 
 
 def check_mutation_allowed(state: Any) -> bool:
-    """Central guard against mutating state while LLM triage is running."""
-    if getattr(state, "is_llm_running", False):
+    """Central guard against mutating state while LLM triage or postcheck is running."""
+    if getattr(state, "is_llm_running", False) or getattr(state, "is_postcheck_active", False):
         return False
     return True
 

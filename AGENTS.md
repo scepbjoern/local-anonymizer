@@ -85,7 +85,7 @@ Agents making code modifications must ensure all tests pass:
 ```bash
 uv run pytest -q
 ```
-* Expected outcome: Full test suite passes cleanly (224+ unit and regression tests passed, 2 integration tests deselected by default).
+* Expected outcome: Full test suite passes cleanly (381+ unit and regression tests passed, 2 integration tests deselected by default).
 * Run the live EU-PII integration test when modifying recognizer lifecycle:
   ```bash
   uv run pytest -m integration -q
@@ -111,3 +111,7 @@ uv run pytest -q
    * Never execute a blanket `taskkill /im pythonw.exe` or `Stop-Process -Name pythonw` as it kills unrelated user processes. Always filter by process path / command line matching `*local-anonymizer*` and `*app.py*`.
 5. **Deterministic Single-Pass De-Anonymization:**
    * Placeholders in `de_anonymize` must always be sorted by descending length to prevent sub-string collision and cascading replacement errors.
+
+## 7. Planning & Documentation Standard
+- **Canonical Feature Plans:** Strategic feature master plans must be placed directly in the repository (docs/product/). They contain the complete product requirements, user flows, architecture decisions, and limits.
+- **Tactical Execution Checklists:** Local chat plans (like implementation_plan.md in your .gemini storage) must only serve as tactical execution checklists pointing to the master plan in the repo. Do not place overarching architectural contracts solely in your local storage.

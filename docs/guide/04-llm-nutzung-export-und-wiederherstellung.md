@@ -61,6 +61,16 @@ passenden Stellen exakt.
 
 Verwende nicht versehentlich die Mapping-Datei als Teil dieses Auftrags.
 
+## Optionale Ausgangskontrolle (Nachzügler-Suche via lokales LLM)
+
+Vor dem Export kannst du den fertig anonymisierten Text einer zusätzlichen, automatisierten Ausgangskontrolle (Postcheck) unterziehen. Ein lokales LLM scannt den Ausgabetext auf im Klartext verbliebene, übersehene personenbezogene Daten:
+
+- **Unabhängig nutzbar:** Die Ausgangskontrolle steht auch dann zur Verfügung, wenn du die LLM-Review-Assistenz (Stufe 2) in den Einstellungen nicht aktiviert oder übersprungen hast.
+- **Gemeinsame Modelleinstellungen:** Die Konfiguration des lokalen Modells (z. B. `qwen3:8b` via Ollama) erfolgt zentral im oberen Einstellungsbereich.
+- **Kontextbestätigung & Budget:** Aus Sicherheitsgründen ist das Gesamtbudget auf 32.000 Tokens (bei 4.096 Tokens Antwortreserve) begrenzt. Bei unbekanntem Server-Limit bestätigst du vorab per Checkbox, dass dein lokaler Server für mindestens 32k Tokens ausgelegt ist.
+- **Auswahl & atomare Übernahme:** Findet das Modell Nachzügler, erscheinen diese in einer separaten Auswahlliste. Du wählst die gewünschten Treffer per Checkbox aus und klickst auf **„Ausgewählte übernehmen“**. Die neuen Platzhalter werden atomar in den Text eingefügt, die Entitätstabelle aktualisiert und die Mapping-Datei synchronisiert.
+- **Abbruch jederzeit möglich:** Ein Klick auf „Abbrechen“ beendet den Lauf sofort und gibt alle gesperrten Steuerelemente wieder frei.
+
 ## Wiederherstellung
 
 Wechsle in den Tab **Wiederherstellen (De-Anonymize)** und lade:

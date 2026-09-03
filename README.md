@@ -30,7 +30,7 @@ Für die praktische Nutzung steht ein deutschsprachiger [Benutzerleitfaden](docs
 - **👔 Optional Role Detection:** `ROLE` recognizes job titles such as `CEO`, `CFO`, or `Leiter Prozessmanagement`; it is off by default because process roles are often meaningful content.
 - **🇨🇭 Deterministic Swiss/CH-PII Detection:** Recognizes Swiss/German addresses plus checksum-validated AHV and CHE/UID numbers; internal IT systems are supported through the glossary and GLiNER safety-net prompts.
 - **🔎 Transparent Review Sources & Bulk Toggles:** Each finding shows whether it came from `🤖 GLiNER`, `🤖 EU-PII`, `🔤 Regex`, `📚 Bibliothek` (Google `phonenumbers`), `📖 Glossar` (direct/fuzzy), or `✍ Manuell`. The toolbar includes "Alle aktivieren", "Alle abwählen" and an interactive "Alle aufklappen / zuklappen" toggle.
-- **🧠 Optional Local LLM Triage Layer:** Verifies detected entities in context via local OpenAI-compatible endpoints (e.g. Ollama, LM Studio). Provides snapshot-protected recommendations for false-positive filtering, category corrections, and role descriptors with explicit, impact-previewed, atomic human approval.
+- **🧠 Optional Local LLM Layer (Triage & Postcheck):** Verifies detected entities in context (Phase 6A) and scans already anonymized text for overlooked PII in an independent postcheck (Phase 6B) via local OpenAI-compatible endpoints (e.g. Ollama). Both features share common model configuration, loopback security, and strict human approval with atomic apply.
 - **📄 Multi-Format Document Support:** Structured text and Markdown extraction for Word `.docx`, `.pdf`, `.csv`, `.json`, `.txt`, and `.md` with robust multi-encoding fallback (`utf-8-sig`, `cp1252`, `iso-8859-15`).
 - **📊 Advanced PDF-to-Markdown Extraction:** Structured Markdown extraction powered by PyMuPDF RAG (preserving headers, lists, bold/italic, and clean tables without tearing words across columns), picture text toggle, and recurring header/footer suppression with Page-1 title protection.
 - **🖥️ Native Desktop GUI:** Responsive, instant-startup NiceGUI interface running as a native desktop window (with `--browser` option for web workflows).
@@ -97,15 +97,17 @@ pip install -e ".[gui,llm]"
    # Or browser mode:
    uv run --extra gui --extra llm python app.py --browser
    ```
-4. In the Desktop GUI, enable the LLM Review Assistant (top area), select or enter your local model (e.g. `qwen3:8b`), and optionally preload it.
+4. In the Desktop GUI, configure your local model (e.g. `qwen3:8b`) in the central LLM configuration panel.
+   - **LLM-Review (Phase 6A):** Optional in-context verification and role enrichment for detected entities.
+   - **Ausgangskontrolle / Postcheck (Phase 6B):** Independent final scan of the anonymized text for overlooked PII with a 32k-token budget and atomic apply. Operable even if LLM-Review is switched off.
 
 > [!NOTE]
 > **Hardware & Performance:**
-> The core deterministic anonymization pipeline (GLiNER, EU-PII, Regex, Swiss Checksums) is lightweight and runs efficiently on standard CPU-only laptops. The optional LLM Triage Layer is an accelerated power-user path (for the tested reference setup with ~8B models, GPU acceleration is recommended).
+> The core deterministic anonymization pipeline (GLiNER, EU-PII, Regex, Swiss Checksums) is lightweight and runs efficiently on standard CPU-only laptops. The optional LLM features are an accelerated power-user path (for the tested reference setup with ~8B models, GPU acceleration is recommended).
 
 > [!IMPORTANT]
 > **Strict Human-in-the-Loop:**
-> The LLM Triage Layer makes recommendations only. It never mutates entity groups or placeholders automatically. Changes are only applied when the user explicitly reviews them, selects them, and confirms them in the impact dialog.
+> Local LLM features make recommendations only. They never mutate entity groups or placeholders automatically. Changes are only applied when the user explicitly reviews them, selects them, and confirms them in the UI.
 
 ---
 

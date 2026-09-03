@@ -3,8 +3,8 @@
 Willkommen in der Dokumentation für `local-anonymizer`.
 
 > **Governance-Hinweis:**
-> Dieses Repository enthält die *technische Source of Truth* (Produkt-Spezifikation, Architektur, Komponenten-Doku, Test-Dokumentation).
-> Strategische Handoffs, CAS-Protokolle, Architekturentscheide und Projektphasen-Steuerung verbleiben im privaten Obsidian-Vault unter `50-59 Knowledge systems, AI & private development / 52 AI, agents & automation / 52.16 AI workspaces / P_PLAI - Privacy-First Local AI`.
+> Dieses Repository enthält die *technische Source of Truth* (Produkt-Spezifikation, Architektur, Feature-Masterpläne, Komponenten-Doku).
+> Strategische Handoffs, CAS-Protokolle, persönliche Entscheidungsprovenienz und Projektphasen-Steuerung verbleiben im privaten Obsidian-Vault des Projektinhabers.
 
 ---
 
@@ -22,6 +22,7 @@ andere Personen, die das Werkzeug praktisch verwenden möchten:
 Globale Dokumente, die das gesamte Repository und die Produktdefinition betreffen:
 - [Product Requirements Document (PRD)](product/PRD.md) – Vision, Zielgruppen, Anwendungsfälle, Spezifikation der Format-Modi, Entity-Linking, Homonym-Zuordnung (Phase 5a), lokaler LLM-Triage-Layer (Phase 6A) und Phasen-Roadmap.
 - [System Architecture](product/ARCHITECTURE.md) – Technische Architektur (In-Memory Processing, GLiNER NER Chunking, Presidio Integration, RapidFuzz Fuzzy Glossary, NiceGUI UI-Schicht, Single-Pass De-Anonymisierung, lokaler LLM-Triage-Layer mit Snapshot-Schutz, Batching, Provider-Loopback und Apply-Service).
+- [Phase 6B Ausgangskontrolle](product/Phase_6B_Ausgangskontrolle.md) – Masterplan für den Postcheck (Nachzügler-Suche).
 
 ---
 

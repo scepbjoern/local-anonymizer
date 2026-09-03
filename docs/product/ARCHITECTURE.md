@@ -219,6 +219,60 @@ Die UI-Schalter für Entitätstypen verwenden bis zu vier Modi: `Aus` blockiert 
 
 ---
 
+## 4.1 LLM-Ausgangskontrolle (Postcheck, Phase 6B)
+
+Als komplementäres Verfahren zur Fundstellen-Triage (Phase 6A) prüft die Ausgangskontrolle (Phase 6B) den *bereits anonymisierten Ausgabetext* auf übersehene personenbezogene Daten:
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 1. ANONYMISIERTE VORSCHAU                                                   │
+│    "Dr. [PERSON_1] leitete das [ORGANIZATION_1] in Bern."                   │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 2. VORBEREITUNG & SPERRE (run_postcheck_for_state)                          │
+│    • Budgetprüfung (max. 32'000 Tokens, 4'096 Reserve)                      │
+│    • Unveränderliche Segmente berechnen (compute_unchanged_segments)        │
+│    • Text & Segmente einfrieren (postcheck_frozen_anon_text, segs)          │
+│    • Sessionlokale Bearbeitungssperre & Generation-Guard (postcheck_run_id) │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 3. LOKALE INFERENZ (LocalApiProvider.generate_postcheck)                    │
+│    • Single-Call Prompting (kein Chunking, System- & User-Prompt)           │
+│    • Schema-Validierung (Pydantic PostcheckEnvelope, extra="forbid")        │
+│    • Truncation-Guard (finish_reason == "length" führt zu Fehlerabbruch)    │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 4. RÜCKFÜHRUNG & AUSWAHLPHASE                                               │
+│    • Slice-Validierung: output_start/end muss exakt in Segment liegen       │
+│    • Back-Mapping auf Originaltext (map_output_slice_to_raw)                │
+│    • Auswahlliste mit Checkboxen (Bearbeitungssperre bleibt aktiv)          │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 5. ATOMARE SAMMELÜBERNAHME (atomic_apply_postcheck_findings)                │
+│    • Gegenseitige & bestehende Intervall-Konfliktprüfung                    │
+│    • Generierung kollisionsfreier IDs / Homonym-Split (OccurrenceOverride)   │
+│    • Atomare Aktualisierung von Text, Review-Tabelle und Mapping-Tabelle    │
+│    • Automatischer vollständiger Rollback bei Fehlern                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Kernprinzipien der Ausgangskontrolle
+
+1. **Minimale Entkopplung:** Die Ausgangskontrolle teilt sich die lokalen Modelleinstellungen mit der Review-Assistenz, ist jedoch funktionell vollständig eigenständig start- und nutzbar, auch wenn der LLM-Review (Stufe 2) deaktiviert ist.
+2. **Bearbeitungssperre & Generation-Guard:** Während des Laufs und der Auswahlphase sind alle zustandsverändernden GUI-Elemente gesperrt (`readonly`/`disabled`). `postcheck_run_id` schützt vor verspäteten Antworten oder Cleanups abgebrochener Vorläufe.
+3. **Strikte Slice-Sicherheit:** Funde werden nur akzeptiert, wenn die gemeldeten Indizes exakt mit dem Text übereinstimmen und in unveränderten Textsegmenten liegen. Abweichende Indizes kleinerer Modelle werden sicherheitsgerichtet als Slice-Fehler verworfen.
+4. **NiceGUI-Client-Binding (F1):** Alle asynchronen Hintergrund-Worker-Callbacks binden explizit an den UI-Client-Kontext (`with client:`).
+
+---
+
 ## 5. Abgrenzung: Warum keine echte PDF-Content-Stream-Redaktion?
 
 > [!NOTE]

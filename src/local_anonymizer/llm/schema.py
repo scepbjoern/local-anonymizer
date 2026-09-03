@@ -53,6 +53,7 @@ class CatalogModelEntry(BaseModel):
     test_date: str = Field(..., min_length=10, max_length=10, description="Testdatum YYYY-MM-DD")
     phase_6a_triage: CatalogPhaseEvaluation = Field(..., description="Bewertung Phase 6A")
     phase_6b_smart_linking: CatalogPhaseEvaluation = Field(..., description="Bewertung Phase 6B")
+    context_limit: Optional[int] = Field(default=None, ge=1, description="Dokumentierte max. Kontextgrenze in Tokens falls bekannt")
 
     @field_validator("canonical_name", "tested_tag")
     @classmethod

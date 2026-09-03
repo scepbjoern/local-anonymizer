@@ -100,6 +100,20 @@ try:
         verify_ollama_model_running,
         PROVIDER_TYPE_OLLAMA,
         PROVIDER_TYPE_GENERIC,
+        SYSTEM_POSTCHECK_PROMPT,
+        USER_POSTCHECK_TEMPLATE,
+        PostcheckFindingItem,
+        PostcheckEnvelope,
+        MAX_POSTCHECK_TOTAL_BUDGET,
+        POSTCHECK_RESPONSE_RESERVE,
+        MAX_POSTCHECK_INPUT_TOKENS,
+        calculate_postcheck_budget,
+        compute_unchanged_segments,
+        map_output_slice_to_raw,
+        validate_scope_and_category,
+        check_batch_conflicts,
+        atomic_apply_postcheck_findings,
+        get_known_context_limit,
     )
     LLM_AVAILABLE = True
 except ImportError:
@@ -120,6 +134,20 @@ except ImportError:
     verify_ollama_model_running = None  # type: ignore
     PROVIDER_TYPE_OLLAMA = "ollama"
     PROVIDER_TYPE_GENERIC = "generic"
+    SYSTEM_POSTCHECK_PROMPT = ""
+    USER_POSTCHECK_TEMPLATE = ""
+    PostcheckFindingItem = None  # type: ignore
+    PostcheckEnvelope = None  # type: ignore
+    MAX_POSTCHECK_TOTAL_BUDGET = 32000
+    POSTCHECK_RESPONSE_RESERVE = 4096
+    MAX_POSTCHECK_INPUT_TOKENS = 27904
+    calculate_postcheck_budget = None  # type: ignore
+    compute_unchanged_segments = None  # type: ignore
+    map_output_slice_to_raw = None  # type: ignore
+    validate_scope_and_category = None  # type: ignore
+    check_batch_conflicts = None  # type: ignore
+    atomic_apply_postcheck_findings = None  # type: ignore
+    get_known_context_limit = lambda m: None  # type: ignore
 
 # Silence presidio analyzer language mismatch warnings
 logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
@@ -637,6 +665,17 @@ async def cleanup_session_async(st: "AppState") -> None:
             pass
         if getattr(st, "llm_active_task", None) is active_task:
             st.llm_active_task = None
+    pc_task = getattr(st, "postcheck_active_task", None)
+    if pc_task and not pc_task.done():
+        pc_task.cancel()
+        try:
+            await pc_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        if getattr(st, "postcheck_active_task", None) is pc_task:
+            st.postcheck_active_task = None
+    st.is_postcheck_active = False
+    st.postcheck_run_id = ""
     st.is_llm_running = False
     await st.close_llm_provider()
 
@@ -651,6 +690,17 @@ def reset_app_state(st: "AppState") -> None:
     if getattr(st, "llm_active_task", None) and not st.llm_active_task.done():
         st.llm_active_task.cancel()
     st.llm_active_task = None
+    if getattr(st, "current_extraction_id", None) is None:
+        st.is_extracting = False
+    if getattr(st, "postcheck_active_task", None) and not st.postcheck_active_task.done():
+        st.postcheck_active_task.cancel()
+    st.postcheck_active_task = None
+    st.is_postcheck_active = False
+    st.postcheck_run_id = ""
+    st.postcheck_findings = []
+    st.postcheck_selected_ids = set()
+    st.postcheck_frozen_anon_text = ""
+    st.postcheck_frozen_segments = []
     st.filename = ""
     st.raw_text = ""
     st.last_raw_bytes = None
@@ -935,6 +985,10 @@ def launch_llm_triage_for_state(
         notify("LLM-Prüfung kann während laufender Textanalyse nicht gestartet werden.", "warning")
         return None
 
+    if getattr(state, "is_postcheck_active", False):
+        notify("LLM-Prüfung kann während aktiver Ausgangskontrolle nicht gestartet werden.", "warning")
+        return None
+
     if not LLM_AVAILABLE:
         notify("LLM-Paket nicht verfügbar. Bitte `pip install local-anonymizer[llm]` installieren.", "warning")
         return None
@@ -1189,7 +1243,22 @@ class AppState:
         self.llm_show_details: bool = True
         # Analysis Lock State
         self.is_analyzing: bool = False
+        self.is_extracting: bool = False
+        self.current_extraction_id: Optional[str] = None
         self.llm_ready_expires_at: float = 0.0
+
+        # LLM Postcheck State (Phase 6B Ausgangskontrolle)
+        self.is_postcheck_active: bool = False
+        self.postcheck_run_id: str = ""
+        self.postcheck_frozen_anon_text: str = ""
+        self.postcheck_frozen_segments: List[Tuple[int, int, int, int]] = []
+        self.postcheck_active_task: Optional[asyncio.Task] = None
+        self.postcheck_findings: List[Dict[str, Any]] = []
+        self.postcheck_selected_ids: Set[str] = set()
+        self.postcheck_user_context_confirmed: bool = False
+        self.postcheck_confirmed_bound_key: str = ""
+        self.postcheck_status_msg: str = ""
+        self.postcheck_error_msg: str = ""
 
         self.mutating_ui_zones: Dict[str, List[Any]] = {
             "sidebar": [],
@@ -1204,7 +1273,7 @@ class AppState:
     @property
     def is_busy(self) -> bool:
         """Central check whether any mutating async operation is in-flight."""
-        return self.is_analyzing or self.is_llm_running or self.llm_setup_state != "idle"
+        return self.is_analyzing or self.is_extracting or self.is_llm_running or self.llm_setup_state != "idle" or self.is_postcheck_active
 
     def refresh_effective_config(self, reload_profiles: bool = False) -> Any:
         """Rebuild the immutable profile snapshot and update stale-result state."""
@@ -1280,6 +1349,8 @@ class AppState:
         self.llm_ready_expires_at = 0.0
         self.llm_ready_bound_url = ""
         self.llm_ready_bound_model = ""
+        self.postcheck_user_context_confirmed = False
+        self.postcheck_confirmed_bound_key = ""
         if self.llm_setup_status_msg == "Modell bereit":
             self.llm_setup_status_msg = ""
 
@@ -2155,10 +2226,583 @@ def native_export_folder(stem: str, anon_text: str, mapping: dict, report: dict,
 
 
 # --- UI Construction ---
+def run_postcheck_for_state(
+    state: "AppState",
+    provider: Optional[Any] = None,
+    notify_fn: Optional[Callable[[str, str], None]] = None,
+    refresh_fn: Optional[Callable[[], None]] = None,
+) -> Optional[asyncio.Task]:
+    """
+    Launch postcheck analysis for given AppState in background task.
+    Validates all start and provider conditions, enforces budgets and locks,
+    and returns the running Task (or None if aborted).
+    """
+    def notify(msg: str, type_: str = "info"):
+        if notify_fn:
+            try:
+                notify_fn(msg, type_)
+            except Exception as e:
+                logging.error(f"Postcheck notify_fn error: {e}", exc_info=True)
+        else:
+            try:
+                ui.notify(msg, type=type_)
+            except Exception:
+                pass
+
+    if not LLM_AVAILABLE:
+        notify("LLM-Funktionen sind nicht verfügbar (Paket [llm] nicht installiert).", "warning")
+        return None
+
+    model_name = state.config.llm_model_name.strip() if state.config.llm_model_name else ""
+    if not model_name:
+        notify("Kein lokales Modell konfiguriert.", "warning")
+        return None
+
+    known_limit = get_known_context_limit(model_name)
+    if known_limit is not None and known_limit < MAX_POSTCHECK_TOTAL_BUDGET:
+        notify(
+            f"Modell '{model_name}' hat eine bekannte Kontextgrenze von {known_limit} Tokens. "
+            f"Erforderlich sind mindestens {MAX_POSTCHECK_TOTAL_BUDGET} Tokens. Start blockiert.",
+            "negative",
+        )
+        return None
+
+    bound_key = f"{state.config.llm_base_url.strip()}|{model_name}"
+    if not (state.postcheck_user_context_confirmed and state.postcheck_confirmed_bound_key == bound_key):
+        notify("Bitte bestätigen Sie vorab die 32.000-Token-Konfiguration Ihres Modellservers.", "warning")
+        return None
+
+    if state.is_busy or getattr(state, "is_extracting", False) or getattr(state, "is_analyzing", False):
+        notify("System oder Dokumentextraktion ist beschäftigt. Ausgangskontrolle kann nicht gestartet werden.", "warning")
+        return None
+
+    if getattr(state, "postcheck_active_task", None) and not state.postcheck_active_task.done():
+        notify("Vorheriger Postcheck-Lauf wird noch beendet. Bitte kurz warten.", "warning")
+        return None
+
+    if not state.current_anon_text:
+        notify("Kein anonymisierter Text vorhanden.", "warning")
+        return None
+
+    active_postcheck_modes = [
+        m for m in state.entity_modes.values() if m in (ENTITY_MODE_ALL, ENTITY_MODE_EXPLICIT_EUPII)
+    ]
+    if not active_postcheck_modes:
+        notify("Ausgangskontrolle im aktuellen Profil deaktiviert (nur bei 'all' oder 'explicit_eupii' aktiv).", "info")
+        return None
+
+    run_id = uuid.uuid4().hex
+    is_ok, est_in, max_in, budget_msg = calculate_postcheck_budget(state.current_anon_text, request_id=run_id)
+    if not is_ok:
+        notify(budget_msg, "negative")
+        return None
+
+    # Snapshot state and lock with exception-safe reservation
+    state.is_postcheck_active = True
+    state.postcheck_run_id = run_id
+    try:
+        state.postcheck_frozen_anon_text = state.current_anon_text
+        state.postcheck_status_msg = "Ausgangskontrolle wird vorbereitet..."
+
+        active_groups = [g for g in state.entity_groups if g.enabled and get_active_occurrences(state, g)]
+        active_occs = []
+        for g in active_groups:
+            for occ in get_active_occurrences(state, g):
+                active_occs.append({
+                    "start": occ.start,
+                    "end": occ.end,
+                    "placeholder": g.placeholder,
+                })
+        state.postcheck_frozen_segments = compute_unchanged_segments(state.raw_text, active_occs)
+        state.postcheck_findings = []
+        state.postcheck_selected_ids = set()
+        state.set_all_mutating_elements_disabled(True)
+        if refresh_fn:
+            refresh_fn()
+    except Exception as exc:
+        state.is_postcheck_active = False
+        state.postcheck_run_id = ""
+        state.postcheck_status_msg = ""
+        state.set_all_mutating_elements_disabled(False)
+        notify(f"Fehler bei Vorbereitung der Ausgangskontrolle: {exc}", "negative")
+        return None
+
+    # Immutable copies for worker execution
+    current_run_id = run_id
+    frozen_anon = state.current_anon_text
+    frozen_raw = state.raw_text
+    frozen_segs = list(state.postcheck_frozen_segments)
+    frozen_modes = dict(state.entity_modes)
+    # Package D: Effective configuration is alone authoritative; legacy fallback only if absent
+    frozen_ignores: Set[str] = set()
+    if hasattr(state, "effective_config") and state.effective_config is not None and hasattr(state.effective_config, "ignore_terms"):
+        frozen_ignores = set(state.effective_config.ignore_terms)
+    elif hasattr(state, "ignore_terms_text") and state.ignore_terms_text:
+        frozen_ignores = set(parse_ignore_terms(state.ignore_terms_text))
+
+    async def _worker():
+        p = None
+        owns_provider = False
+        try:
+            if state.postcheck_run_id != current_run_id:
+                return
+
+            state.postcheck_status_msg = "Lokales LLM sucht nach übersehenen Nachzüglern..."
+            if refresh_fn:
+                refresh_fn()
+
+            p = provider or state.llm_provider
+            if p is None:
+                p = LocalApiProvider(
+                    base_url=state.config.llm_base_url,
+                    model_name=state.config.llm_model_name,
+                )
+                owns_provider = True
+
+            user_prompt = USER_POSTCHECK_TEMPLATE.format(
+                anon_text=frozen_anon,
+                request_id=current_run_id,
+            )
+            raw_response = await p.generate_postcheck(
+                prompt=user_prompt,
+                system_prompt=SYSTEM_POSTCHECK_PROMPT,
+                max_tokens=POSTCHECK_RESPONSE_RESERVE,
+            )
+
+            if state.postcheck_run_id != current_run_id:
+                logging.info(f"Postcheck: Veraltete Antwort für Lauf {current_run_id} verworfen.")
+                return
+
+            cleaned = extract_json_from_llm_response(raw_response)
+            data = json.loads(cleaned)
+            envelope = PostcheckEnvelope.model_validate(data)
+
+            if envelope.request_id != current_run_id:
+                raise ValueError(f"Request-ID-Abweichung: Erwartet '{current_run_id}', erhalten '{envelope.request_id}'.")
+
+            total_items = len(envelope.items)
+            scope_rejected = 0
+            slice_rejected = 0
+            valid_findings = []
+
+            # Disabled spans check
+            disabled_spans = []
+            for g in state.entity_groups:
+                if not g.enabled:
+                    for occ in g.occurrences:
+                        disabled_spans.append((occ.start, occ.end))
+                else:
+                    for occ in g.occurrences:
+                        ov = getattr(state, "occurrence_overrides", {}).get(occ.occ_id)
+                        if ov and not ov.enabled:
+                            disabled_spans.append((occ.start, occ.end))
+
+            for idx, item in enumerate(envelope.items):
+                is_allowed, norm_type, reason = validate_scope_and_category(
+                    item.entity_type, item.text, frozen_modes, frozen_ignores
+                )
+                if not is_allowed:
+                    scope_rejected += 1
+                    logging.info(f"Postcheck item #{idx+1} rejected by scope/ignore filter: {reason}")
+                    continue
+
+                try:
+                    raw_s, raw_e = map_output_slice_to_raw(
+                        item.output_start,
+                        item.output_end,
+                        item.text,
+                        frozen_anon,
+                        frozen_raw,
+                        frozen_segs,
+                    )
+                except ValueError:
+                    slice_rejected += 1
+                    logging.warning("Postcheck: Fundstelle #%d an [%d:%d] verworfen: ungueltiger Text-Slice.", idx + 1, item.output_start, item.output_end)
+                    continue
+
+                if any(not (raw_e <= ds or raw_s >= de) for ds, de in disabled_spans):
+                    scope_rejected += 1
+                    logging.info(f"Postcheck item #{idx+1} rejected because it matches a manually disabled entity.")
+                    continue
+
+                f_id = f"post_{idx+1}_{uuid.uuid4().hex[:6]}"
+                valid_findings.append({
+                    "id": f_id,
+                    "text": item.text,
+                    "entity_type": norm_type,
+                    "raw_start": raw_s,
+                    "raw_end": raw_e,
+                    "output_start": item.output_start,
+                    "output_end": item.output_end,
+                    "reasoning": item.reasoning or "",
+                    "confidence": item.confidence or "high",
+                })
+
+            if state.postcheck_run_id != current_run_id:
+                return
+
+            state.postcheck_findings = valid_findings
+            state.postcheck_status_msg = ""
+
+            if not valid_findings:
+                state.is_postcheck_active = False
+                state.postcheck_run_id = ""
+                state.set_all_mutating_elements_disabled(False)
+                if total_items == 0:
+                    notify("Ausgangskontrolle abgeschlossen: Keine ungeschützten Nachzügler gefunden.", "positive")
+                elif slice_rejected > 0:
+                    notify(
+                        f"Ausgangskontrolle unvollständig: Das Modell lieferte {total_items} Funde, "
+                        f"deren Textpositionen ({slice_rejected} fehlerhaft) nicht zugeordnet werden konnten.",
+                        "warning",
+                    )
+                else:
+                    notify(
+                        f"Ausgangskontrolle abgeschlossen: Alle {total_items} Modellvorschläge "
+                        f"wurden durch Ignorierregeln oder Profilfilter verworfen.",
+                        "info",
+                    )
+            else:
+                state.postcheck_selected_ids = {f["id"] for f in valid_findings}
+                if slice_rejected > 0:
+                    notify(
+                        f"Ausgangskontrolle unvollständig: {len(valid_findings)} Nachzügler gefunden, "
+                        f"aber {slice_rejected} Fundstellen mit ungültigen Positionen verworfen.",
+                        "warning",
+                    )
+                else:
+                    notify(f"Ausgangskontrolle abgeschlossen: {len(valid_findings)} Nachzügler gefunden. Bitte prüfen.", "info")
+
+            if refresh_fn:
+                refresh_fn()
+
+        except asyncio.CancelledError:
+            if state.postcheck_run_id == current_run_id:
+                state.is_postcheck_active = False
+                state.postcheck_run_id = ""
+                state.postcheck_findings = []
+                state.set_all_mutating_elements_disabled(False)
+                if refresh_fn:
+                    refresh_fn()
+            raise
+        except Exception as exc:
+            if state.postcheck_run_id == current_run_id:
+                state.is_postcheck_active = False
+                state.postcheck_run_id = ""
+                state.postcheck_findings = []
+                state.set_all_mutating_elements_disabled(False)
+                if refresh_fn:
+                    refresh_fn()
+                notify(f"Fehler bei der Ausgangskontrolle: {exc}", "negative")
+        finally:
+            if owns_provider and p is not None:
+                try:
+                    await p.close()
+                except Exception:
+                    pass
+            if getattr(state, "postcheck_active_task", None) is asyncio.current_task():
+                state.postcheck_active_task = None
+
+    task = asyncio.create_task(_worker())
+    state.postcheck_active_task = task
+    return task
+
+
+def cancel_postcheck_for_state(
+    state: "AppState",
+    expected_run_id: Optional[str] = None,
+    refresh_fn: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Safely abort active postcheck task and release edit locks without data loss."""
+    current_run_id = getattr(state, "postcheck_run_id", "")
+    if expected_run_id is not None and expected_run_id != current_run_id:
+        return False
+    task = getattr(state, "postcheck_active_task", None)
+    if task and not task.done():
+        task.cancel()
+    else:
+        state.postcheck_active_task = None
+    state.is_postcheck_active = False
+    state.postcheck_run_id = ""
+    state.postcheck_findings.clear()
+    state.postcheck_selected_ids.clear()
+    state.postcheck_status_msg = ""
+    state.set_all_mutating_elements_disabled(False)
+    if refresh_fn:
+        refresh_fn()
+    return True
+
+
+def apply_postcheck_for_state(
+    state: "AppState",
+    selected_ids: Optional[Set[str]] = None,
+    expected_run_id: Optional[str] = None,
+    preview_fn: Optional[Callable[[Any], Any]] = None,
+    sync_fn: Optional[Callable[[Any, Any], None]] = None,
+    table_fn: Optional[Callable[[], None]] = None,
+    refresh_fn: Optional[Callable[[], None]] = None,
+) -> Tuple[bool, str]:
+    """Atomically apply selected postcheck findings into AppState."""
+    current_run_id = getattr(state, "postcheck_run_id", "")
+    target_run_id = expected_run_id if expected_run_id is not None else current_run_id
+    if not target_run_id or target_run_id != current_run_id:
+        return False, "Veralteter Lauf: Vorschläge gehören nicht zur aktuellen Ausgangskontrolle."
+    ids_to_apply = selected_ids if selected_ids is not None else getattr(state, "postcheck_selected_ids", set())
+    selected = [f for f in getattr(state, "postcheck_findings", []) if f["id"] in ids_to_apply]
+    if not selected:
+        return False, "Keine Fundstellen ausgewählt."
+
+    ok, msg = atomic_apply_postcheck_findings(
+        state,
+        selected,
+        expected_run_id=target_run_id,
+        preview_fn=preview_fn,
+        sync_fn=sync_fn,
+    )
+    if ok:
+        if table_fn:
+            table_fn()
+        if refresh_fn:
+            refresh_fn()
+    return ok, msg
+
+
+def render_postcheck_ui_component(
+    state: "AppState",
+    anon_text: Optional[str] = None,
+    cancel_action: Optional[Callable[[], None]] = None,
+    apply_action: Optional[Callable[[], None]] = None,
+    run_action: Optional[Callable[[], None]] = None,
+    refresh_action: Optional[Callable[[], None]] = None,
+) -> None:
+    """Render the Postcheck UI panel (Phase 6B) under the anonymized preview."""
+    text_to_show = anon_text if anon_text is not None else getattr(state, "current_anon_text", "")
+    if not text_to_show:
+        return
+
+    with ui.column().classes("w-full mt-3 p-3 bg-slate-50 border border-slate-200 rounded-lg"):
+        if not LLM_AVAILABLE:
+            with ui.row().classes("w-full items-center gap-2 text-slate-500 text-xs"):
+                ui.icon("info", size="sm")
+                ui.label("LLM-Ausgangskontrolle: Zusatzpaket [llm] nicht installiert.").classes("font-medium")
+            return
+
+        model_name = state.config.llm_model_name.strip() if state.config.llm_model_name else ""
+        if not model_name:
+            with ui.row().classes("w-full items-center gap-2 text-amber-700 text-xs"):
+                ui.icon("warning", size="sm")
+                ui.label("LLM-Ausgangskontrolle: Kein lokales Modell konfiguriert.").classes("font-medium")
+            return
+
+        known_limit = get_known_context_limit(model_name)
+        has_known_small_limit = known_limit is not None and known_limit < MAX_POSTCHECK_TOTAL_BUDGET
+
+        bound_key = f"{state.config.llm_base_url.strip()}|{model_name}"
+        context_confirmed = state.postcheck_user_context_confirmed and state.postcheck_confirmed_bound_key == bound_key
+
+        with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("manage_search", size="sm").classes("text-indigo-600")
+                ui.label("LLM-Ausgangskontrolle (Nachzügler suchen)").classes("font-semibold text-sm text-slate-800")
+                if state.is_postcheck_active and state.postcheck_findings:
+                    ui.badge("Auswahlphase", color="primary").props("dense")
+                elif state.is_postcheck_active:
+                    ui.spinner(size="xs", color="primary")
+                    ui.badge("Prüfung läuft...", color="primary").props("dense")
+                elif has_known_small_limit:
+                    ui.badge(f"⚠️ Kontext zu klein ({known_limit} Tokens)", color="negative").props("dense outline")
+                elif context_confirmed:
+                    ui.badge("✓ 32k-Kontext bestätigt", color="positive").props("dense outline").tooltip("Vom Nutzer bestätigt, nicht technisch geprüft.")
+
+            bound_run_id = str(getattr(state, "postcheck_run_id", ""))
+            if state.is_postcheck_active and cancel_action:
+                ui.button("Abbrechen / Schliessen", icon="cancel", color="negative", on_click=lambda rid=bound_run_id: cancel_action(rid)).props("flat dense size=sm")
+
+        if has_known_small_limit:
+            with ui.row().classes("w-full my-2 p-2 bg-red-50 border border-red-200 rounded text-xs text-red-900 items-center gap-2"):
+                ui.icon("error", size="sm").classes("text-red-600")
+                ui.label(
+                    f"Modell '{model_name}' unterstützt laut Katalog nur {known_limit} Tokens. "
+                    f"Für die Ausgangskontrolle sind mindestens {MAX_POSTCHECK_TOTAL_BUDGET} Tokens erforderlich. Start blockiert."
+                ).classes("font-medium")
+
+        elif not state.is_postcheck_active and not context_confirmed:
+            with ui.column().classes("w-full my-2 p-2.5 bg-amber-50 border border-amber-200 rounded text-xs text-amber-900 gap-1"):
+                def on_confirm_ctx(e):
+                    state.postcheck_user_context_confirmed = bool(e.value)
+                    state.postcheck_confirmed_bound_key = bound_key if e.value else ""
+                    if refresh_action:
+                        refresh_action()
+
+                ui.checkbox(
+                    "Ich bestätige, dass mein lokaler LLM-Server für mindestens 32.000 Tokens Kontext konfiguriert ist (vom Nutzer bestätigt, nicht technisch geprüft).",
+                    value=False,
+                    on_change=on_confirm_ctx,
+                ).classes("text-xs font-semibold")
+                ui.label("Hinweis: Lokale LLM-Server können Eingaben bei unzureichendem Kontextfenster stillschweigend abschneiden. Ein regulärer Abschluss garantiert keine Vollständigkeit.").classes("text-[11px] text-amber-700 ml-6")
+
+        if state.is_postcheck_active and state.postcheck_findings:
+            ui.label(
+                "Wählen Sie die Fundstellen aus, die Sie in die reguläre Anonymisierung übernehmen möchten:"
+            ).classes("text-xs text-slate-600 mt-1 mb-2")
+
+            btn_holder = {"apply_btn": None}
+
+            with ui.column().classes("w-full gap-2 mb-3"):
+                for f in state.postcheck_findings:
+                    f_id = f["id"]
+                    with ui.row().classes("w-full items-center justify-between p-2 bg-white border border-slate-200 rounded text-xs gap-2"):
+                        with ui.row().classes("items-center gap-2"):
+                            def make_on_check(fid=f_id):
+                                def _h(e):
+                                    if e.value:
+                                        state.postcheck_selected_ids.add(fid)
+                                    else:
+                                        state.postcheck_selected_ids.discard(fid)
+                                    btn = btn_holder.get("apply_btn")
+                                    if btn is not None:
+                                        btn.text = f"✅ Ausgewählte übernehmen ({len(state.postcheck_selected_ids)})"
+                                        btn.update()
+                                return _h
+
+                            is_sel = f_id in state.postcheck_selected_ids
+                            ui.checkbox(value=is_sel, on_change=make_on_check(f_id)).props("dense")
+                            ui.label(f["text"]).classes("font-mono font-bold text-slate-900 bg-amber-100 px-1.5 py-0.5 rounded")
+                            ui.badge(f["entity_type"], color="indigo").props("dense outline")
+                            ui.label(f"Position: {f['output_start']}..{f['output_end']}").classes("text-[11px] text-slate-500 font-mono")
+
+                        if f.get("reasoning"):
+                            ui.label(f["reasoning"]).classes("text-[11px] text-slate-500 italic max-w-md truncate").tooltip(f["reasoning"])
+
+            with ui.row().classes("w-full items-center justify-between gap-2"):
+                with ui.row().classes("gap-2"):
+                    def select_all():
+                        for f in state.postcheck_findings:
+                            state.postcheck_selected_ids.add(f["id"])
+                        if refresh_action:
+                            refresh_action()
+
+                    def deselect_all():
+                        state.postcheck_selected_ids.clear()
+                        if refresh_action:
+                            refresh_action()
+
+                    ui.button("Alle auswählen", on_click=select_all).props("flat dense size=xs")
+                    ui.button("Keine auswählen", on_click=deselect_all).props("flat dense size=xs")
+
+                with ui.row().classes("gap-2"):
+                    if apply_action:
+                        apply_btn = ui.button(
+                            f"✅ Ausgewählte übernehmen ({len(state.postcheck_selected_ids)})",
+                            color="primary",
+                            on_click=lambda rid=bound_run_id: apply_action(rid),
+                        ).props("unelevated dense size=sm")
+                        btn_holder["apply_btn"] = apply_btn
+                    if cancel_action:
+                        ui.button("Verwerfen", icon="close", color="negative", on_click=lambda rid=bound_run_id: cancel_action(rid)).props("flat dense size=sm")
+
+        elif state.is_postcheck_active and not state.postcheck_findings:
+            with ui.row().classes("w-full items-center gap-2 p-2 text-xs text-slate-600"):
+                ui.spinner(size="sm", color="primary")
+                ui.label(state.postcheck_status_msg or "Ausgangskontrolle läuft...").classes("font-medium")
+
+        elif not state.is_postcheck_active:
+            can_start = context_confirmed and not has_known_small_limit and not state.is_busy and bool(text_to_show)
+            if run_action:
+                start_btn = ui.button(
+                    "🔍 Ausgangskontrolle starten (Nachzügler suchen)",
+                    icon="manage_search",
+                    color="indigo-7",
+                    on_click=run_action,
+                ).props("unelevated dense size=sm" + ("" if can_start else " disabled"))
+                if hasattr(state, "register_mutating_element"):
+                    state.register_mutating_element(start_btn, "workspace")
+
+
+async def extract_and_load_file_bytes_workflow(
+    state: "AppState",
+    raw_bytes: bytes,
+    filename: str,
+    load_content_fn: Optional[Callable[[str, str, Optional[bytes]], Any]] = None,
+    progress_card: Optional[Any] = None,
+    progress_bar: Optional[Any] = None,
+    progress_label: Optional[Any] = None,
+    notify_fn: Optional[Callable[[str, str], None]] = None,
+) -> None:
+    """Core extraction workflow that acquires state.is_extracting, calls read_document_from_bytes in a thread, and loads content."""
+    # Reject second concurrent extraction immediately without await
+    if state.is_extracting or getattr(state, "current_extraction_id", None) is not None:
+        msg = "Eine Dokumentextraktion läuft bereits. Bitte warten."
+        if notify_fn:
+            notify_fn(msg, "warning")
+        elif "ui" in globals() and hasattr(ui, "notify"):
+            ui.notify(msg, type="warning")
+        return
+
+    extraction_id = uuid.uuid4().hex
+    state.is_extracting = True
+    state.current_extraction_id = extraction_id
+
+    try:
+        try:
+            if progress_card is not None and progress_bar is not None and progress_label is not None:
+                progress_card.set_visibility(True)
+                progress_bar.set_value(0.0)
+                progress_label.set_text(f"Lese '{filename}' ein...")
+                await asyncio.sleep(0.02)
+
+            loop = asyncio.get_running_loop()
+
+            def progress_cb(curr: int, total: int, msg: str):
+                if progress_bar is not None and progress_label is not None:
+                    val = curr / max(1, total)
+                    loop.call_soon_threadsafe(progress_bar.set_value, val)
+                    loop.call_soon_threadsafe(progress_label.set_text, f"{msg} ({int(val * 100)}%)")
+
+            text = await asyncio.to_thread(
+                read_document_from_bytes,
+                raw_bytes,
+                filename,
+                progress_cb,
+                state.include_headers_footers,
+                state.extract_picture_text,
+            )
+            if load_content_fn:
+                res = load_content_fn(text, filename, raw_bytes)
+                if asyncio.iscoroutine(res):
+                    await res
+            else:
+                state.raw_text = text
+                state.filename = filename
+                state.last_raw_bytes = raw_bytes
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            err_msg = f"{type(ex).__name__}: {str(ex)}"
+            logging.error(f"File extraction error: {err_msg}", exc_info=True)
+            if notify_fn:
+                notify_fn(f"Fehler beim Einlesen von '{filename}': {err_msg}", "negative")
+            elif "ui" in globals() and hasattr(ui, "notify"):
+                try:
+                    ui.notify(f"Fehler beim Einlesen von '{filename}': {err_msg}", type="negative", timeout=15000)
+                except Exception:
+                    pass
+    finally:
+        if getattr(state, "current_extraction_id", None) == extraction_id:
+            state.current_extraction_id = None
+            state.is_extracting = False
+        if progress_card is not None:
+            try:
+                progress_card.set_visibility(False)
+            except Exception:
+                pass
+
+
 @ui.page("/")
 def create_ui(client: Optional[Client] = None):
     state = AppState()
     if client is not None:
+        client.state = state
         client.on_disconnect(lambda: cleanup_session_async(state))
     ui.colors(primary="#1976D2", secondary="#26A69A", accent="#9C27B0", positive="#2E7D32", warning="#F57C00", negative="#C62828")
 
@@ -2224,6 +2868,8 @@ def create_ui(client: Optional[Client] = None):
             with ui.row().classes("justify-end w-full mt-3 gap-2"):
                 ui.button("Abbrechen", on_click=discard_dialog.close).props("flat")
                 async def discard_and_continue() -> None:
+                    if not check_mutation_allowed():
+                        return
                     discard_dialog.close()
                     state.document_overlay = DocumentProfileOverlay(
                         overlay_revision=state.document_overlay.overlay_revision + 1
@@ -2237,7 +2883,7 @@ def create_ui(client: Optional[Client] = None):
 
     async def load_content_into_workspace(text: str, filename: str, raw_bytes: Optional[bytes] = None):
         """Unified asynchronous workspace loader."""
-        if not check_mutation_allowed():
+        if not check_mutation_allowed(ignore_extraction=True):
             return
         if state.document_overlay.dirty:
             ask_discard_document_overlay(
@@ -2265,37 +2911,16 @@ def create_ui(client: Optional[Client] = None):
         """Asynchronously extract structured text from document bytes with live UI progress."""
         if not check_mutation_allowed():
             return
-        if extraction_progress_card is not None and extraction_progress_bar is not None and extraction_progress_label is not None:
-            extraction_progress_card.set_visibility(True)
-            extraction_progress_bar.set_value(0.0)
-            extraction_progress_label.set_text(f"Lese '{filename}' ein...")
-            await asyncio.sleep(0.02)
-
-        loop = asyncio.get_running_loop()
-
-        def progress_cb(curr: int, total: int, msg: str):
-            if extraction_progress_bar is not None and extraction_progress_label is not None:
-                val = curr / max(1, total)
-                loop.call_soon_threadsafe(extraction_progress_bar.set_value, val)
-                loop.call_soon_threadsafe(extraction_progress_label.set_text, f"{msg} ({int(val * 100)}%)")
-
-        try:
-            text = await asyncio.to_thread(
-                read_document_from_bytes,
-                raw_bytes,
-                filename,
-                progress_cb,
-                state.include_headers_footers,
-                state.extract_picture_text,
-            )
-            await load_content_into_workspace(text, filename, raw_bytes=raw_bytes)
-        except Exception as ex:
-            err_msg = f"{type(ex).__name__}: {str(ex)}"
-            logging.error(f"File extraction error: {err_msg}", exc_info=True)
-            ui.notify(f"Fehler beim Einlesen von '{filename}': {err_msg}", type="negative", timeout=15000)
-        finally:
-            if extraction_progress_card is not None:
-                extraction_progress_card.set_visibility(False)
+        await extract_and_load_file_bytes_workflow(
+            state=state,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            load_content_fn=load_content_into_workspace,
+            progress_card=extraction_progress_card,
+            progress_bar=extraction_progress_bar,
+            progress_label=extraction_progress_label,
+            notify_fn=lambda m, t: ui.notify(m, type=t, timeout=15000 if t == "negative" else 5000),
+        )
 
     async def open_native_file_dialog():
         """Open native OS file picker with full Win32 lock-sharing support."""
@@ -2484,40 +3109,38 @@ def create_ui(client: Optional[Client] = None):
                 with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
                     with ui.row().classes("items-center gap-2 flex-wrap"):
                         ui.icon("psychology", size="sm").classes("text-indigo-700")
-                        ui.label("Lokale LLM-Review-Assistenz (Optional)").classes("font-bold text-xs text-slate-800")
-                        if state.config.llm_enabled:
-                            if state.llm_setup_state == "discovering":
-                                ui.spinner(size="xs", color="primary")
-                                ui.badge("Suche Modelle...", color="primary").props("dense")
-                            elif state.llm_setup_state in ("preloading", "testing"):
-                                ui.spinner(size="xs", color="primary")
-                                ui.badge("Lade / Teste...", color="primary").props("dense")
-                            elif state.is_model_ready():
-                                ps_inf = state.llm_ready_info
-                                tooltip_text = f"Modell '{state.config.llm_model_name}' ist in Ollama geladen."
-                                if ps_inf and getattr(ps_inf, "size_vram", None):
-                                    vram_mb = ps_inf.size_vram // (1024 * 1024)
-                                    tooltip_text += f" (VRAM: ca. {vram_mb} MB)"
-                                if ps_inf and getattr(ps_inf, "expires_at", None):
-                                    tooltip_text += f" (Ablauf: {ps_inf.expires_at})"
-                                ui.badge(f"✓ Bereit ({state.config.llm_model_name})", color="positive").props("dense outline").tooltip(tooltip_text)
-                            elif state.llm_provider_type == "generic" and state.llm_ready_bound_url == state.config.llm_base_url.strip():
-                                ui.badge("✓ Verbindung OK", color="positive").props("dense outline").tooltip("Generischer Server erreichbar")
-                            elif state.llm_setup_status_msg:
-                                ui.badge(state.llm_setup_status_msg, color="grey-7").props("dense outline")
+                        ui.label("Lokale LLM-Modellkonfiguration").classes("font-bold text-xs text-slate-800")
+                        if state.llm_setup_state == "discovering":
+                            ui.spinner(size="xs", color="primary")
+                            ui.badge("Suche Modelle...", color="primary").props("dense")
+                        elif state.llm_setup_state in ("preloading", "testing"):
+                            ui.spinner(size="xs", color="primary")
+                            ui.badge("Lade / Teste...", color="primary").props("dense")
+                        elif state.is_model_ready():
+                            ps_inf = state.llm_ready_info
+                            tooltip_text = f"Modell '{state.config.llm_model_name}' ist in Ollama geladen."
+                            if ps_inf and getattr(ps_inf, "size_vram", None):
+                                vram_mb = ps_inf.size_vram // (1024 * 1024)
+                                tooltip_text += f" (VRAM: ca. {vram_mb} MB)"
+                            if ps_inf and getattr(ps_inf, "expires_at", None):
+                                tooltip_text += f" (Ablauf: {ps_inf.expires_at})"
+                            ui.badge(f"✓ Bereit ({state.config.llm_model_name})", color="positive").props("dense outline").tooltip(tooltip_text)
+                        elif state.llm_provider_type == "generic" and state.llm_ready_bound_url == state.config.llm_base_url.strip():
+                            ui.badge("✓ Verbindung OK", color="positive").props("dense outline").tooltip("Generischer Server erreichbar")
+                        elif state.llm_setup_status_msg:
+                            ui.badge(state.llm_setup_status_msg, color="grey-7").props("dense outline")
 
                     with ui.row().classes("items-center gap-2"):
-                        if state.config.llm_enabled:
-                            def toggle_details():
-                                state.llm_show_details = not state.llm_show_details
-                                build_llm_setup_panel()
+                        def toggle_details():
+                            state.llm_show_details = not state.llm_show_details
+                            build_llm_setup_panel()
 
-                            det_btn = ui.button(
-                                "Details ausblenden" if state.llm_show_details else "Einstellungen anpassen",
-                                icon="expand_less" if state.llm_show_details else "tune",
-                                on_click=toggle_details,
-                            ).props("flat dense size=xs color=slate").classes("text-xs")
-                            state.register_mutating_element(det_btn, "llm_setup")
+                        det_btn = ui.button(
+                            "Details ausblenden" if state.llm_show_details else "Modell & Einstellungen anpassen",
+                            icon="expand_less" if state.llm_show_details else "tune",
+                            on_click=toggle_details,
+                        ).props("flat dense size=xs color=slate").classes("text-xs")
+                        state.register_mutating_element(det_btn, "llm_setup")
 
                         async def on_llm_toggle(e):
                             if not check_mutation_allowed():
@@ -2525,22 +3148,20 @@ def create_ui(client: Optional[Client] = None):
                             state.config.llm_enabled = bool(e.value)
                             save_current_config(state)
                             if not state.config.llm_enabled:
-                                await state.cancel_setup_task()
-                                await state.close_llm_provider()
-                                state.invalidate_llm_ready()
+                                if getattr(state, "llm_active_task", None) and not state.llm_active_task.done():
+                                    state.llm_active_task.cancel()
                             else:
-                                state.llm_show_details = True
                                 if state.llm_provider_type == "ollama" and not state.llm_discovered_models:
                                     await trigger_model_discovery()
                             build_llm_setup_panel()
                             build_llm_panel()
                             build_review_table()
 
-                        llm_switch = ui.switch("Aktivieren", value=state.config.llm_enabled, on_change=on_llm_toggle).props("dense size=sm").classes("text-xs font-semibold")
+                        llm_switch = ui.switch("LLM-Review aktivieren", value=state.config.llm_enabled, on_change=on_llm_toggle).props("dense size=sm").classes("text-xs font-semibold")
                         state.register_mutating_element(llm_switch, "llm_setup")
 
-                # Expanded Body when enabled and details shown
-                if state.config.llm_enabled and state.llm_show_details:
+                # Expanded Body when details shown (accessible regardless of review switch)
+                if state.llm_show_details:
                     ui.separator().classes("my-2")
 
                     # Row 1: Main Controls on single line (Modellauswahl first, then Provider, then API-Endpunkt)
@@ -2937,6 +3558,90 @@ def create_ui(client: Optional[Client] = None):
 
         state.llm_setup_task = asyncio.create_task(_runner_test())
 
+
+
+
+    def run_postcheck_action():
+        if not check_mutation_allowed():
+            return
+
+        def safe_notify(msg: str, t: str = "info"):
+            if client is not None:
+                with client:
+                    ui.notify(msg, type=t)
+            else:
+                try:
+                    ui.notify(msg, type=t)
+                except Exception:
+                    pass
+
+        def safe_refresh():
+            if client is not None:
+                with client:
+                    refresh_preview_and_exports()
+            else:
+                refresh_preview_and_exports()
+
+        run_postcheck_for_state(
+            state,
+            notify_fn=safe_notify,
+            refresh_fn=safe_refresh,
+        )
+
+    def apply_postcheck_action(expected_run_id: Optional[str] = None):
+        target_run = expected_run_id if expected_run_id is not None else state.postcheck_run_id
+
+        def safe_refresh():
+            if client is not None:
+                with client:
+                    refresh_preview_and_exports()
+            else:
+                refresh_preview_and_exports()
+
+        def safe_table():
+            if client is not None:
+                with client:
+                    build_review_table()
+            else:
+                build_review_table()
+
+        ok, msg = apply_postcheck_for_state(
+            state,
+            expected_run_id=target_run,
+            preview_fn=compute_reactive_preview,
+            sync_fn=sync_group_overrides,
+            table_fn=safe_table,
+            refresh_fn=safe_refresh,
+        )
+        if ok:
+            ui.notify(msg, type="positive")
+        else:
+            ui.notify(msg, type="negative", timeout=12000)
+
+    def cancel_postcheck_action(expected_run_id: Optional[str] = None):
+        target_run = expected_run_id if expected_run_id is not None else state.postcheck_run_id
+
+        def safe_refresh():
+            if client is not None:
+                with client:
+                    refresh_preview_and_exports()
+            else:
+                refresh_preview_and_exports()
+
+        ok = cancel_postcheck_for_state(state, expected_run_id=target_run, refresh_fn=safe_refresh)
+        if ok:
+            ui.notify("Ausgangskontrolle geschlossen.", type="info")
+
+    def render_postcheck_ui(anon_text: Optional[str] = None):
+        render_postcheck_ui_component(
+            state=state,
+            anon_text=anon_text,
+            cancel_action=cancel_postcheck_action,
+            apply_action=apply_postcheck_action,
+            run_action=run_postcheck_action,
+            refresh_action=refresh_preview_and_exports,
+        )
+
     def refresh_preview_and_exports():
         if not preview_holder or not export_holder:
             return
@@ -2972,6 +3677,7 @@ def create_ui(client: Optional[Client] = None):
 
             ui.label(f"Anonymisierte Vorschau ({ext.upper()} / Markdown):").classes("font-semibold text-slate-700 mb-1")
             ui.textarea(value=anon_text).props("readonly rows=12").classes("w-full font-mono text-sm bg-slate-50 border rounded p-2")
+            render_postcheck_ui(anon_text)
 
         export_holder.clear()
         with export_holder:
@@ -3267,8 +3973,11 @@ def create_ui(client: Optional[Client] = None):
             client=client,
         )
 
-    def check_mutation_allowed() -> bool:
-        """Central guard against mutating state while analysis, LLM triage or setup is running."""
+    def check_mutation_allowed(ignore_extraction: bool = False) -> bool:
+        """Central guard against mutating state while analysis, LLM triage, extraction or setup is running."""
+        if not ignore_extraction and getattr(state, "is_extracting", False):
+            ui.notify("Aktion während laufender Dokumentextraktion gesperrt.", type="warning")
+            return False
         if state.is_analyzing:
             ui.notify("Aktion während laufender Textanalyse gesperrt.", type="warning")
             return False
@@ -3277,6 +3986,9 @@ def create_ui(client: Optional[Client] = None):
             return False
         if state.llm_setup_state != "idle":
             ui.notify("Aktion während laufendem Modell-Setup gesperrt.", type="warning")
+            return False
+        if getattr(state, "is_postcheck_active", False):
+            ui.notify("Aktion während aktiver Ausgangskontrolle gesperrt.", type="warning")
             return False
         return True
 
@@ -5543,13 +6255,16 @@ def create_ui(client: Optional[Client] = None):
                         with ui.column().classes("flex-1"):
                             ui.label("1. LLM-Antwort (Text oder Dokument):").classes("font-semibold text-xs text-slate-700 mb-1")
 
-                            def load_restore_text(text: str, filename: str):
-                                if not check_mutation_allowed():
+                            def load_restore_text(text: str, filename: str, ignore_extraction: bool = False):
+                                if not check_mutation_allowed(ignore_extraction=ignore_extraction):
                                     return
                                 state.restore_anon_text = text
                                 if restore_anon_input is not None:
                                     restore_anon_input.value = text
-                                ui.notify(f"'{filename}' geladen ({len(text)} Zeichen).", type="positive")
+                                try:
+                                    ui.notify(f"'{filename}' geladen ({len(text)} Zeichen).", type="positive")
+                                except Exception:
+                                    pass
 
                             def open_restore_file_dialog():
                                 if not check_mutation_allowed():
@@ -5583,10 +6298,27 @@ def create_ui(client: Optional[Client] = None):
                                     raw_bytes, filename, temp_paths = extract_upload_payload(data, UPLOAD_DIR)
                                     if not check_mutation_allowed():
                                         return
-                                    text = await asyncio.to_thread(read_document_from_bytes, raw_bytes, filename)
-                                    load_restore_text(text, filename)
+                                    if state.is_extracting or getattr(state, "current_extraction_id", None) is not None:
+                                        try:
+                                            ui.notify("Eine Dokumentextraktion läuft bereits. Bitte warten.", type="warning")
+                                        except Exception:
+                                            pass
+                                        return
+                                    ext_id = uuid.uuid4().hex
+                                    state.is_extracting = True
+                                    state.current_extraction_id = ext_id
+                                    try:
+                                        text = await asyncio.to_thread(read_document_from_bytes, raw_bytes, filename)
+                                        load_restore_text(text, filename, ignore_extraction=True)
+                                    finally:
+                                        if getattr(state, "current_extraction_id", None) == ext_id:
+                                            state.current_extraction_id = None
+                                            state.is_extracting = False
                                 except Exception as ex:
-                                    ui.notify(f"Fehler beim Laden: {type(ex).__name__}: {str(ex)}", type="negative", timeout=15000)
+                                    try:
+                                        ui.notify(f"Fehler beim Laden: {type(ex).__name__}: {str(ex)}", type="negative", timeout=15000)
+                                    except Exception:
+                                        pass
                                 finally:
                                     if temp_paths:
                                         cleanup_upload_paths(*temp_paths)

@@ -62,6 +62,24 @@ from local_anonymizer.llm.apply_service import (
     CANONICAL_APP_ENTITY_TYPES,
     ENTITY_TYPE_ALIASES,
 )
+from local_anonymizer.llm.postcheck_schema import (
+    SYSTEM_POSTCHECK_PROMPT,
+    USER_POSTCHECK_TEMPLATE,
+    PostcheckFindingItem,
+    PostcheckEnvelope,
+)
+from local_anonymizer.llm.postcheck_service import (
+    MAX_POSTCHECK_TOTAL_BUDGET,
+    POSTCHECK_RESPONSE_RESERVE,
+    MAX_POSTCHECK_INPUT_TOKENS,
+    calculate_postcheck_budget,
+    compute_unchanged_segments,
+    map_output_slice_to_raw,
+    validate_scope_and_category,
+    check_batch_conflicts,
+    atomic_apply_postcheck_findings,
+    get_known_context_limit,
+)
 
 __all__ = [
     "TriageAction",
@@ -111,4 +129,18 @@ __all__ = [
     "check_mutation_allowed",
     "CANONICAL_APP_ENTITY_TYPES",
     "ENTITY_TYPE_ALIASES",
+    "SYSTEM_POSTCHECK_PROMPT",
+    "USER_POSTCHECK_TEMPLATE",
+    "PostcheckFindingItem",
+    "PostcheckEnvelope",
+    "MAX_POSTCHECK_TOTAL_BUDGET",
+    "POSTCHECK_RESPONSE_RESERVE",
+    "MAX_POSTCHECK_INPUT_TOKENS",
+    "calculate_postcheck_budget",
+    "compute_unchanged_segments",
+    "map_output_slice_to_raw",
+    "validate_scope_and_category",
+    "check_batch_conflicts",
+    "atomic_apply_postcheck_findings",
+    "get_known_context_limit",
 ]

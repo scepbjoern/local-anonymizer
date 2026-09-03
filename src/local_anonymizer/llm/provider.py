@@ -45,6 +45,11 @@ class LlmProvider(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    async def generate_postcheck(self, prompt: str, system_prompt: str = "", max_tokens: int = 4096) -> str:
+        """Generate postcheck response with explicit token reserve and finish_reason validation."""
+        raise NotImplementedError("Dieser Provider unterstützt die Phase-6B-Ausgangskontrolle nicht.")
+
+    @abc.abstractmethod
     async def close(self) -> None:
         """Clean up resources."""
         raise NotImplementedError
@@ -602,10 +607,15 @@ class LocalApiProvider(LlmProvider):
             )
         return self._session
 
-    async def generate(self, prompt: str, system_prompt: str = "") -> str:
+    async def _send_completion_request(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        max_tokens: int = 4096,
+    ) -> Tuple[str, Optional[str]]:
         """
         Send a non-streaming chat completion request with response_format: json_object.
-        Uses session-local asyncio.Lock to avoid interleaving requests on the same provider instance.
+        Returns (content, finish_reason).
         """
         if not self.model_name:
             raise ValueError("Kein LLM-Modellname konfiguriert.")
@@ -628,7 +638,7 @@ class LocalApiProvider(LlmProvider):
                 "model": self.model_name,
                 "messages": messages,
                 "temperature": 0.0,
-                "max_tokens": 4096,
+                "max_tokens": max_tokens,
                 "response_format": {"type": "json_object"},
                 "reasoning_effort": "none",
             }
@@ -694,18 +704,44 @@ class LocalApiProvider(LlmProvider):
                 logger.warning(f"Lokaler LLM-Aufruf fehlgeschlagen: {type(e).__name__}")
                 raise RuntimeError("Verbindung zum lokalen LLM-Dienst fehlgeschlagen oder unterbrochen.")
 
-            # Extract message content from standard OpenAI response structure
+            # Extract message content and finish_reason from standard OpenAI response structure
             try:
                 data = json.loads(raw_body)
                 choices = data.get("choices", [])
                 if not choices:
                     raise ValueError("Ungültige Antwortstruktur: Keine choices im LLM-Response.")
-                content = choices[0].get("message", {}).get("content", "")
+                choice = choices[0]
+                content = choice.get("message", {}).get("content", "")
+                finish_reason = choice.get("finish_reason")
                 if not content:
                     raise ValueError("Leere Antwort vom lokalen LLM erhalten.")
-                return content
+                return content, finish_reason
             except json.JSONDecodeError:
                 raise ValueError("Antwort des lokalen LLMs ist kein gültiges JSON.")
+
+    async def generate(self, prompt: str, system_prompt: str = "") -> str:
+        """
+        Send a non-streaming chat completion request with response_format: json_object (Phase 6A Triage).
+        Preserves existing 6A behavior.
+        """
+        content, _ = await self._send_completion_request(prompt, system_prompt=system_prompt, max_tokens=4096)
+        return content
+
+    async def generate_postcheck(self, prompt: str, system_prompt: str = "", max_tokens: int = 4096) -> str:
+        """
+        Send a non-streaming chat completion request for postcheck with explicit max_tokens reserve (Phase 6B).
+        Strictly enforces finish_reason == 'stop'; rejects truncation (length) and missing/unexpected status.
+        """
+        content, finish_reason = await self._send_completion_request(prompt, system_prompt=system_prompt, max_tokens=max_tokens)
+        if finish_reason == "length":
+            raise ValueError(
+                "LLM-Antwort wurde wegen Längenbegrenzung (max_tokens) abgeschnitten – Prüfung unvollständig und abgewiesen."
+            )
+        if not finish_reason or finish_reason != "stop":
+            raise ValueError(
+                f"Unerwarteter oder fehlender Abschlussstatus vom LLM-Provider: '{finish_reason}'. Prüfung abgewiesen."
+            )
+        return content
 
     async def close(self) -> None:
         """Close the underlying HTTP client session."""

@@ -65,6 +65,17 @@ Begriffe.
 - **Falscher Endpunkt:** Der Endpunkt muss eine lokale Loopback-Adresse sein und den Pfad `/v1` enthalten (Standard: `http://127.0.0.1:11434/v1`).
 - **Unvollständige Batches / Timeout:** Wenn das Modell überlastet ist oder die GPU zu wenig VRAM hat, können einzelne Batches abbrechen. Die Applikation zeigt die ungeprüften Fundstellen transparent an. Du kannst geprüfte Fundstellen einzeln übernehmen oder den Lauf nach Entlastung des Systems wiederholen.
 
+## Probleme bei der Ausgangskontrolle (Postcheck)
+
+- **Start-Button deaktiviert:**
+  - Prüfe, ob im oberen Bereich ein Modell konfiguriert ist (z. B. `qwen3:8b`).
+  - Bestätige vorab die Checkbox zur 32k-Kontextunterstützung deines lokalen Servers.
+  - Stelle sicher, dass zuvor eine Textanalyse durchgeführt wurde und keine andere Operation (z. B. Upload oder Analyse) aktiv ist.
+- **Ausgangskontrolle meldet unvollständigen Lauf (fehlerhafte Textpositionen):**
+  - Kleine lokale Sprachmodelle können bei langen Dokumenten oder komplexen Tabellen ungenaue Zeichen-Offsets liefern.
+  - Das System schützt dich vor Fehlplatzierungen: Entspricht der vom Modell gemeldete Zeichenbereich im Text nicht exakt dem Fundbegriff (`anonymisierter_text[start:end] == text`), wird der Treffer sicherheitsgerichtet verworfen und eine entsprechende Warnung angezeigt.
+  - Überprüfe in solchen Fällen den Text stichprobenartig manuell oder teste ein größeres bzw. höher parametrisiertes lokales Modell.
+
 ## macOS
 
 Die Anwendung wurde bisher nicht praktisch auf macOS getestet. Wenn der

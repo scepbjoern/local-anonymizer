@@ -16,15 +16,16 @@ Festplatte liegt. Bei besonders schützenswerten Dokumenten solltest du deshalb
 auch lokale Zugriffsrechte, Backups, Virenscanner und temporäre Systemkopien
 berücksichtigen.
 
-## Datenschutz bei Nutzung des lokalen LLM-Triage-Layers
+## Datenschutz bei Nutzung lokaler LLM-Funktionen (Review-Assistenz & Ausgangskontrolle)
 
-Wenn du die optionale LLM-Review-Assistenz aktivierst:
+Wenn du die optionalen lokalen LLM-Funktionen (Review-Assistenz und/oder Ausgangskontrolle) nutzt:
 
 - **Strikter Loopback-Schutz:** Die Anwendung erzwingt strikt lokale Loopback-Adressen (`127.0.0.1`, `localhost`, `[::1]`). Verbindungen zu externen Cloud-APIs oder fremden LAN-IPs werden technisch blockiert.
 - **Kein Cloud-Fallback:** Schlägt der lokale LLM-Endpunkt fehl, bricht der Lauf sicher ab – es gibt keinen stillen Ausweichpfad in die Cloud.
-- **Lokale Schnittstelle:** Zur Prüfung werden Text-Snippets lokal per HTTP an den separaten Dienst (z. B. Ollama) übertragen. Beachte, dass solche lokalen Server eigene Logs auf deiner Festplatte anlegen können.
+- **Lokale Schnittstelle:** Zur Prüfung werden Text-Snippets bzw. der anonymisierte Text lokal per HTTP an den separaten Dienst (z. B. Ollama) übertragen. Beachte, dass solche lokalen Server eigene Logs auf deiner Festplatte anlegen können.
 - **Keine Rohdaten-Protokollierung:** Die Applikation selbst schreibt keine LLM-Rohantworten oder sensiblen Pydantic-Inhalte in Anwendungslogs oder die Konsole.
-- **Menschliche Letztkontrolle:** Das LLM entscheidet nie autonom; alle Aktionen erfordern deine explizite Bestätigung in der Review-Tabelle.
+- **Menschliche Letztkontrolle:** Das LLM entscheidet nie autonom; alle Aktionen (sowohl Triage-Vorschläge als auch gefundene Nachzügler) erfordern deine explizite Bestätigung.
+- **Keine Vollständigkeitsgarantie:** Auch die Ausgangskontrolle garantiert kein lückenloses Auffinden aller übersehenen Entitäten (insbesondere bei ungenauen Modell-Offsets oder blinden Flecken kleinerer Modelle). Eine menschliche Stichprobe bleibt unerlässlich.
 
 ## Was du weitergeben darfst
 
