@@ -71,6 +71,7 @@ Begriffe.
   - Prüfe, ob im oberen Bereich ein Modell konfiguriert ist (z. B. `qwen3:8b`).
   - Bestätige vorab die Checkbox zur 32k-Kontextunterstützung deines lokalen Servers.
   - Stelle sicher, dass zuvor eine Textanalyse durchgeführt wurde und keine andere Operation (z. B. Upload oder Analyse) aktiv ist.
+- **Bestätigungs-Checkbox erscheint nach Modell- oder Endpunktwechsel erneut:** Das ist beabsichtigt und kein Fehler. Die 32k-Bestätigung gilt immer nur für die aktuell konfigurierte Modell-/Endpunkt-Kombination; wechselst du das Modell oder den API-Endpunkt, musst du einmal erneut bestätigen. Ein blosses erneutes Bereitwerden desselben Modells (z. B. nach Ablauf des Ollama-Keep-alive) verlangt dagegen **keine** erneute Bestätigung.
 - **Ausgangskontrolle meldet unvollständigen Lauf (fehlerhafte Textpositionen):**
   - Kleine lokale Sprachmodelle können bei langen Dokumenten oder komplexen Tabellen ungenaue Zeichen-Offsets liefern.
   - Das System schützt dich vor Fehlplatzierungen: Entspricht der vom Modell gemeldete Zeichenbereich im Text nicht exakt dem Fundbegriff (`anonymisierter_text[start:end] == text`), wird der Treffer sicherheitsgerichtet verworfen und eine entsprechende Warnung angezeigt.

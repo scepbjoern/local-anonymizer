@@ -14,6 +14,7 @@ import copy
 import json
 import logging
 import pytest
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Set
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,6 +33,8 @@ from app import (
     parse_ignore_terms,
     build_anonymizer,
     render_postcheck_ui_component,
+    compute_postcheck_bound_key,
+    is_postcheck_context_confirmed,
 )
 from local_anonymizer.anonymizer import LocalAnonymizer
 from local_anonymizer.llm.postcheck_schema import (
@@ -1291,5 +1294,436 @@ def test_analysis_with_review_disabled_does_not_trigger_auto_review():
     # Evaluation condition from start_analysis:
     should_auto_trigger = st.config.llm_enabled and st.config.llm_auto_review and not st.is_busy
     assert should_auto_trigger is False
+
+
+# ---------------------------------------------------------------------------
+# 12. U1 - Review switch & Auto-Review checkbox relocated to the review-assistant
+#     panel (Handoff 20260903-1256). Shared model settings stay above and independent.
+# ---------------------------------------------------------------------------
+
+def test_review_switch_and_auto_review_checkbox_live_in_review_panel_not_settings():
+    """
+    U1: 'LLM-Review aktivieren' and the auto-review checkbox must be built as part of
+    the review-assistant panel (build_llm_panel), not the shared model-settings panel
+    (build_llm_setup_panel) any more. The settings panel is built and fully populated
+    first during page construction, so any element created afterwards (higher element
+    id) that carries these exact labels can only originate from the review panel.
+    """
+    from nicegui import Client, ui
+    from nicegui.page import page
+    from app import create_ui
+
+    with Client(page('/')) as client:
+        create_ui(client)
+
+        settings_label = next(
+            el for el in client.elements.values()
+            if isinstance(el, ui.label) and el.text == "Lokale LLM-Modellkonfiguration"
+        )
+
+        switches = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.switch) and el.text == "LLM-Review aktivieren"
+        ]
+        assert len(switches) == 1, "Es darf nur einen 'LLM-Review aktivieren'-Schalter geben (keine Kopie)."
+        assert switches[0].id > settings_label.id, (
+            "Der Schalter muss im Review-Assistenten-Bereich entstehen, der erst nach "
+            "vollständigem Aufbau der Modelleinstellungen gebaut wird."
+        )
+
+        auto_review_checkboxes = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.checkbox) and el.text == "LLM-Review direkt an die Textanalyse anschließen"
+        ]
+        assert len(auto_review_checkboxes) == 1, "Auch die Auto-Review-Checkbox darf nur einmal existieren."
+        assert auto_review_checkboxes[0].id > settings_label.id
+
+
+@pytest.mark.asyncio
+async def test_review_controls_reachable_and_operable_while_review_disabled():
+    """
+    U1: with the review switched off, the review-assistant panel must stay
+    visible/reachable - i.e. still render the switch and the auto-review checkbox,
+    both enabled - instead of hiding behind a dead-end notice.
+    """
+    from nicegui import Client, ui
+    from nicegui.page import page
+    from types import SimpleNamespace
+    from app import create_ui
+
+    with Client(page('/')) as client:
+        create_ui(client)
+        st = client.state
+
+        # Force the "off" state explicitly (a persisted local config from prior manual
+        # GUI testing may already have llm_enabled=True, so the class default alone
+        # cannot be relied on here) via the real switch handler.
+        switch = next(
+            el for el in client.elements.values()
+            if isinstance(el, ui.switch) and el.text == "LLM-Review aktivieren"
+        )
+        with patch("app.save_current_config", return_value=True):
+            with client:
+                await switch._change_handlers[0](SimpleNamespace(value=False))
+        assert st.config.llm_enabled is False
+
+        disabled_notices = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.label) and el.text == "Lokale LLM-Review-Assistenz ist deaktiviert."
+        ]
+        assert len(disabled_notices) == 1
+
+        switches = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.switch) and el.text == "LLM-Review aktivieren"
+        ]
+        assert len(switches) == 1
+        assert switches[0].enabled is True
+
+        auto_review_checkboxes = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.checkbox) and el.text == "LLM-Review direkt an die Textanalyse anschließen"
+        ]
+        assert len(auto_review_checkboxes) == 1
+        assert auto_review_checkboxes[0].enabled is True
+
+
+@pytest.mark.asyncio
+async def test_llm_toggle_switch_real_handler_enables_review_and_rebuilds_panels():
+    """U1: firing the real switch handler flips state.config.llm_enabled and replaces
+    the 'deaktiviert'-notice with the actual review-assistant controls."""
+    from nicegui import Client, ui
+    from nicegui.page import page
+    from types import SimpleNamespace
+    from app import create_ui
+
+    with Client(page('/')) as client:
+        create_ui(client)
+        st = client.state
+        st.config.llm_model_name = "model-a"
+
+        switch = next(
+            el for el in client.elements.values()
+            if isinstance(el, ui.switch) and el.text == "LLM-Review aktivieren"
+        )
+        assert len(switch._change_handlers) == 1
+        on_llm_toggle = switch._change_handlers[0]
+
+        with patch("app.save_current_config", return_value=True):
+            with client:
+                await on_llm_toggle(SimpleNamespace(value=True))
+
+        assert st.config.llm_enabled is True
+        assert not any(
+            isinstance(el, ui.label) and el.text == "Lokale LLM-Review-Assistenz ist deaktiviert."
+            for el in client.elements.values()
+        )
+        assert any(
+            isinstance(el, ui.label) and el.text == "Lokale LLM-Review-Assistenz"
+            for el in client.elements.values()
+        )
+
+
+def test_auto_review_checkbox_toggle_persists_via_real_handler():
+    """U1: toggling the relocated auto-review checkbox writes state.config.llm_auto_review
+    and the value survives an unrelated panel rebuild (no reset on relocation)."""
+    from nicegui import Client, ui
+    from nicegui.page import page
+    from app import create_ui
+
+    with Client(page('/')) as client:
+        create_ui(client)
+        st = client.state
+        st.config.llm_auto_review = False
+
+        def get_checkbox():
+            return next(
+                el for el in client.elements.values()
+                if isinstance(el, ui.checkbox) and el.text == "LLM-Review direkt an die Textanalyse anschließen"
+            )
+
+        checkbox = get_checkbox()
+        assert checkbox.value is False
+
+        with patch("app.save_current_config", return_value=True):
+            checkbox._handle_value_change(True)
+        assert st.config.llm_auto_review is True
+
+        # Unrelated rebuild (e.g. review switch handler) must not reset the value.
+        with patch("app.save_current_config", return_value=True):
+            get_checkbox()._handle_value_change(False)
+        assert st.config.llm_auto_review is False
+
+
+def test_shared_model_settings_remain_independent_of_review_switch():
+    """U1: the shared model settings (model dropdown, provider, endpoint, preload/test)
+    stay reachable via 'Modell & Einstellungen anpassen' regardless of the review switch."""
+    from nicegui import Client, ui
+    from nicegui.page import page
+    from app import create_ui
+
+    with Client(page('/')) as client:
+        create_ui(client)
+        st = client.state
+        # Set explicitly rather than relying on the class default: a persisted local
+        # config from prior manual GUI testing may already have llm_enabled=True.
+        st.config.llm_enabled = False
+
+        model_dropdowns = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.select) and el._props.get("label") == "Modellauswahl"
+        ]
+        endpoint_inputs = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.input) and el._props.get("label") == "API-Endpunkt (Loopback)"
+        ]
+        assert len(model_dropdowns) == 1
+        assert len(endpoint_inputs) == 1
+        assert model_dropdowns[0].enabled is True
+        assert endpoint_inputs[0].enabled is True
+
+
+# ---------------------------------------------------------------------------
+# 13. U2 - Context-confirmation lifecycle: readiness/keep-alive loss must not discard
+#     the postcheck confirmation; only a real model/endpoint change may (Handoff
+#     20260903-1256, reproducing and closing Björns GUI finding of 20260903-1250).
+# ---------------------------------------------------------------------------
+
+def test_readiness_only_invalidation_preserves_postcheck_context_confirmation():
+    """invalidate_llm_ready() (keep-alive expiry, failed preload/test, lost /api/ps) must
+    NOT discard a valid context confirmation for the unchanged model/endpoint."""
+    st = AppState()
+    st.config.llm_model_name = "qwen3:8b"
+    st.postcheck_user_context_confirmed = True
+    st.postcheck_confirmed_bound_key = compute_postcheck_bound_key(st)
+    assert is_postcheck_context_confirmed(st) is True
+
+    st.llm_ready_info = object()
+    st.llm_ready_expires_at = time.time() + 300
+    st.invalidate_llm_ready()
+
+    assert st.llm_ready_info is None  # readiness itself IS reset
+    assert st.postcheck_user_context_confirmed is True
+    assert st.postcheck_confirmed_bound_key == compute_postcheck_bound_key(st)
+    assert is_postcheck_context_confirmed(st) is True
+
+
+def test_model_ready_expiry_real_path_does_not_invalidate_confirmation():
+    """Exercises the real is_model_ready() expiry branch (used by the periodic
+    check_readiness_expiry timer and pre-triage re-verification), not a re-implementation."""
+    st = AppState()
+    st.config.llm_model_name = "qwen3:8b"
+    st.llm_provider_type = "ollama"
+    st.llm_ready_info = object()
+    st.llm_ready_bound_url = st.config.llm_base_url.strip()
+    st.llm_ready_bound_model = "qwen3:8b"
+    st.llm_ready_expires_at = time.time() - 1.0  # already expired
+
+    st.postcheck_user_context_confirmed = True
+    st.postcheck_confirmed_bound_key = compute_postcheck_bound_key(st)
+
+    assert st.is_model_ready() is False  # triggers internal invalidate_llm_ready()
+    assert is_postcheck_context_confirmed(st) is True
+
+
+def test_invalidate_llm_config_clears_confirmation_for_real_config_change():
+    """invalidate_llm_config() (used by the actual model/provider/endpoint change
+    handlers) must discard a confirmation that was given for a different configuration."""
+    st = AppState()
+    st.config.llm_model_name = "model-a"
+    st.postcheck_user_context_confirmed = True
+    st.postcheck_confirmed_bound_key = compute_postcheck_bound_key(st)
+    assert is_postcheck_context_confirmed(st) is True
+
+    st.config.llm_model_name = "model-b"  # simulates the handler applying the new value
+    st.invalidate_llm_config()
+
+    assert st.postcheck_user_context_confirmed is False
+    assert st.postcheck_confirmed_bound_key == ""
+    assert is_postcheck_context_confirmed(st) is False
+
+
+@pytest.mark.asyncio
+async def test_shared_bound_key_rule_consistent_between_server_check_and_renderer():
+    """U2 point 2: server-side start check (run_postcheck_for_state) and the UI renderer
+    (render_postcheck_ui_component) must agree on validity via the same shared rule."""
+    from nicegui import Client, ui
+    from nicegui.page import page
+
+    st = AppState()
+    st.raw_text = "Text"
+    st.current_anon_text = "Text"
+    st.config.llm_model_name = "model-a"
+    st.entity_modes = {"PERSON": "all"}
+    st.postcheck_user_context_confirmed = True
+    st.postcheck_confirmed_bound_key = compute_postcheck_bound_key(st)
+
+    # Confirmed for model-a: server check passes this gate (fails later/succeeds elsewhere,
+    # but must not reject for "unconfirmed"), and the renderer shows the positive badge.
+    notified = []
+    fake = FakeProvider(response_text='{"schema_version": "1.0", "request_id": "REQID", "items": []}')
+    task = run_postcheck_for_state(st, provider=fake, notify_fn=lambda m, t: notified.append((m, t)))
+    assert task is not None
+    await task
+    st.is_postcheck_active = False  # allow a second run below on the same state
+
+    with Client(page('/')) as client:
+        render_postcheck_ui_component(state=st, anon_text=st.current_anon_text, run_action=lambda: None)
+        badges = [el for el in client.elements.values() if isinstance(el, ui.badge)]
+        assert any("32k-Kontext bestätigt" in (b.text or "") for b in badges)
+
+    # Model changes WITHOUT re-confirming (simulates a config change whose invalidation
+    # was somehow missed): both the server check and the renderer must now reject/prompt,
+    # using the identical bound-key rule.
+    st.config.llm_model_name = "model-b"
+    notified.clear()
+    task2 = run_postcheck_for_state(st, provider=fake, notify_fn=lambda m, t: notified.append((m, t)))
+    assert task2 is None
+    assert any("32.000-Token-Konfiguration" in m for m, t in notified)
+
+    with Client(page('/')) as client:
+        render_postcheck_ui_component(state=st, anon_text=st.current_anon_text, run_action=lambda: None)
+        badges = [el for el in client.elements.values() if isinstance(el, ui.badge)]
+        checkboxes = [el for el in client.elements.values() if isinstance(el, ui.checkbox)]
+        assert not any("32k-Kontext bestätigt" in (b.text or "") for b in badges)
+        assert any("32.000 Tokens Kontext konfiguriert" in (cb.text or "") for cb in checkboxes)
+
+
+@pytest.mark.asyncio
+async def test_gui_model_change_via_real_handler_invalidates_confirmation_and_refreshes_panel():
+    """
+    Flagship production-near regression for U2 (Handoff 20260903-1256 / Björns GUI-Befund
+    20260903-1250): fires the REAL on_model_select_change handler (not a hand-set
+    AppState) and verifies the full acceptance sequence end-to-end -
+    Bestätigen -> Modell wechseln -> Badge weg / Checkbox da -> erneut bestätigen -> starten.
+    """
+    from nicegui import Client, ui
+    from nicegui.page import page
+    from types import SimpleNamespace
+    from app import create_ui
+
+    with Client(page('/')) as client:
+        create_ui(client)
+        st = client.state
+        st.raw_text = "Hallo Anna."
+        st.llm_provider_type = "ollama"
+        st.config.llm_provider_type = "ollama"
+        st.config.llm_model_name = "model-a"
+        st.llm_discovered_models = ["model-a", "model-b"]
+        st.entity_modes = {"PERSON": "all"}
+
+        # 1. User confirms the 32k-context assumption for the currently configured model.
+        st.postcheck_user_context_confirmed = True
+        st.postcheck_confirmed_bound_key = compute_postcheck_bound_key(st)
+        assert is_postcheck_context_confirmed(st) is True
+
+        model_dropdown = next(
+            el for el in client.elements.values()
+            if isinstance(el, ui.select) and el._props.get("label") == "Modellauswahl"
+        )
+        assert len(model_dropdown._change_handlers) == 1
+        on_model_select_change = model_dropdown._change_handlers[0]
+
+        # 2. Modell wechseln (real handler, not a manual AppState mutation).
+        with patch("app.save_current_config", return_value=True):
+            with client:
+                await on_model_select_change(SimpleNamespace(value="model-b"))
+
+        assert st.config.llm_model_name == "model-b"
+        assert st.postcheck_user_context_confirmed is False
+        assert is_postcheck_context_confirmed(st) is False
+
+        # 3. Badge weg / Checkbox da - in the REAL postcheck panel (inside the actual
+        #    preview_holder the handler refreshed), not a freshly constructed one.
+        badge_labels = [
+            el.text for el in client.elements.values()
+            if isinstance(el, ui.badge) and "32k-Kontext bestätigt" in (el.text or "")
+        ]
+        assert badge_labels == [], "Kein veraltetes Bestätigungs-Badge nach Modellwechsel erlaubt."
+
+        confirm_checkboxes = [
+            el for el in client.elements.values()
+            if isinstance(el, ui.checkbox) and "32.000 Tokens Kontext konfiguriert" in (el.text or "")
+        ]
+        assert len(confirm_checkboxes) == 1, "Die Bestätigungs-Checkbox muss wieder angeboten werden."
+
+        # 4. Erneut bestätigen (for the NEW model).
+        confirm_checkboxes[0]._handle_value_change(True)
+        assert is_postcheck_context_confirmed(st) is True
+        assert st.postcheck_confirmed_bound_key == compute_postcheck_bound_key(st)
+
+        # 5. Starten - now succeeds without being rejected for "unbestätigt".
+        fake = FakeProvider(response_text='{"schema_version": "1.0", "request_id": "REQID", "items": []}')
+        notified = []
+        task = run_postcheck_for_state(st, provider=fake, notify_fn=lambda m, t: notified.append((m, t)))
+        assert task is not None
+        await task
+        assert not any("32.000-Token-Konfiguration" in m for m, t in notified)
+
+
+@pytest.mark.asyncio
+async def test_gui_endpoint_change_stale_checkbox_cannot_confirm_a_config_it_was_not_rendered_for():
+    """
+    Production-near regression for U2 point 3: 'Alte Checkbox-Callbacks duerfen keine
+    Bestaetigung fuer inzwischen andere Modell-/Endpunktwerte setzen.' A confirmation
+    checkbox rendered for an older endpoint, once superseded by a real subsequent
+    endpoint change, must never leave behind a confirmation for either the outdated
+    endpoint it was rendered for (NiceGUI itself refuses to dispatch to a removed
+    element) or a mismatched one - and the freshly re-rendered checkbox for the LIVE
+    endpoint must still confirm correctly.
+    """
+    from nicegui import Client, ui
+    from nicegui.page import page
+    from types import SimpleNamespace
+    from app import create_ui
+
+    with Client(page('/')) as client:
+        create_ui(client)
+        st = client.state
+        st.raw_text = "Hallo Anna."
+        st.config.llm_model_name = "model-a"
+
+        base_url_input = next(
+            el for el in client.elements.values()
+            if isinstance(el, ui.input) and el._props.get("label") == "API-Endpunkt (Loopback)"
+        )
+        assert len(base_url_input._change_handlers) == 1
+        on_base_url_change = base_url_input._change_handlers[0]
+
+        with patch("app.save_current_config", return_value=True):
+            with client:
+                await on_base_url_change(SimpleNamespace(value="http://127.0.0.1:11434/v1_A"))
+
+            confirm_checkboxes = [
+                el for el in client.elements.values()
+                if isinstance(el, ui.checkbox) and "32.000 Tokens Kontext konfiguriert" in (el.text or "")
+            ]
+            assert len(confirm_checkboxes) == 1
+            stale_checkbox = confirm_checkboxes[0]  # rendered while endpoint was "..._A"
+
+            with client:
+                await on_base_url_change(SimpleNamespace(value="http://127.0.0.1:11434/v1_B"))
+
+        assert st.config.llm_base_url == "http://127.0.0.1:11434/v1_B"
+        assert is_postcheck_context_confirmed(st) is False
+
+        # The stale checkbox no longer belongs to the live render (its container was
+        # cleared by the panel refresh); NiceGUI itself refuses to dispatch to it, so
+        # this delayed click must be a safe no-op - never a confirmation for the
+        # outdated "..._A" endpoint, nor an incorrect one for "..._B".
+        stale_checkbox._handle_value_change(True)
+        assert st.postcheck_user_context_confirmed is False
+        assert st.postcheck_confirmed_bound_key == ""
+        assert st.postcheck_confirmed_bound_key != "http://127.0.0.1:11434/v1_A|model-a"
+
+        # The freshly re-rendered checkbox for the LIVE endpoint still works correctly.
+        live_checkbox = next(
+            el for el in client.elements.values()
+            if isinstance(el, ui.checkbox) and "32.000 Tokens Kontext konfiguriert" in (el.text or "")
+        )
+        live_checkbox._handle_value_change(True)
+        assert st.postcheck_confirmed_bound_key == compute_postcheck_bound_key(st)
+        assert st.postcheck_confirmed_bound_key == "http://127.0.0.1:11434/v1_B|model-a"
+        assert is_postcheck_context_confirmed(st) is True
 
 

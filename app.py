@@ -1343,16 +1343,29 @@ class AppState:
                     pass
 
     def invalidate_llm_ready(self) -> None:
-        """Reset transient model readiness status."""
+        """Reset transient model readiness status (e.g. keep-alive expiry, lost /api/ps
+        confirmation, a failed preload/test). This alone is NOT a change of the configured
+        model or endpoint, so it must not discard the user's postcheck context confirmation
+        (see invalidate_postcheck_context_confirmation / invalidate_llm_config)."""
         self.llm_ready_info = None
         self.llm_ready_timestamp = 0.0
         self.llm_ready_expires_at = 0.0
         self.llm_ready_bound_url = ""
         self.llm_ready_bound_model = ""
-        self.postcheck_user_context_confirmed = False
-        self.postcheck_confirmed_bound_key = ""
         if self.llm_setup_status_msg == "Modell bereit":
             self.llm_setup_status_msg = ""
+
+    def invalidate_postcheck_context_confirmation(self) -> None:
+        """Discard the user's confirmed 32k-context assumption for the Ausgangskontrolle."""
+        self.postcheck_user_context_confirmed = False
+        self.postcheck_confirmed_bound_key = ""
+
+    def invalidate_llm_config(self) -> None:
+        """Full invalidation for an actual model name / provider / endpoint change: resets
+        readiness AND discards any prior context confirmation, since that confirmation was
+        given for a configuration that no longer applies."""
+        self.invalidate_llm_ready()
+        self.invalidate_postcheck_context_confirmation()
 
     def is_model_ready(self) -> bool:
         """
@@ -2226,6 +2239,23 @@ def native_export_folder(stem: str, anon_text: str, mapping: dict, report: dict,
 
 
 # --- UI Construction ---
+def compute_postcheck_bound_key(state: "AppState") -> str:
+    """Canonical key binding the user's 32k-context confirmation to the active model
+    and endpoint. Shared by the server-side start check and the UI renderer so both
+    always agree on what counts as 'the same configuration'."""
+    model_name = state.config.llm_model_name.strip() if state.config.llm_model_name else ""
+    return f"{state.config.llm_base_url.strip()}|{model_name}"
+
+
+def is_postcheck_context_confirmed(state: "AppState") -> bool:
+    """Single shared validity rule: the confirmation is only valid for the exact
+    model/endpoint combination it was given for."""
+    return bool(
+        state.postcheck_user_context_confirmed
+        and state.postcheck_confirmed_bound_key == compute_postcheck_bound_key(state)
+    )
+
+
 def run_postcheck_for_state(
     state: "AppState",
     provider: Optional[Any] = None,
@@ -2267,8 +2297,7 @@ def run_postcheck_for_state(
         )
         return None
 
-    bound_key = f"{state.config.llm_base_url.strip()}|{model_name}"
-    if not (state.postcheck_user_context_confirmed and state.postcheck_confirmed_bound_key == bound_key):
+    if not is_postcheck_context_confirmed(state):
         notify("Bitte bestätigen Sie vorab die 32.000-Token-Konfiguration Ihres Modellservers.", "warning")
         return None
 
@@ -2597,8 +2626,7 @@ def render_postcheck_ui_component(
         known_limit = get_known_context_limit(model_name)
         has_known_small_limit = known_limit is not None and known_limit < MAX_POSTCHECK_TOTAL_BUDGET
 
-        bound_key = f"{state.config.llm_base_url.strip()}|{model_name}"
-        context_confirmed = state.postcheck_user_context_confirmed and state.postcheck_confirmed_bound_key == bound_key
+        context_confirmed = is_postcheck_context_confirmed(state)
 
         with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
             with ui.row().classes("items-center gap-2"):
@@ -2629,8 +2657,11 @@ def render_postcheck_ui_component(
         elif not state.is_postcheck_active and not context_confirmed:
             with ui.column().classes("w-full my-2 p-2.5 bg-amber-50 border border-amber-200 rounded text-xs text-amber-900 gap-1"):
                 def on_confirm_ctx(e):
+                    # Recompute the bound key at click-time (not from the render-time
+                    # closure) so a not-yet-refreshed checkbox can never bind a confirmation
+                    # to a model/endpoint other than the one currently configured.
                     state.postcheck_user_context_confirmed = bool(e.value)
-                    state.postcheck_confirmed_bound_key = bound_key if e.value else ""
+                    state.postcheck_confirmed_bound_key = compute_postcheck_bound_key(state) if e.value else ""
                     if refresh_action:
                         refresh_action()
 
@@ -3142,25 +3173,8 @@ def create_ui(client: Optional[Client] = None):
                         ).props("flat dense size=xs color=slate").classes("text-xs")
                         state.register_mutating_element(det_btn, "llm_setup")
 
-                        async def on_llm_toggle(e):
-                            if not check_mutation_allowed():
-                                return
-                            state.config.llm_enabled = bool(e.value)
-                            save_current_config(state)
-                            if not state.config.llm_enabled:
-                                if getattr(state, "llm_active_task", None) and not state.llm_active_task.done():
-                                    state.llm_active_task.cancel()
-                            else:
-                                if state.llm_provider_type == "ollama" and not state.llm_discovered_models:
-                                    await trigger_model_discovery()
-                            build_llm_setup_panel()
-                            build_llm_panel()
-                            build_review_table()
-
-                        llm_switch = ui.switch("LLM-Review aktivieren", value=state.config.llm_enabled, on_change=on_llm_toggle).props("dense size=sm").classes("text-xs font-semibold")
-                        state.register_mutating_element(llm_switch, "llm_setup")
-
-                # Expanded Body when details shown (accessible regardless of review switch)
+                # Expanded Body when details shown (accessible regardless of review switch;
+                # the switch itself now lives in the review-assistant panel below, see U1)
                 if state.llm_show_details:
                     ui.separator().classes("my-2")
 
@@ -3192,11 +3206,12 @@ def create_ui(client: Optional[Client] = None):
                                 try:
                                     valid_name = validate_model_name(val)
                                     state.config.llm_model_name = valid_name
-                                    state.invalidate_llm_ready()
+                                    state.invalidate_llm_config()
                                     await state.close_llm_provider()
                                     save_current_config(state)
                                     build_llm_setup_panel()
                                     build_llm_panel()
+                                    refresh_preview_and_exports()
                                 except ValueError as ve:
                                     ui.notify(str(ve), type="negative")
 
@@ -3219,10 +3234,11 @@ def create_ui(client: Optional[Client] = None):
                                         if raw_val:
                                             valid_name = validate_model_name(raw_val)
                                             state.config.llm_model_name = valid_name
-                                            state.invalidate_llm_ready()
+                                            state.invalidate_llm_config()
                                             await state.close_llm_provider()
                                             save_current_config(state)
                                             build_llm_panel()
+                                            refresh_preview_and_exports()
                                     except ValueError as ve:
                                         ui.notify(str(ve), type="negative")
 
@@ -3243,10 +3259,11 @@ def create_ui(client: Optional[Client] = None):
                                     if raw_val:
                                         valid_name = validate_model_name(raw_val)
                                         state.config.llm_model_name = valid_name
-                                        state.invalidate_llm_ready()
+                                        state.invalidate_llm_config()
                                         await state.close_llm_provider()
                                         save_current_config(state)
                                         build_llm_panel()
+                                        refresh_preview_and_exports()
                                 except ValueError as ve:
                                     ui.notify(str(ve), type="negative")
 
@@ -3265,13 +3282,14 @@ def create_ui(client: Optional[Client] = None):
                             new_type = e.value
                             state.llm_provider_type = new_type
                             state.config.llm_provider_type = new_type
-                            state.invalidate_llm_ready()
+                            state.invalidate_llm_config()
                             await state.close_llm_provider()
                             save_current_config(state)
                             if new_type == "ollama" and not state.llm_discovered_models:
                                 await trigger_model_discovery()
                             build_llm_setup_panel()
                             build_llm_panel()
+                            refresh_preview_and_exports()
 
                         prov_select = ui.select(
                             options={"ollama": "Ollama (Lokal)", "generic": "OpenAI-kompatibel"},
@@ -3288,10 +3306,11 @@ def create_ui(client: Optional[Client] = None):
                             new_url = (e.value or "").strip()
                             if new_url != state.config.llm_base_url:
                                 state.config.llm_base_url = new_url
-                                state.invalidate_llm_ready()
+                                state.invalidate_llm_config()
                                 await state.close_llm_provider()
                                 save_current_config(state)
                                 build_llm_panel()
+                                refresh_preview_and_exports()
 
                         base_url_input = ui.input(
                             label="API-Endpunkt (Loopback)",
@@ -3301,8 +3320,8 @@ def create_ui(client: Optional[Client] = None):
                         ).props("dense outlined bg-white").classes("w-60 text-xs")
                         state.register_mutating_element(base_url_input, "llm_setup")
 
-                    # Row 2: Action Buttons & Auto-Review Checkbox (All on one line)
-                    with ui.row().classes("w-full items-center justify-between gap-3 flex-wrap mb-1"):
+                    # Row 2: Action Buttons (Auto-Review checkbox now lives in the review-assistant panel, see U1)
+                    with ui.row().classes("w-full items-center gap-3 flex-wrap mb-1"):
                         with ui.row().classes("items-center gap-2 flex-wrap"):
                             if state.llm_provider_type == "ollama":
                                 async def on_preload_click():
@@ -3346,21 +3365,6 @@ def create_ui(client: Optional[Client] = None):
                                     set_mutating_controls_disabled(False)
                                     build_llm_setup_panel()
                                 cancel_setup_btn = ui.button("Abbrechen", icon="cancel", on_click=on_cancel_setup, color="negative").props("flat dense size=sm")
-
-                        def on_auto_review_toggle(e):
-                            if not check_mutation_allowed():
-                                return
-                            state.config.llm_auto_review = bool(e.value)
-                            save_current_config(state)
-
-                        auto_review_checkbox = ui.checkbox(
-                            "LLM-Review direkt an die Textanalyse anschließen",
-                            value=state.config.llm_auto_review,
-                            on_change=on_auto_review_toggle,
-                        ).props("dense size=sm").classes("text-xs text-slate-700 font-medium").tooltip(
-                            "Wenn aktiviert, startet nach der lokalen Erkennung automatisch die LLM-Triage der Fundstellen."
-                        )
-                        state.register_mutating_element(auto_review_checkbox, "llm_setup")
 
                     # Row 3: Catalog Info & Privacy Notice (Discreet and compact)
                     catalog_err_msg: Optional[str] = None
@@ -4273,19 +4277,53 @@ def create_ui(client: Optional[Client] = None):
                             ui.label("Lokale LLM-Review-Assistenz: Optionales Zusatzpaket `[llm]` nicht installiert. Zur Aktivierung: `pip install local-anonymizer[llm]`.").classes("font-medium")
                 return
 
+            # Review switch & auto-review checkbox live here (U1 relocation): the
+            # review-assistant panel stays visible and operable even while the review
+            # itself is switched off. Shared model settings (model/provider/endpoint/
+            # preload/test) remain in the panel above; this is not a second config copy,
+            # both controls still read/write the same state.config fields as before.
+            async def on_llm_toggle(e):
+                if not check_mutation_allowed():
+                    return
+                state.config.llm_enabled = bool(e.value)
+                save_current_config(state)
+                if not state.config.llm_enabled:
+                    if getattr(state, "llm_active_task", None) and not state.llm_active_task.done():
+                        state.llm_active_task.cancel()
+                else:
+                    if state.llm_provider_type == "ollama" and not state.llm_discovered_models:
+                        await trigger_model_discovery()
+                build_llm_setup_panel()
+                build_llm_panel()
+                build_review_table()
+
+            def on_auto_review_toggle(e):
+                if not check_mutation_allowed():
+                    return
+                state.config.llm_auto_review = bool(e.value)
+                save_current_config(state)
+
+            with ui.row().classes("w-full items-center gap-4 flex-wrap mb-2"):
+                llm_switch = ui.switch(
+                    "LLM-Review aktivieren", value=state.config.llm_enabled, on_change=on_llm_toggle
+                ).props("dense size=sm").classes("text-xs font-semibold")
+                state.register_mutating_element(llm_switch, "llm")
+
+                auto_review_checkbox = ui.checkbox(
+                    "LLM-Review direkt an die Textanalyse anschließen",
+                    value=state.config.llm_auto_review,
+                    on_change=on_auto_review_toggle,
+                ).props("dense size=sm").classes("text-xs text-slate-700 font-medium").tooltip(
+                    "Wenn aktiviert, startet nach der lokalen Erkennung automatisch die LLM-Triage der Fundstellen."
+                )
+                state.register_mutating_element(auto_review_checkbox, "llm")
+
             if not state.config.llm_enabled:
                 with ui.card().classes("w-full p-3 bg-slate-50 border border-slate-200 rounded-lg"):
-                    with ui.row().classes("items-center justify-between gap-2 flex-wrap"):
-                        with ui.row().classes("items-center gap-2 text-slate-700 text-xs"):
-                            ui.icon("psychology", size="sm").classes("text-slate-400")
-                            ui.label("Lokale LLM-Review-Assistenz ist deaktiviert.").classes("font-semibold")
-                            ui.label("Aktivieren Sie die Option in der LLM-Konfiguration (oberer Bereich), um Fundstellen automatisch durch ein lokales LLM prüfen zu lassen.").classes("text-slate-500")
-                        def enable_in_config():
-                            state.config.llm_enabled = True
-                            save_current_config(state)
-                            render_llm_settings_ui()
-                            build_llm_panel()
-                        ui.button("In Konfiguration aktivieren", icon="toggle_on", on_click=enable_in_config).props("flat dense size=sm color=primary")
+                    with ui.row().classes("items-center gap-2 text-slate-700 text-xs"):
+                        ui.icon("psychology", size="sm").classes("text-slate-400")
+                        ui.label("Lokale LLM-Review-Assistenz ist deaktiviert.").classes("font-semibold")
+                        ui.label("Aktivieren Sie den Schalter oben, um Fundstellen automatisch durch ein lokales LLM prüfen zu lassen.").classes("text-slate-500")
                 return
 
             has_entities = bool(state.entity_groups)

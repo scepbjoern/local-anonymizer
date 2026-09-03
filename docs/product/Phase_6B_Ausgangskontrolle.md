@@ -1,6 +1,8 @@
 # Phase 6B: LLM-Ausgangskontrolle (Postcheck)
 
-**Status:** Implementiert & technisch abgenommen (inkl. Minimaler Entkopplung & F1 Client-Binding)
+**Status:** Implementiert, inkl. Minimaler Entkopplung, F1 Client-Binding sowie U1/U2-Nachbesserung
+(Review-Bedienelemente im Review-Assistenten, Kontextanzeige nach Modell-/Endpunktwechsel). Automatisierte
+Regressionstests grün; finale GUI-Abnahme durch Björn/PLAI-00b steht für den Folgecommit noch aus.
 **Basis-Commit:** `cbf06c006a37a08e3e7745e7980a5ffc6f21a990`
 
 ---
@@ -90,7 +92,8 @@ Die Ausgangskontrolle nutzt Einzelaufrufe ohne Chunking und setzt ausreichenden 
 **Kontextbestätigung (Nutzerverantwortung):**
 - Ist der tatsächliche Serverkontext des Providers programmatisch unbekannt, darf eine ausdrückliche Nutzerbestätigung den Start ermöglichen.
 - Die Bestätigung wird sichtbar gekennzeichnet als *"vom Nutzer bestätigt, nicht technisch geprüft"*.
-- Ändert sich das Modell, der Endpoint oder eine relevante Konfiguration, verfällt die Bestätigung.
+- Ändert sich das Modell, der Endpoint oder eine relevante Konfiguration, verfällt die Bestätigung (`invalidate_llm_config`). Anzeige (Badge/Checkbox) und Serverprüfung teilen sich dieselbe Gültigkeitsregel (`compute_postcheck_bound_key` / `is_postcheck_context_confirmed`), damit beide nie auseinanderlaufen.
+- Ein reines Verlieren der Modellbereitschaft (Ollama-Keep-alive-Ablauf, ein fehlgeschlagener Verbindungstest, ein nicht verifizierbares Vorladen) ist **keine** Konfigurationsänderung und darf die Bestätigung nicht verwerfen (`invalidate_llm_ready` bleibt readiness-only; siehe Handoff 20260903-1256, U2).
 - Bekannte, zu kleine Grenzen dürfen durch die Bestätigung nicht übergangen werden.
 - Dem Nutzer wird transparent erläutert, dass eine serverseitige Kürzung durch den Provider möglich ist (Restrisiko ohne Garantie für Seitenzahl oder Vollständigkeit).
 
@@ -107,7 +110,8 @@ Die Ausgangskontrolle nutzt Einzelaufrufe ohne Chunking und setzt ausreichenden 
 6. **Atomarität / Fehler:** Bei einem Apply-Fehler (z.B. späte Konflikte) erfolgt keinerlei Teilmutation. Das Mapping, der Restore und eine Neuanalyse bleiben absolut konsistent. Wiederholungs-Apply wird sicher behandelt.
 7. **Sammelübernahme:** Überlappende Funde innerhalb desselben Batch-Applys blockieren sich gegenseitig sicher. Nach erfolgreicher Übernahme verfallen alle verbliebenen, nicht ausgewählten Vorschläge sofort.
 8. **Budget & Reserve:** Budgetüberschreitung bricht ohne Request ab. Der tatsächliche API-Request setzt `max_tokens=4096` durch. Truncation (`finish_reason == "length"` oder fehlender/unerwarteter Status) führt zum Fehlerabbruch.
-9. **Kontextbestätigung:** Die Abfrage erscheint bei unbekanntem Limit, verfällt bei Modell-/Endpoint-Wechsel und warnt vor serverseitiger Kürzung. Bekannte zu kleine Limits blockieren weiterhin.
+9. **Kontextbestätigung:** Die Abfrage erscheint bei unbekanntem Limit, verfällt bei einem echten Modell-/Endpoint-Wechsel und warnt vor serverseitiger Kürzung. Bekannte zu kleine Limits blockieren weiterhin. Ein reiner Bereitschafts-/Keep-alive-Verlust bei unverändertem Modell/Endpoint verfällt die Bestätigung **nicht**, und Anzeige (Badge/Checkbox) sowie Serverprüfung bleiben nach einem Wechsel konsistent (kein veraltetes Badge bei gleichzeitig blockiertem Start).
 10. **Phase-6A-Regression:** Alle bestehenden Phase-6A-Funktionen und -Tests bleiben vollständig und unverändert erhalten.
 11. **Minimale Entkopplung:** Die Ausgangskontrolle ist auch bei deaktiviertem LLM-Review vollumfänglich start- und bedienbar. Die Modelleinstellungen und Statusanzeigen bleiben für beide Funktionen zentral zugänglich.
 12. **NiceGUI-Client-Binding (F1):** Alle asynchronen Hintergrund-Worker-Callbacks binden explizit an den aktiven UI-Client-Kontext (`with client:`), um Re-Rendering- und Notification-Abbrüche zu verhindern.
+13. **Review-Bedienplatzierung (U1):** Der Schalter „LLM-Review aktivieren“ und die Checkbox „LLM-Review direkt an die Textanalyse anschließen“ sind Teil des Review-Assistenten-Panels (nicht der gemeinsamen Modelleinstellungen), bleiben dort auch bei ausgeschaltetem Review sichtbar/bedienbar, und bilden keine zweite Konfigurationskopie (dieselben `state.config`-Felder wie zuvor).
