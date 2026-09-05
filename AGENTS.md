@@ -91,6 +91,7 @@ uv run pytest -q
   uv run pytest -m integration -q
   ```
 * Note: A warning regarding `resume_download` from `huggingface_hub` is an upstream deprecation notice and not a test failure.
+* **Run order:** After a code change, first run the test file(s) the change demonstrably affects (e.g. `uv run pytest -q tests/test_llm_postcheck.py`). Once those are green, run the full suite exactly once as the final gate before commit / completion report. This does not replace the obligation to run the full suite.
 
 ---
 
@@ -111,6 +112,8 @@ uv run pytest -q
    * Never execute a blanket `taskkill /im pythonw.exe` or `Stop-Process -Name pythonw` as it kills unrelated user processes. Always filter by process path / command line matching `*local-anonymizer*` and `*app.py*`.
 5. **Deterministic Single-Pass De-Anonymization:**
    * Placeholders in `de_anonymize` must always be sorted by descending length to prevent sub-string collision and cascading replacement errors.
+6. **`AppState` and Real Profile Storage in Tests:**
+   * `AppState` initializes `ProfileStore` with the real `CONFIG_DIR`. Any test path that can reach `save_current_config` or another profile write path must first rewire all associated profile objects (`profile_store`, `profile_controller`, `system_profile`, `project_profile`) to a fresh `tmp_path` `ProfileStore`, or work without a real `AppState`. Tests must never write to `CONFIG_DIR`.
 
 ## 7. Planning & Documentation Standard
 - **Canonical Feature Plans:** Strategic feature master plans must be placed directly in the repository (docs/product/). They contain the complete product requirements, user flows, architecture decisions, and limits.
